@@ -135,6 +135,7 @@ pub struct RawMessageQuery {
 #[derive(Debug, Serialize)]
 pub struct RawMessageResponse {
     pub id: Uuid,
+    pub raw_message_id: Uuid,
     pub source_type: RawMessageSource,
     pub protocol: Option<String>,
     pub content_type: Option<String>,
@@ -665,6 +666,7 @@ fn raw_message_response(raw_message: RawMessage) -> RawMessageResponse {
 
     RawMessageResponse {
         id: raw_message.id,
+        raw_message_id: raw_message.id,
         source_type: raw_message.source_type,
         protocol,
         content_type: raw_message.content_type,
@@ -1136,6 +1138,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let raw_message = to_json(response).await;
         assert_eq!(raw_message["id"], raw_message_id);
+        assert_eq!(raw_message["raw_message_id"], raw_message_id);
         assert_eq!(raw_message["protocol"], "http");
         assert_eq!(raw_message["content_type"], "application/senml+json");
         assert_eq!(raw_message["payload_format"], "senml-json");
@@ -1168,6 +1171,33 @@ mod tests {
         let raw_messages = to_json(response).await;
         assert_eq!(raw_messages.as_array().unwrap().len(), 1);
         assert_eq!(raw_messages[0]["id"], raw_message_id);
+    }
+
+    #[tokio::test]
+    async fn queries_raw_messages_by_feature_of_interest_id() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+        let other_plot_id = create_test_entity(&app, "plot-02", "aion:Plot").await;
+        let ingest = ingest_test_senml(&app, &sensor_id, &plot_id).await;
+        ingest_test_senml(&app, &sensor_id, &other_plot_id).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/raw-messages?feature_of_interest_id={plot_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw_messages = to_json(response).await;
+        assert_eq!(raw_messages.as_array().unwrap().len(), 1);
+        assert_eq!(raw_messages[0]["raw_message_id"], raw_message_id);
+        assert_eq!(raw_messages[0]["feature_of_interest_id"], plot_id);
     }
 
     #[tokio::test]

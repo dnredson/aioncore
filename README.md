@@ -270,24 +270,86 @@ Invoke-RestMethod `
   -Body $ingest
 ```
 
+Ingest SenML telemetry and keep the raw message ID for inspection:
+
+```powershell
+$sensor = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "soil-sensor-01"
+    entity_type = "aion:Sensor"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:farm:01:soil-sensor:01"
+      "@type" = "aion:Sensor"
+      name = "Soil Sensor 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$plot = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "plot-01"
+    entity_type = "aion:Plot"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:farm:01:plot:01"
+      "@type" = "aion:Plot"
+      name = "Plot 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$senmlIngest = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingest/http" `
+  -ContentType "application/json" `
+  -Body (@{
+    producer_entity_id = $sensor.id
+    feature_of_interest_id = $plot.id
+    payload_format = "senml-json"
+    protocol = "http"
+    content_type = "application/senml+json"
+    payload = @(
+      @{
+        bn = "urn:aion:farm:01:soil-sensor:01:"
+        bt = 1777294800
+        n = "soil_moisture"
+        u = "%"
+        v = 18.5
+      },
+      @{
+        n = "soil_temperature"
+        u = "Cel"
+        v = 24.1
+      }
+    )
+  } | ConvertTo-Json -Depth 10)
+
+$rawMessageId = $senmlIngest.raw_message_id
+```
+
 Inspect a raw message after ingestion:
 
-```text
-Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages/<raw-message-id>"
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages/$rawMessageId"
 ```
 
 Query raw messages:
 
-```text
-Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages?producer_entity_id=<sensor-id>"
-Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages?feature_of_interest_id=<plot-id>"
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages?producer_entity_id=$($sensor.id)"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages?feature_of_interest_id=$($plot.id)"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages?payload_format=senml-json"
 ```
 
 Query observations generated from a raw message:
 
-```text
-Invoke-RestMethod -Method Get -Uri "http://localhost:8080/observations?raw_message_id=<raw-message-id>"
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/observations?raw_message_id=$rawMessageId"
 ```
 
 Query observations:
