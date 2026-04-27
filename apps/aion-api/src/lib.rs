@@ -199,9 +199,11 @@ fn parse_entity_input(value: Value) -> Result<EntityInput, ApiError> {
         .ok_or_else(|| ApiError::bad_request("native JSON-LD entity must include string @id"))?;
     let entity_type = extract_jsonld_type(object.get("@type"))
         .ok_or_else(|| ApiError::bad_request("native JSON-LD entity must include string @type"))?;
-    let entity_key = derive_entity_key(jsonld_id).ok_or_else(|| {
-        ApiError::bad_request("could not derive entity_key from native JSON-LD @id")
-    })?;
+    let entity_key = extract_jsonld_entity_key(object)
+        .or_else(|| derive_entity_key(jsonld_id))
+        .ok_or_else(|| {
+            ApiError::bad_request("could not derive entity_key from native JSON-LD @id")
+        })?;
 
     Ok(EntityInput {
         entity_key,
@@ -223,16 +225,43 @@ fn extract_jsonld_type(value: Option<&Value>) -> Option<String> {
     }
 }
 
+fn extract_jsonld_entity_key(object: &serde_json::Map<String, Value>) -> Option<String> {
+    object
+        .get("entity_key")
+        .or_else(|| object.get("aion:entityKey"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn derive_entity_key(jsonld_id: &str) -> Option<String> {
     let trimmed = jsonld_id.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    trimmed
-        .rsplit(['/', '#', ':'])
-        .find(|segment| !segment.trim().is_empty())
-        .map(ToOwned::to_owned)
+    let segments = trimmed
+        .split(['/', '#', ':'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let last = segments.last()?;
+
+    if is_generic_numeric_suffix(last) {
+        return segments
+            .iter()
+            .rev()
+            .skip(1)
+            .find(|segment| !is_generic_numeric_suffix(segment))
+            .map(|prefix| format!("{prefix}-{last}"));
+    }
+
+    Some((*last).to_string())
+}
+
+fn is_generic_numeric_suffix(segment: &str) -> bool {
+    segment.chars().all(|character| character.is_ascii_digit())
 }
 
 async fn get_entity(
@@ -604,6 +633,82 @@ mod tests {
         assert_eq!(entity["entity_type"], "aion:Sensor");
         assert_eq!(entity["jsonld"]["@id"], "urn:aion:sensor:sensor-ld-01");
         assert_eq!(entity["jsonld"]["name"], "Sensor LD 01");
+    }
+
+    #[test]
+    fn derives_entity_key_from_native_jsonld_fields_first() {
+        let explicit = json!({
+            "entity_key": "explicit-zone-key",
+            "aion:entityKey": "semantic-zone-key"
+        });
+        assert_eq!(
+            extract_jsonld_entity_key(explicit.as_object().unwrap()).as_deref(),
+            Some("explicit-zone-key")
+        );
+
+        let semantic = json!({
+            "aion:entityKey": "semantic-zone-key"
+        });
+        assert_eq!(
+            extract_jsonld_entity_key(semantic.as_object().unwrap()).as_deref(),
+            Some("semantic-zone-key")
+        );
+    }
+
+    #[test]
+    fn derives_semantic_entity_key_from_jsonld_id() {
+        assert_eq!(
+            derive_entity_key("urn:aion:farm:01:zone:01").as_deref(),
+            Some("zone-01")
+        );
+        assert_eq!(
+            derive_entity_key("urn:aion:farm:01:soil-sensor:01").as_deref(),
+            Some("soil-sensor-01")
+        );
+        assert_eq!(
+            derive_entity_key("urn:aion:sensor:runtime-jsonld-01").as_deref(),
+            Some("runtime-jsonld-01")
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_native_jsonld_entities_with_numeric_suffixes_without_conflict() {
+        let app = app();
+
+        let zone_response = app
+            .clone()
+            .oneshot(json_ld_request(
+                "POST",
+                "/entities",
+                json!({
+                    "@context": {"aion": "https://aioncore.org/ns#"},
+                    "@id": "urn:aion:farm:01:zone:01",
+                    "@type": "aion:IrrigationZone",
+                    "name": "Zone 01"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(zone_response.status(), StatusCode::CREATED);
+        let zone = to_json(zone_response).await;
+        assert_eq!(zone["entity_key"], "zone-01");
+
+        let sensor_response = app
+            .oneshot(json_ld_request(
+                "POST",
+                "/entities",
+                json!({
+                    "@context": {"aion": "https://aioncore.org/ns#"},
+                    "@id": "urn:aion:farm:01:soil-sensor:01",
+                    "@type": "aion:SoilSensor",
+                    "name": "Soil Sensor 01"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(sensor_response.status(), StatusCode::CREATED);
+        let sensor = to_json(sensor_response).await;
+        assert_eq!(sensor["entity_key"], "soil-sensor-01");
     }
 
     #[tokio::test]

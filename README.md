@@ -118,6 +118,7 @@ $jsonldEntity = @{
   }
   "@id" = "urn:aion:sensor:sensor-ld-01"
   "@type" = "aion:Sensor"
+  "aion:entityKey" = "sensor-ld-01"
   name = "Sensor LD 01"
 } | ConvertTo-Json -Depth 10
 
@@ -126,6 +127,40 @@ Invoke-RestMethod `
   -Uri "http://localhost:8080/entities" `
   -ContentType "application/ld+json" `
   -Body $jsonldEntity
+```
+
+For native JSON-LD, AionCore uses `entity_key` first, then `aion:entityKey`, then derives a key from `@id`. Numeric suffixes are combined with the preceding semantic segment, so these IDs derive distinct keys:
+
+```powershell
+$zone = @{
+  "@context" = @{
+    aion = "https://aioncore.org/ns#"
+  }
+  "@id" = "urn:aion:farm:01:zone:01"
+  "@type" = "aion:IrrigationZone"
+  name = "Zone 01"
+} | ConvertTo-Json -Depth 10
+
+$sensor = @{
+  "@context" = @{
+    aion = "https://aioncore.org/ns#"
+  }
+  "@id" = "urn:aion:farm:01:soil-sensor:01"
+  "@type" = "aion:SoilSensor"
+  name = "Soil Sensor 01"
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/ld+json" `
+  -Body $zone
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/ld+json" `
+  -Body $sensor
 ```
 
 Create a relationship after creating two entities:
