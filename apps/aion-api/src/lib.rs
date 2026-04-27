@@ -1,3 +1,4 @@
+use aion_action::{Action, ActionResult, Capability, Command, CommandStatus};
 use aion_entity::Entity;
 use aion_observation::{Observation, ObservationValue};
 use aion_payload::{
@@ -7,8 +8,9 @@ use aion_payload::{
 use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_storage::{
-    EntityStore, InMemoryStorage, ObservationStore, PayloadProfile, PayloadProfileStore,
-    RawMessageStore, RelationshipStore, StorageError,
+    ActionResultStore, ActionStore, CapabilityStore, CommandStore, EntityStore, InMemoryStorage,
+    ObservationStore, PayloadProfile, PayloadProfileStore, RawMessageStore, RelationshipStore,
+    StorageError,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -118,6 +120,62 @@ pub struct PutPayloadProfileRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PutCapabilityRequest {
+    pub capability_name: String,
+    pub command_type: String,
+    pub protocol: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateCommandRequest {
+    pub target_entity_id: Uuid,
+    pub command_type: String,
+    pub payload: Value,
+    pub requested_by: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommandQuery {
+    pub target_entity_id: Option<Uuid>,
+    pub status: Option<CommandStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateActionRequest {
+    pub command_id: Uuid,
+    pub executor_entity_id: Option<Uuid>,
+    pub action_type: String,
+    pub status: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionQuery {
+    pub command_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateActionResultRequest {
+    pub command_id: Uuid,
+    pub action_id: Uuid,
+    pub status: String,
+    pub verified: bool,
+    pub result_payload: Value,
+    pub observed_at: DateTime<Utc>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionResultQuery {
+    pub action_id: Option<Uuid>,
+    pub command_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ObservationQuery {
     pub feature_of_interest_id: Option<Uuid>,
     pub observed_property: Option<String>,
@@ -172,10 +230,22 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/entities/:entity_id", get(get_entity))
         .route("/entities/:entity_id/context", get(get_entity_context))
         .route(
+            "/entities/:entity_id/capabilities",
+            put(put_capabilities).get(get_capabilities),
+        )
+        .route(
             "/entities/:entity_id/payload-profile",
             put(put_payload_profile).get(get_payload_profile),
         )
         .route("/relationships", post(create_relationship))
+        .route("/commands", post(create_command).get(query_commands))
+        .route("/commands/:command_id", get(get_command))
+        .route("/actions", post(create_action).get(query_actions))
+        .route("/actions/:action_id", get(get_action))
+        .route(
+            "/action-results",
+            post(create_action_result).get(query_action_results),
+        )
         .route("/ingest/http", post(ingest_http))
         .route("/raw-messages", get(query_raw_messages))
         .route("/raw-messages/:raw_message_id", get(get_raw_message))
@@ -398,6 +468,177 @@ async fn get_entity_context(
         outgoing_relationships,
         incoming_relationships,
     }))
+}
+
+async fn put_capabilities(
+    State(state): State<AppState>,
+    Path(entity_id): Path<Uuid>,
+    Json(requests): Json<Vec<PutCapabilityRequest>>,
+) -> Result<(StatusCode, Json<Vec<Capability>>), ApiError> {
+    ensure_entity_exists(&state, entity_id)?;
+    let capabilities = requests
+        .into_iter()
+        .map(|request| {
+            Capability::new(
+                entity_id,
+                request.capability_name,
+                request.command_type,
+                request.protocol,
+                request.metadata,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    let capabilities = state
+        .storage
+        .put_capabilities(state.tenant_id, entity_id, capabilities)?;
+    Ok((StatusCode::OK, Json(capabilities)))
+}
+
+async fn get_capabilities(
+    State(state): State<AppState>,
+    Path(entity_id): Path<Uuid>,
+) -> Result<Json<Vec<Capability>>, ApiError> {
+    ensure_entity_exists(&state, entity_id)?;
+    Ok(Json(
+        state
+            .storage
+            .list_capabilities(state.tenant_id, entity_id)?,
+    ))
+}
+
+async fn create_command(
+    State(state): State<AppState>,
+    Json(request): Json<CreateCommandRequest>,
+) -> Result<(StatusCode, Json<Command>), ApiError> {
+    ensure_entity_exists(&state, request.target_entity_id)?;
+    let command = Command::new(
+        state.tenant_id,
+        request.target_entity_id,
+        request.command_type,
+        request.payload,
+        request.requested_by,
+        request.reason,
+        Utc::now(),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    let command = state.storage.store_command(command)?;
+    Ok((StatusCode::CREATED, Json(command)))
+}
+
+async fn get_command(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+) -> Result<Json<Command>, ApiError> {
+    let command = state
+        .storage
+        .get_command(state.tenant_id, command_id)?
+        .ok_or_else(ApiError::not_found)?;
+
+    Ok(Json(command))
+}
+
+async fn query_commands(
+    State(state): State<AppState>,
+    Query(query): Query<CommandQuery>,
+) -> Result<Json<Vec<Command>>, ApiError> {
+    Ok(Json(state.storage.query_commands(
+        state.tenant_id,
+        query.target_entity_id,
+        query.status,
+    )?))
+}
+
+async fn create_action(
+    State(state): State<AppState>,
+    Json(request): Json<CreateActionRequest>,
+) -> Result<(StatusCode, Json<Action>), ApiError> {
+    ensure_command_exists(&state, request.command_id)?;
+    if let Some(executor_entity_id) = request.executor_entity_id {
+        ensure_entity_exists(&state, executor_entity_id)?;
+    }
+
+    let action = Action::new(
+        state.tenant_id,
+        request.command_id,
+        request.executor_entity_id,
+        request.action_type,
+        request.status,
+        request.started_at,
+        request.finished_at,
+        request.metadata,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    let action = state.storage.store_action(action)?;
+    Ok((StatusCode::CREATED, Json(action)))
+}
+
+async fn get_action(
+    State(state): State<AppState>,
+    Path(action_id): Path<Uuid>,
+) -> Result<Json<Action>, ApiError> {
+    let action = state
+        .storage
+        .get_action(state.tenant_id, action_id)?
+        .ok_or_else(ApiError::not_found)?;
+
+    Ok(Json(action))
+}
+
+async fn query_actions(
+    State(state): State<AppState>,
+    Query(query): Query<ActionQuery>,
+) -> Result<Json<Vec<Action>>, ApiError> {
+    Ok(Json(
+        state
+            .storage
+            .query_actions(state.tenant_id, query.command_id)?,
+    ))
+}
+
+async fn create_action_result(
+    State(state): State<AppState>,
+    Json(request): Json<CreateActionResultRequest>,
+) -> Result<(StatusCode, Json<ActionResult>), ApiError> {
+    ensure_command_exists(&state, request.command_id)?;
+    let action = state
+        .storage
+        .get_action(state.tenant_id, request.action_id)?
+        .ok_or_else(ApiError::not_found)?;
+    if action.command_id != request.command_id {
+        return Err(ApiError::bad_request(
+            "action_id does not belong to command_id",
+        ));
+    }
+
+    let result = ActionResult::new(
+        state.tenant_id,
+        request.command_id,
+        request.action_id,
+        request.status,
+        request.verified,
+        request.result_payload,
+        request.observed_at,
+        request.metadata,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    let result = state.storage.store_action_result(result)?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+async fn query_action_results(
+    State(state): State<AppState>,
+    Query(query): Query<ActionResultQuery>,
+) -> Result<Json<Vec<ActionResult>>, ApiError> {
+    Ok(Json(state.storage.query_action_results(
+        state.tenant_id,
+        query.action_id,
+        query.command_id,
+    )?))
 }
 
 async fn create_observation(
@@ -709,6 +950,14 @@ fn ensure_entity_exists(state: &AppState, entity_id: Uuid) -> Result<(), ApiErro
     state
         .storage
         .get_entity(state.tenant_id, entity_id)?
+        .map(|_| ())
+        .ok_or_else(ApiError::not_found)
+}
+
+fn ensure_command_exists(state: &AppState, command_id: Uuid) -> Result<(), ApiError> {
+    state
+        .storage
+        .get_command(state.tenant_id, command_id)?
         .map(|_| ())
         .ok_or_else(ApiError::not_found)
 }
@@ -1066,6 +1315,222 @@ mod tests {
             profile["attribute_mapping"]["t"]["observed_property"],
             "aion:SoilTemperature"
         );
+    }
+
+    #[tokio::test]
+    async fn manages_capabilities_commands_actions_and_results() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "pump-01", "aion:Pump").await;
+        let executor_id = create_test_entity(&app, "executor-01", "aion:Executor").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/entities/{pump_id}/capabilities"),
+                json!([
+                    {
+                        "capability_name": "StartPump",
+                        "command_type": "StartPump",
+                        "protocol": "http",
+                        "metadata": {
+                            "description": "Start pump motor"
+                        }
+                    },
+                    {
+                        "capability_name": "StopPump",
+                        "command_type": "StopPump",
+                        "protocol": "http"
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let capabilities = to_json(response).await;
+        assert_eq!(capabilities.as_array().unwrap().len(), 2);
+        assert_eq!(capabilities[0]["entity_id"], pump_id);
+        assert_eq!(capabilities[0]["capability_name"], "StartPump");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/entities/{pump_id}/capabilities"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let capabilities = to_json(response).await;
+        assert_eq!(capabilities.as_array().unwrap().len(), 2);
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/commands",
+                json!({
+                    "target_entity_id": pump_id,
+                    "command_type": "StartPump",
+                    "payload": {
+                        "target_state": "running"
+                    },
+                    "requested_by": "operator@example.com",
+                    "reason": "water tank below minimum level"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let command = to_json(response).await;
+        let command_id = command["id"].as_str().unwrap();
+        assert_eq!(command["target_entity_id"], pump_id);
+        assert_eq!(command["status"], "pending");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/commands/{command_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_json(response).await["id"], command_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/commands?target_entity_id={pump_id}&status=pending"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let commands = to_json(response).await;
+        assert_eq!(commands.as_array().unwrap().len(), 1);
+        assert_eq!(commands[0]["id"], command_id);
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/actions",
+                json!({
+                    "command_id": command_id,
+                    "executor_entity_id": executor_id,
+                    "action_type": "StartPump",
+                    "status": "started",
+                    "started_at": "2026-04-27T13:00:00Z",
+                    "metadata": {
+                        "external_correlation_id": "exec-001"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let action = to_json(response).await;
+        let action_id = action["id"].as_str().unwrap();
+        assert_eq!(action["command_id"], command_id);
+        assert_eq!(action["executor_entity_id"], executor_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/actions/{action_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_json(response).await["id"], action_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/actions?command_id={command_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let actions = to_json(response).await;
+        assert_eq!(actions.as_array().unwrap().len(), 1);
+        assert_eq!(actions[0]["command_id"], command_id);
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/action-results",
+                json!({
+                    "command_id": command_id,
+                    "action_id": action_id,
+                    "status": "succeeded",
+                    "verified": true,
+                    "result_payload": {
+                        "pump_state": "running"
+                    },
+                    "observed_at": "2026-04-27T13:00:05Z",
+                    "metadata": {
+                        "verification_source": "simulated_executor"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let result = to_json(response).await;
+        assert_eq!(result["command_id"], command_id);
+        assert_eq!(result["action_id"], action_id);
+        assert_eq!(result["verified"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/action-results?action_id={action_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let results = to_json(response).await;
+        assert_eq!(results.as_array().unwrap().len(), 1);
+        assert_eq!(results[0]["action_id"], action_id);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/action-results?command_id={command_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let results = to_json(response).await;
+        assert_eq!(results.as_array().unwrap().len(), 1);
+        assert_eq!(results[0]["command_id"], command_id);
+        assert_eq!(results[0]["action_id"], action_id);
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use aion_action::{Action, ActionResult, Capability, Command, CommandStatus};
 use aion_entity::Entity;
 use aion_observation::Observation;
 use aion_raw_message::RawMessage;
@@ -181,6 +182,48 @@ pub trait PayloadProfileStore {
     ) -> StorageResult<Option<PayloadProfile>>;
 }
 
+pub trait CapabilityStore {
+    fn put_capabilities(
+        &self,
+        tenant_id: Uuid,
+        entity_id: Uuid,
+        capabilities: Vec<Capability>,
+    ) -> StorageResult<Vec<Capability>>;
+    fn list_capabilities(&self, tenant_id: Uuid, entity_id: Uuid)
+        -> StorageResult<Vec<Capability>>;
+}
+
+pub trait CommandStore {
+    fn store_command(&self, command: Command) -> StorageResult<Command>;
+    fn get_command(&self, tenant_id: Uuid, command_id: Uuid) -> StorageResult<Option<Command>>;
+    fn query_commands(
+        &self,
+        tenant_id: Uuid,
+        target_entity_id: Option<Uuid>,
+        status: Option<CommandStatus>,
+    ) -> StorageResult<Vec<Command>>;
+}
+
+pub trait ActionStore {
+    fn store_action(&self, action: Action) -> StorageResult<Action>;
+    fn get_action(&self, tenant_id: Uuid, action_id: Uuid) -> StorageResult<Option<Action>>;
+    fn query_actions(
+        &self,
+        tenant_id: Uuid,
+        command_id: Option<Uuid>,
+    ) -> StorageResult<Vec<Action>>;
+}
+
+pub trait ActionResultStore {
+    fn store_action_result(&self, result: ActionResult) -> StorageResult<ActionResult>;
+    fn query_action_results(
+        &self,
+        tenant_id: Uuid,
+        action_id: Option<Uuid>,
+        command_id: Option<Uuid>,
+    ) -> StorageResult<Vec<ActionResult>>;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStorage {
     inner: Arc<RwLock<InMemoryState>>,
@@ -196,6 +239,10 @@ struct InMemoryState {
     raw_messages: HashMap<Uuid, RawMessage>,
     observations: HashMap<Uuid, Observation>,
     payload_profiles: HashMap<(Uuid, Uuid), PayloadProfile>,
+    capabilities: HashMap<(Uuid, Uuid), Vec<Capability>>,
+    commands: HashMap<Uuid, Command>,
+    actions: HashMap<Uuid, Action>,
+    action_results: HashMap<Uuid, ActionResult>,
 }
 
 impl InMemoryStorage {
@@ -494,6 +541,158 @@ impl PayloadProfileStore for InMemoryStorage {
     }
 }
 
+impl CapabilityStore for InMemoryStorage {
+    fn put_capabilities(
+        &self,
+        tenant_id: Uuid,
+        entity_id: Uuid,
+        capabilities: Vec<Capability>,
+    ) -> StorageResult<Vec<Capability>> {
+        let mut state = self.write_state()?;
+        state
+            .capabilities
+            .insert((tenant_id, entity_id), capabilities.clone());
+        Ok(capabilities)
+    }
+
+    fn list_capabilities(
+        &self,
+        tenant_id: Uuid,
+        entity_id: Uuid,
+    ) -> StorageResult<Vec<Capability>> {
+        let mut capabilities = self
+            .read_state()?
+            .capabilities
+            .get(&(tenant_id, entity_id))
+            .cloned()
+            .unwrap_or_default();
+
+        capabilities.sort_by(|left, right| left.capability_name.cmp(&right.capability_name));
+        Ok(capabilities)
+    }
+}
+
+impl CommandStore for InMemoryStorage {
+    fn store_command(&self, command: Command) -> StorageResult<Command> {
+        let mut state = self.write_state()?;
+        if state.commands.contains_key(&command.id) {
+            return Err(StorageError::Conflict);
+        }
+
+        state.commands.insert(command.id, command.clone());
+        Ok(command)
+    }
+
+    fn get_command(&self, tenant_id: Uuid, command_id: Uuid) -> StorageResult<Option<Command>> {
+        Ok(self
+            .read_state()?
+            .commands
+            .get(&command_id)
+            .filter(|command| command.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn query_commands(
+        &self,
+        tenant_id: Uuid,
+        target_entity_id: Option<Uuid>,
+        status: Option<CommandStatus>,
+    ) -> StorageResult<Vec<Command>> {
+        let mut commands = self
+            .read_state()?
+            .commands
+            .values()
+            .filter(|command| command.tenant_id == tenant_id)
+            .filter(|command| {
+                target_entity_id
+                    .map(|id| command.target_entity_id == id)
+                    .unwrap_or(true)
+            })
+            .filter(|command| {
+                status
+                    .as_ref()
+                    .map(|status| command.status == *status)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        commands.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        Ok(commands)
+    }
+}
+
+impl ActionStore for InMemoryStorage {
+    fn store_action(&self, action: Action) -> StorageResult<Action> {
+        let mut state = self.write_state()?;
+        if state.actions.contains_key(&action.id) {
+            return Err(StorageError::Conflict);
+        }
+
+        state.actions.insert(action.id, action.clone());
+        Ok(action)
+    }
+
+    fn get_action(&self, tenant_id: Uuid, action_id: Uuid) -> StorageResult<Option<Action>> {
+        Ok(self
+            .read_state()?
+            .actions
+            .get(&action_id)
+            .filter(|action| action.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn query_actions(
+        &self,
+        tenant_id: Uuid,
+        command_id: Option<Uuid>,
+    ) -> StorageResult<Vec<Action>> {
+        let mut actions = self
+            .read_state()?
+            .actions
+            .values()
+            .filter(|action| action.tenant_id == tenant_id)
+            .filter(|action| command_id.map(|id| action.command_id == id).unwrap_or(true))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        actions.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+        Ok(actions)
+    }
+}
+
+impl ActionResultStore for InMemoryStorage {
+    fn store_action_result(&self, result: ActionResult) -> StorageResult<ActionResult> {
+        let mut state = self.write_state()?;
+        if state.action_results.contains_key(&result.id) {
+            return Err(StorageError::Conflict);
+        }
+
+        state.action_results.insert(result.id, result.clone());
+        Ok(result)
+    }
+
+    fn query_action_results(
+        &self,
+        tenant_id: Uuid,
+        action_id: Option<Uuid>,
+        command_id: Option<Uuid>,
+    ) -> StorageResult<Vec<ActionResult>> {
+        let mut results = self
+            .read_state()?
+            .action_results
+            .values()
+            .filter(|result| result.tenant_id == tenant_id)
+            .filter(|result| action_id.map(|id| result.action_id == id).unwrap_or(true))
+            .filter(|result| command_id.map(|id| result.command_id == id).unwrap_or(true))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        results.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
+        Ok(results)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +909,76 @@ mod tests {
         storage.store_raw_message(other).unwrap();
 
         assert_eq!(storage.list_raw_messages(tenant_id).unwrap(), vec![raw]);
+    }
+
+    #[test]
+    fn in_memory_storage_links_command_action_and_result() {
+        use chrono::TimeZone;
+        use serde_json::json;
+
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let target_entity_id = Uuid::new_v4();
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let command = Command::new(
+            tenant_id,
+            target_entity_id,
+            "StartPump",
+            json!({"target_state": "on"}),
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+
+        storage.store_command(command.clone()).unwrap();
+        let action = Action::new(
+            tenant_id,
+            command.id,
+            None,
+            "StartPump",
+            "started",
+            Some(now),
+            None,
+            None,
+        )
+        .unwrap();
+        storage.store_action(action.clone()).unwrap();
+
+        let result = ActionResult::new(
+            tenant_id,
+            command.id,
+            action.id,
+            "succeeded",
+            true,
+            json!({"pump_state": "running"}),
+            now,
+            None,
+        )
+        .unwrap();
+        storage.store_action_result(result.clone()).unwrap();
+
+        assert_eq!(
+            storage
+                .query_commands(
+                    tenant_id,
+                    Some(target_entity_id),
+                    Some(CommandStatus::Pending)
+                )
+                .unwrap(),
+            vec![command]
+        );
+        assert_eq!(
+            storage
+                .query_actions(tenant_id, Some(action.command_id))
+                .unwrap(),
+            vec![action]
+        );
+        assert_eq!(
+            storage
+                .query_action_results(tenant_id, None, Some(result.command_id))
+                .unwrap(),
+            vec![result]
+        );
     }
 }

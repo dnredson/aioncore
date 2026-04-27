@@ -358,4 +358,105 @@ Query observations:
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/observations?feature_of_interest_id=<room-id>"
 ```
 
+Create a smart-building command, action, and action result:
+
+```powershell
+$tank = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "water-tank-01"
+    entity_type = "aion:WaterTank"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:water-tank:01"
+      "@type" = "aion:WaterTank"
+      name = "Water Tank 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$pump = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "pump-01"
+    entity_type = "aion:Pump"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:pump:01"
+      "@type" = "aion:Pump"
+      name = "Pump 01"
+      serves = $tank.id
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$capabilities = @(
+  @{
+    capability_name = "StartPump"
+    command_type = "StartPump"
+    protocol = "http"
+    metadata = @{ description = "Start the pump motor" }
+  },
+  @{
+    capability_name = "StopPump"
+    command_type = "StopPump"
+    protocol = "http"
+    metadata = @{ description = "Stop the pump motor" }
+  }
+) | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/entities/$($pump.id)/capabilities" `
+  -ContentType "application/json" `
+  -Body $capabilities
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities/$($pump.id)/capabilities"
+
+$command = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands" `
+  -ContentType "application/json" `
+  -Body (@{
+    target_entity_id = $pump.id
+    command_type = "StartPump"
+    payload = @{ target_state = "running" }
+    requested_by = "operator@example.com"
+    reason = "Water tank level is below minimum"
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/commands?target_entity_id=$($pump.id)&status=pending"
+
+$action = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/actions" `
+  -ContentType "application/json" `
+  -Body (@{
+    command_id = $command.id
+    executor_entity_id = $pump.id
+    action_type = "StartPump"
+    status = "started"
+    started_at = "2026-04-27T13:00:00Z"
+    metadata = @{ external_correlation_id = "building-sim-001" }
+  } | ConvertTo-Json -Depth 10)
+
+$result = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/action-results" `
+  -ContentType "application/json" `
+  -Body (@{
+    command_id = $command.id
+    action_id = $action.id
+    status = "succeeded"
+    verified = $true
+    result_payload = @{ pump_state = "running" }
+    observed_at = "2026-04-27T13:00:05Z"
+    metadata = @{ verification_source = "simulated_executor" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/action-results?command_id=$($command.id)"
+```
+
 In-memory data is lost when the process exits.
