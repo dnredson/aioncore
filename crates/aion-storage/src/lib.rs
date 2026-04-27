@@ -141,6 +141,7 @@ pub trait RawMessageStore {
         tenant_id: Uuid,
         raw_message_id: Uuid,
     ) -> StorageResult<Option<RawMessage>>;
+    fn list_raw_messages(&self, tenant_id: Uuid) -> StorageResult<Vec<RawMessage>>;
     fn mark_raw_message_normalized(
         &self,
         tenant_id: Uuid,
@@ -366,6 +367,19 @@ impl RawMessageStore for InMemoryStorage {
             .get(&raw_message_id)
             .filter(|raw_message| raw_message.tenant_id == tenant_id)
             .cloned())
+    }
+
+    fn list_raw_messages(&self, tenant_id: Uuid) -> StorageResult<Vec<RawMessage>> {
+        let mut raw_messages = self
+            .read_state()?
+            .raw_messages
+            .values()
+            .filter(|raw_message| raw_message.tenant_id == tenant_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        raw_messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
+        Ok(raw_messages)
     }
 
     fn mark_raw_message_normalized(
@@ -655,5 +669,46 @@ mod tests {
                 .unwrap(),
             profile
         );
+    }
+
+    #[test]
+    fn in_memory_storage_lists_raw_messages_by_tenant() {
+        use aion_raw_message::RawMessageSource;
+        use chrono::TimeZone;
+        use serde_json::json;
+
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let other_tenant_id = Uuid::new_v4();
+        let received_at = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let raw = RawMessage::new(
+            tenant_id,
+            RawMessageSource::Http,
+            Some("/ingest/http".to_string()),
+            Some("sensor-01".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/senml+json".to_string()),
+            json!({"payload_format": "senml-json"}),
+            br#"[{"n":"temperature","v":21.4}]"#.to_vec(),
+            received_at,
+        )
+        .unwrap();
+        let other = RawMessage::new(
+            other_tenant_id,
+            RawMessageSource::Http,
+            Some("/ingest/http".to_string()),
+            Some("sensor-02".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/senml+json".to_string()),
+            json!({"payload_format": "senml-json"}),
+            br#"[{"n":"temperature","v":22.4}]"#.to_vec(),
+            received_at,
+        )
+        .unwrap();
+
+        storage.store_raw_message(raw.clone()).unwrap();
+        storage.store_raw_message(other).unwrap();
+
+        assert_eq!(storage.list_raw_messages(tenant_id).unwrap(), vec![raw]);
     }
 }

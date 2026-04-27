@@ -4,7 +4,7 @@ use aion_payload::{
     CanonicalJsonDecoder, DecodeInput, PayloadDecoder, PayloadFormat, SenMlJsonDecoder,
     UltraLightDecoder,
 };
-use aion_raw_message::{RawMessage, RawMessageSource};
+use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_storage::{
     EntityStore, InMemoryStorage, ObservationStore, PayloadProfile, PayloadProfileStore,
@@ -121,7 +121,31 @@ pub struct PutPayloadProfileRequest {
 pub struct ObservationQuery {
     pub feature_of_interest_id: Option<Uuid>,
     pub observed_property: Option<String>,
+    pub raw_message_id: Option<Uuid>,
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawMessageQuery {
+    pub producer_entity_id: Option<Uuid>,
+    pub feature_of_interest_id: Option<Uuid>,
+    pub payload_format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RawMessageResponse {
+    pub id: Uuid,
+    pub source_type: RawMessageSource,
+    pub protocol: Option<String>,
+    pub content_type: Option<String>,
+    pub payload_format: Option<String>,
+    pub producer_entity_id: Option<Uuid>,
+    pub feature_of_interest_id: Option<Uuid>,
+    pub received_at: DateTime<Utc>,
+    pub normalization_status: NormalizationStatus,
+    pub normalization_error: Option<String>,
+    pub decoder_metadata: Value,
+    pub payload: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +176,8 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/relationships", post(create_relationship))
         .route("/ingest/http", post(ingest_http))
+        .route("/raw-messages", get(query_raw_messages))
+        .route("/raw-messages/:raw_message_id", get(get_raw_message))
         .route(
             "/observations",
             post(create_observation).get(query_observations),
@@ -413,8 +439,67 @@ async fn query_observations(
         None,
         query.limit.unwrap_or(100),
     )?;
+    let observations = if let Some(raw_message_id) = query.raw_message_id {
+        observations
+            .into_iter()
+            .filter(|observation| observation.raw_message_id == Some(raw_message_id))
+            .collect::<Vec<_>>()
+    } else {
+        observations
+    };
 
     Ok(Json(observations))
+}
+
+async fn get_raw_message(
+    State(state): State<AppState>,
+    Path(raw_message_id): Path<Uuid>,
+) -> Result<Json<RawMessageResponse>, ApiError> {
+    let raw_message = state
+        .storage
+        .get_raw_message(state.tenant_id, raw_message_id)?
+        .ok_or_else(ApiError::not_found)?;
+
+    Ok(Json(raw_message_response(raw_message)))
+}
+
+async fn query_raw_messages(
+    State(state): State<AppState>,
+    Query(query): Query<RawMessageQuery>,
+) -> Result<Json<Vec<RawMessageResponse>>, ApiError> {
+    let raw_messages = state
+        .storage
+        .list_raw_messages(state.tenant_id)?
+        .into_iter()
+        .filter(|raw_message| {
+            query
+                .producer_entity_id
+                .map(|id| raw_message_uuid_header(raw_message, "producer_entity_id") == Some(id))
+                .unwrap_or(true)
+        })
+        .filter(|raw_message| {
+            query
+                .feature_of_interest_id
+                .map(|id| {
+                    raw_message_uuid_header(raw_message, "feature_of_interest_id") == Some(id)
+                })
+                .unwrap_or(true)
+        })
+        .filter(|raw_message| {
+            query
+                .payload_format
+                .as_deref()
+                .map(|payload_format| {
+                    raw_message_string_header(raw_message, "payload_format")
+                        .map(|value| value.eq_ignore_ascii_case(payload_format))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true)
+        })
+        .map(raw_message_response)
+        .collect::<Vec<_>>();
+
+    Ok(Json(raw_messages))
 }
 
 async fn ingest_http(
@@ -426,6 +511,20 @@ async fn ingest_http(
 
     let received_at = Utc::now();
     let payload_bytes = payload_to_bytes(&request.payload);
+    let profile = state
+        .storage
+        .get_payload_profile(state.tenant_id, request.producer_entity_id)?;
+    let mapping_source = if request.mapping.is_some() {
+        "request"
+    } else if profile
+        .as_ref()
+        .and_then(|profile| profile.attribute_mapping.as_ref())
+        .is_some()
+    {
+        "payload_profile"
+    } else {
+        "none"
+    };
     let mut raw_message = RawMessage::new(
         state.tenant_id,
         RawMessageSource::Http,
@@ -435,7 +534,13 @@ async fn ingest_http(
         request.content_type.clone(),
         json!({
             "protocol": request.protocol,
-            "payload_format": request.payload_format
+            "payload_format": request.payload_format,
+            "producer_entity_id": request.producer_entity_id,
+            "feature_of_interest_id": request.feature_of_interest_id,
+            "decoder_metadata": {
+                "decoder": request.payload_format,
+                "mapping_source": mapping_source
+            }
         }),
         payload_bytes.clone(),
         received_at,
@@ -444,9 +549,6 @@ async fn ingest_http(
 
     raw_message = state.storage.store_raw_message(raw_message)?;
 
-    let profile = state
-        .storage
-        .get_payload_profile(state.tenant_id, request.producer_entity_id)?;
     let decoder_config = request
         .mapping
         .or_else(|| profile.and_then(|profile| profile.attribute_mapping));
@@ -546,6 +648,59 @@ fn payload_to_bytes(payload: &Value) -> Vec<u8> {
         .as_str()
         .map(|value| value.as_bytes().to_vec())
         .unwrap_or_else(|| payload.to_string().into_bytes())
+}
+
+fn raw_message_response(raw_message: RawMessage) -> RawMessageResponse {
+    let protocol = raw_message_string_header(&raw_message, "protocol");
+    let payload_format = raw_message_string_header(&raw_message, "payload_format")
+        .or(raw_message.decoder_hint.clone());
+    let producer_entity_id = raw_message_uuid_header(&raw_message, "producer_entity_id");
+    let feature_of_interest_id = raw_message_uuid_header(&raw_message, "feature_of_interest_id");
+    let decoder_metadata = raw_message
+        .headers
+        .get("decoder_metadata")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let payload = raw_payload_value(&raw_message.payload);
+
+    RawMessageResponse {
+        id: raw_message.id,
+        source_type: raw_message.source_type,
+        protocol,
+        content_type: raw_message.content_type,
+        payload_format,
+        producer_entity_id,
+        feature_of_interest_id,
+        received_at: raw_message.received_at,
+        normalization_status: raw_message.normalization_status,
+        normalization_error: raw_message.normalization_error,
+        decoder_metadata,
+        payload,
+    }
+}
+
+fn raw_message_string_header(raw_message: &RawMessage, key: &str) -> Option<String> {
+    raw_message
+        .headers
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn raw_message_uuid_header(raw_message: &RawMessage, key: &str) -> Option<Uuid> {
+    raw_message
+        .headers
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+}
+
+fn raw_payload_value(payload: &[u8]) -> Value {
+    serde_json::from_slice(payload).unwrap_or_else(|_| {
+        String::from_utf8(payload.to_vec())
+            .map(Value::String)
+            .unwrap_or_else(|_| json!({"encoding": "binary", "byte_length": payload.len()}))
+    })
 }
 
 fn ensure_entity_exists(state: &AppState, entity_id: Uuid) -> Result<(), ApiError> {
@@ -961,6 +1116,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queries_raw_message_by_id() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+        let ingest = ingest_test_senml(&app, &sensor_id, &plot_id).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/raw-messages/{raw_message_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw_message = to_json(response).await;
+        assert_eq!(raw_message["id"], raw_message_id);
+        assert_eq!(raw_message["protocol"], "http");
+        assert_eq!(raw_message["content_type"], "application/senml+json");
+        assert_eq!(raw_message["payload_format"], "senml-json");
+        assert_eq!(raw_message["producer_entity_id"], sensor_id);
+        assert_eq!(raw_message["feature_of_interest_id"], plot_id);
+        assert_eq!(raw_message["normalization_status"], "normalized");
+        assert_eq!(raw_message["decoder_metadata"]["decoder"], "senml-json");
+        assert_eq!(raw_message["payload"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn queries_raw_messages_by_producer_entity_id() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+        let ingest = ingest_test_senml(&app, &sensor_id, &plot_id).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/raw-messages?producer_entity_id={sensor_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw_messages = to_json(response).await;
+        assert_eq!(raw_messages.as_array().unwrap().len(), 1);
+        assert_eq!(raw_messages[0]["id"], raw_message_id);
+    }
+
+    #[tokio::test]
+    async fn queries_raw_messages_by_payload_format() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+        let ingest = ingest_test_senml(&app, &sensor_id, &plot_id).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/raw-messages?payload_format=senml-json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw_messages = to_json(response).await;
+        assert_eq!(raw_messages.as_array().unwrap().len(), 1);
+        assert_eq!(raw_messages[0]["id"], raw_message_id);
+    }
+
+    #[tokio::test]
+    async fn raw_message_is_linked_to_generated_observations() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+        let ingest = ingest_test_senml(&app, &sensor_id, &plot_id).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/observations?raw_message_id={raw_message_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let observations = to_json(response).await;
+        assert_eq!(observations.as_array().unwrap().len(), 2);
+        assert!(observations
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|observation| observation["raw_message_id"] == raw_message_id));
+    }
+
+    #[tokio::test]
     async fn ingests_ultralight_payload() {
         let app = app();
         let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
@@ -1204,6 +1466,41 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         to_json(response).await["id"].as_str().unwrap().to_string()
+    }
+
+    async fn ingest_test_senml(app: &Router, sensor_id: &str, plot_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "senml-json",
+                    "protocol": "http",
+                    "content_type": "application/senml+json",
+                    "payload": [
+                        {
+                            "bn": "urn:aion:farm:01:soil-sensor:01:",
+                            "bt": 1777294800,
+                            "n": "soil_moisture",
+                            "u": "%",
+                            "v": 18.5
+                        },
+                        {
+                            "n": "soil_temperature",
+                            "u": "Cel",
+                            "v": 24.1
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
     }
 
     fn json_request(method: &str, uri: &str, body: Value) -> Request<Body> {

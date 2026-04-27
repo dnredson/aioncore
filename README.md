@@ -270,6 +270,26 @@ Invoke-RestMethod `
   -Body $ingest
 ```
 
+Inspect a raw message after ingestion:
+
+```text
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages/<raw-message-id>"
+```
+
+Query raw messages:
+
+```text
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages?producer_entity_id=<sensor-id>"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages?feature_of_interest_id=<plot-id>"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages?payload_format=senml-json"
+```
+
+Query observations generated from a raw message:
+
+```text
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/observations?raw_message_id=<raw-message-id>"
+```
+
 Query observations:
 
 ```text
