@@ -6,9 +6,17 @@ version = 4
 name = "aion-api"
 version = "0.1.0"
 dependencies = [
+ "aion-entity",
+ "aion-observation",
+ "aion-relationship",
+ "aion-storage",
  "axum",
+ "chrono",
  "serde",
+ "serde_json",
  "tokio",
+ "tower",
+ "uuid",
 ]
 
 [[package]]

@@ -62,4 +62,64 @@ The architecture should later support distributed deployment, where HTTP ingesti
 
 ## Project Status
 
-AionCore is currently in documentation and MVP planning. Backend and frontend code have not been implemented yet.
+AionCore currently has a minimal Rust workspace, core domain models, SQL migrations, and a local in-memory API runtime for early testing.
+
+## Run Locally Without Docker
+
+The early local runtime uses in-memory storage. It does not require Docker, PostgreSQL, TimescaleDB, NATS, or Mosquitto.
+
+Start the API:
+
+```text
+cargo run -p aion-api
+```
+
+The service listens on:
+
+```text
+http://localhost:8080
+```
+
+Check health:
+
+```text
+curl http://localhost:8080/health
+```
+
+Create an entity:
+
+```text
+curl -X POST http://localhost:8080/entities ^
+  -H "Content-Type: application/json" ^
+  -d "{\"entity_key\":\"sensor-01\",\"entity_type\":\"aion:Sensor\",\"jsonld\":{\"@context\":{\"aion\":\"https://aioncore.org/ns#\"},\"@id\":\"urn:aion:sensor:sensor-01\",\"@type\":\"aion:Sensor\",\"name\":\"Sensor 01\"}}"
+```
+
+Create a relationship after creating two entities:
+
+```text
+curl -X POST http://localhost:8080/relationships ^
+  -H "Content-Type: application/json" ^
+  -d "{\"source_entity_id\":\"<sensor-id>\",\"relationship_type\":\"aion:locatedIn\",\"target_entity_id\":\"<room-id>\",\"jsonld\":{\"@type\":\"aion:Relationship\"}}"
+```
+
+Create an observation:
+
+```text
+curl -X POST http://localhost:8080/observations ^
+  -H "Content-Type: application/json" ^
+  -d "{\"producer_entity_id\":\"<sensor-id>\",\"feature_of_interest_id\":\"<room-id>\",\"observed_property\":\"temperature\",\"value\":{\"type\":\"number\",\"value\":21.4},\"unit\":\"Cel\",\"observed_at\":\"2026-04-27T13:00:00Z\",\"received_at\":\"2026-04-27T13:00:01Z\",\"protocol\":\"http\",\"payload_format\":\"json_mapping\",\"quality\":{},\"metadata\":{}}"
+```
+
+Query entity context:
+
+```text
+curl http://localhost:8080/entities/<entity-id>/context
+```
+
+Query observations:
+
+```text
+curl "http://localhost:8080/observations?feature_of_interest_id=<room-id>"
+```
+
+In-memory data is lost when the process exits.

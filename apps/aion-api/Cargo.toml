@@ -6,6 +6,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aion-entity.workspace = true
+aion-observation.workspace = true
+aion-relationship.workspace = true
+aion-storage.workspace = true
 axum.workspace = true
+chrono.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+tower.workspace = true
+uuid.workspace = true
