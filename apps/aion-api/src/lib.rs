@@ -1,4 +1,6 @@
-use aion_action::{Action, ActionResult, Capability, Command, CommandStatus};
+use aion_action::{
+    Action, ActionResult, ApprovalStatus, Capability, Command, CommandStatus, Policy,
+};
 use aion_entity::Entity;
 use aion_observation::{Observation, ObservationValue};
 use aion_payload::{
@@ -9,8 +11,8 @@ use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_storage::{
     ActionResultStore, ActionStore, CapabilityStore, CommandStore, EntityStore, InMemoryStorage,
-    ObservationStore, PayloadProfile, PayloadProfileStore, RawMessageStore, RelationshipStore,
-    StorageError,
+    ObservationStore, PayloadProfile, PayloadProfileStore, PolicyStore, RawMessageStore,
+    RelationshipStore, StorageError,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -137,6 +139,31 @@ pub struct CreateCommandRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ClaimCommandRequest {
+    pub claimed_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarkFailedCommandRequest {
+    pub failure_reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutPolicyRequest {
+    pub target_entity_id: Option<Uuid>,
+    pub command_type: Option<String>,
+    pub requires_approval: bool,
+    pub auto_execute_allowed: bool,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PolicyQuery {
+    pub target_entity_id: Option<Uuid>,
+    pub command_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CommandQuery {
     pub target_entity_id: Option<Uuid>,
     pub status: Option<CommandStatus>,
@@ -238,7 +265,21 @@ pub fn app_with_state(state: AppState) -> Router {
             put(put_payload_profile).get(get_payload_profile),
         )
         .route("/relationships", post(create_relationship))
+        .route("/policies", put(put_policies).get(query_policies))
         .route("/commands", post(create_command).get(query_commands))
+        .route("/commands/:command_id/claim", post(claim_command))
+        .route("/commands/:command_id/release", post(release_command))
+        .route(
+            "/commands/:command_id/mark-executed",
+            post(mark_command_executed),
+        )
+        .route(
+            "/commands/:command_id/mark-failed",
+            post(mark_command_failed),
+        )
+        .route("/commands/:command_id/cancel", post(cancel_command))
+        .route("/commands/:command_id/approve", post(approve_command))
+        .route("/commands/:command_id/reject", post(reject_command))
         .route("/commands/:command_id", get(get_command))
         .route("/actions", post(create_action).get(query_actions))
         .route("/actions/:action_id", get(get_action))
@@ -508,11 +549,53 @@ async fn get_capabilities(
     ))
 }
 
+async fn put_policies(
+    State(state): State<AppState>,
+    Json(requests): Json<Vec<PutPolicyRequest>>,
+) -> Result<(StatusCode, Json<Vec<Policy>>), ApiError> {
+    for request in &requests {
+        if let Some(target_entity_id) = request.target_entity_id {
+            ensure_entity_exists(&state, target_entity_id)?;
+        }
+    }
+
+    let policies = requests
+        .into_iter()
+        .map(|request| {
+            Policy::new(
+                state.tenant_id,
+                request.target_entity_id,
+                request.command_type,
+                request.requires_approval,
+                request.auto_execute_allowed,
+                request.metadata,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    let policies = state.storage.put_policies(state.tenant_id, policies)?;
+    Ok((StatusCode::OK, Json(policies)))
+}
+
+async fn query_policies(
+    State(state): State<AppState>,
+    Query(query): Query<PolicyQuery>,
+) -> Result<Json<Vec<Policy>>, ApiError> {
+    Ok(Json(state.storage.query_policies(
+        state.tenant_id,
+        query.target_entity_id,
+        query.command_type.as_deref(),
+    )?))
+}
+
 async fn create_command(
     State(state): State<AppState>,
     Json(request): Json<CreateCommandRequest>,
 ) -> Result<(StatusCode, Json<Command>), ApiError> {
     ensure_entity_exists(&state, request.target_entity_id)?;
+    let (approval_status, policy_decision) =
+        command_policy_decision(&state, request.target_entity_id, &request.command_type)?;
     let command = Command::new(
         state.tenant_id,
         request.target_entity_id,
@@ -520,12 +603,71 @@ async fn create_command(
         request.payload,
         request.requested_by,
         request.reason,
+        Some(approval_status),
+        Some(policy_decision),
         Utc::now(),
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let command = state.storage.store_command(command)?;
     Ok((StatusCode::CREATED, Json(command)))
+}
+
+async fn claim_command(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+    Json(request): Json<ClaimCommandRequest>,
+) -> Result<Json<Command>, ApiError> {
+    mutate_command(&state, command_id, |command, now| {
+        command.claim(request.claimed_by, now)
+    })
+}
+
+async fn release_command(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+) -> Result<Json<Command>, ApiError> {
+    mutate_command(&state, command_id, |command, now| command.release(now))
+}
+
+async fn mark_command_executed(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+) -> Result<Json<Command>, ApiError> {
+    mutate_command(&state, command_id, |command, now| {
+        command.mark_executed(now)
+    })
+}
+
+async fn mark_command_failed(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+    Json(request): Json<MarkFailedCommandRequest>,
+) -> Result<Json<Command>, ApiError> {
+    mutate_command(&state, command_id, |command, now| {
+        command.mark_failed(request.failure_reason, now)
+    })
+}
+
+async fn cancel_command(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+) -> Result<Json<Command>, ApiError> {
+    mutate_command(&state, command_id, |command, now| command.cancel(now))
+}
+
+async fn approve_command(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+) -> Result<Json<Command>, ApiError> {
+    mutate_command(&state, command_id, |command, now| command.approve(now))
+}
+
+async fn reject_command(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+) -> Result<Json<Command>, ApiError> {
+    mutate_command(&state, command_id, |command, now| command.reject(now))
 }
 
 async fn get_command(
@@ -960,6 +1102,68 @@ fn ensure_command_exists(state: &AppState, command_id: Uuid) -> Result<(), ApiEr
         .get_command(state.tenant_id, command_id)?
         .map(|_| ())
         .ok_or_else(ApiError::not_found)
+}
+
+fn mutate_command(
+    state: &AppState,
+    command_id: Uuid,
+    mutate: impl FnOnce(&mut Command, DateTime<Utc>) -> Result<(), aion_action::ActionModelError>,
+) -> Result<Json<Command>, ApiError> {
+    let mut command = state
+        .storage
+        .get_command(state.tenant_id, command_id)?
+        .ok_or_else(ApiError::not_found)?;
+    mutate(&mut command, Utc::now()).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let command = state.storage.update_command(command)?;
+    Ok(Json(command))
+}
+
+fn command_policy_decision(
+    state: &AppState,
+    target_entity_id: Uuid,
+    command_type: &str,
+) -> Result<(ApprovalStatus, Value), ApiError> {
+    let policies = state.storage.query_policies(state.tenant_id, None, None)?;
+    let mut matching_policies = policies
+        .into_iter()
+        .filter(|policy| policy.matches(target_entity_id, command_type))
+        .collect::<Vec<_>>();
+
+    matching_policies.sort_by_key(|policy| {
+        (
+            policy.target_entity_id.is_none(),
+            policy.command_type.is_none(),
+            policy.id,
+        )
+    });
+
+    let requires_approval = matching_policies
+        .iter()
+        .any(|policy| policy.requires_approval);
+    let auto_execute_allowed = matching_policies
+        .iter()
+        .any(|policy| policy.auto_execute_allowed);
+    let approval_status = if requires_approval {
+        ApprovalStatus::Required
+    } else {
+        ApprovalStatus::NotRequired
+    };
+    let matched_policy_ids = matching_policies
+        .iter()
+        .map(|policy| policy.id)
+        .collect::<Vec<_>>();
+    let matched_policy_count = matched_policy_ids.len();
+
+    Ok((
+        approval_status,
+        json!({
+            "matched_policy_ids": matched_policy_ids,
+            "matched_policy_count": matched_policy_count,
+            "requires_approval": requires_approval,
+            "auto_execute_allowed": auto_execute_allowed,
+            "safe_default": matched_policy_count == 0
+        }),
+    ))
 }
 
 fn empty_object() -> Value {
@@ -1534,6 +1738,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claims_pending_command_and_rejects_second_claim() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "pump-claim-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/commands/{command_id}/claim"),
+                json!({"claimed_by": "executor-01"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let command = to_json(response).await;
+        assert_eq!(command["status"], "claimed");
+        assert_eq!(command["claimed_by"], "executor-01");
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/commands/{command_id}/claim"),
+                json!({"claimed_by": "executor-02"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(to_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("only be claimed when status is pending"));
+    }
+
+    #[tokio::test]
+    async fn releases_claimed_command_back_to_pending() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "pump-release-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        claim_test_command(&app, command_id, "executor-01").await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/commands/{command_id}/release"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let command = to_json(response).await;
+        assert_eq!(command["status"], "pending");
+        assert!(command["claimed_by"].is_null());
+        assert!(command["claimed_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn marks_claimed_command_executed() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "pump-executed-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        claim_test_command(&app, command_id, "executor-01").await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/commands/{command_id}/mark-executed"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let command = to_json(response).await;
+        assert_eq!(command["status"], "executed");
+        assert!(command["completed_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn marks_claimed_command_failed() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "pump-failed-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        claim_test_command(&app, command_id, "executor-01").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/commands/{command_id}/mark-failed"),
+                json!({"failure_reason": "controller timeout"}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let command = to_json(response).await;
+        assert_eq!(command["status"], "failed");
+        assert_eq!(command["failure_reason"], "controller timeout");
+        assert!(command["completed_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancels_pending_command() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "pump-cancel-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/commands/{command_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let command = to_json(response).await;
+        assert_eq!(command["status"], "cancelled");
+        assert!(command["completed_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn policy_requires_approval_before_claim() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "pump-policy-01", "aion:Pump").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                "/policies",
+                json!([
+                    {
+                        "target_entity_id": pump_id,
+                        "command_type": "StartPump",
+                        "requires_approval": true,
+                        "auto_execute_allowed": false,
+                        "metadata": {
+                            "reason": "physical actuation"
+                        }
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let policies = to_json(response).await;
+        assert_eq!(policies.as_array().unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/policies?target_entity_id={pump_id}&command_type=StartPump"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_json(response).await.as_array().unwrap().len(), 1);
+
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        assert_eq!(command["approval_status"], "required");
+        assert_eq!(command["policy_decision"]["requires_approval"], true);
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/commands/{command_id}/claim"),
+                json!({"claimed_by": "executor-01"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(to_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires approval"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/commands/{command_id}/approve"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_json(response).await["approval_status"], "approved");
+
+        let claimed = claim_test_command(&app, command_id, "executor-01").await;
+        assert_eq!(claimed["status"], "claimed");
+    }
+
+    #[tokio::test]
+    async fn rejected_command_cannot_be_claimed() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "pump-rejected-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/commands/{command_id}/reject"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_json(response).await["approval_status"], "rejected");
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/commands/{command_id}/claim"),
+                json!({"claimed_by": "executor-01"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(to_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("rejected"));
+    }
+
+    #[tokio::test]
     async fn ingests_senml_json_payload() {
         let app = app();
         let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
@@ -1961,6 +2417,50 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         to_json(response).await["id"].as_str().unwrap().to_string()
+    }
+
+    async fn create_test_command(
+        app: &Router,
+        target_entity_id: &str,
+        command_type: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/commands",
+                json!({
+                    "target_entity_id": target_entity_id,
+                    "command_type": command_type,
+                    "payload": {
+                        "target_state": "running"
+                    },
+                    "requested_by": "test",
+                    "reason": "test command"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn claim_test_command(app: &Router, command_id: &str, claimed_by: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/commands/{command_id}/claim"),
+                json!({
+                    "claimed_by": claimed_by
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
     }
 
     async fn ingest_test_senml(app: &Router, sensor_id: &str, plot_id: &str) -> Value {

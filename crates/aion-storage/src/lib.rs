@@ -1,4 +1,4 @@
-use aion_action::{Action, ActionResult, Capability, Command, CommandStatus};
+use aion_action::{Action, ActionResult, Capability, Command, CommandStatus, Policy};
 use aion_entity::Entity;
 use aion_observation::Observation;
 use aion_raw_message::RawMessage;
@@ -195,6 +195,7 @@ pub trait CapabilityStore {
 
 pub trait CommandStore {
     fn store_command(&self, command: Command) -> StorageResult<Command>;
+    fn update_command(&self, command: Command) -> StorageResult<Command>;
     fn get_command(&self, tenant_id: Uuid, command_id: Uuid) -> StorageResult<Option<Command>>;
     fn query_commands(
         &self,
@@ -202,6 +203,16 @@ pub trait CommandStore {
         target_entity_id: Option<Uuid>,
         status: Option<CommandStatus>,
     ) -> StorageResult<Vec<Command>>;
+}
+
+pub trait PolicyStore {
+    fn put_policies(&self, tenant_id: Uuid, policies: Vec<Policy>) -> StorageResult<Vec<Policy>>;
+    fn query_policies(
+        &self,
+        tenant_id: Uuid,
+        target_entity_id: Option<Uuid>,
+        command_type: Option<&str>,
+    ) -> StorageResult<Vec<Policy>>;
 }
 
 pub trait ActionStore {
@@ -241,6 +252,7 @@ struct InMemoryState {
     payload_profiles: HashMap<(Uuid, Uuid), PayloadProfile>,
     capabilities: HashMap<(Uuid, Uuid), Vec<Capability>>,
     commands: HashMap<Uuid, Command>,
+    policies: HashMap<Uuid, Policy>,
     actions: HashMap<Uuid, Action>,
     action_results: HashMap<Uuid, ActionResult>,
 }
@@ -583,6 +595,18 @@ impl CommandStore for InMemoryStorage {
         Ok(command)
     }
 
+    fn update_command(&self, command: Command) -> StorageResult<Command> {
+        let mut state = self.write_state()?;
+        let stored = state
+            .commands
+            .get_mut(&command.id)
+            .filter(|stored| stored.tenant_id == command.tenant_id)
+            .ok_or(StorageError::NotFound)?;
+
+        *stored = command.clone();
+        Ok(command)
+    }
+
     fn get_command(&self, tenant_id: Uuid, command_id: Uuid) -> StorageResult<Option<Command>> {
         Ok(self
             .read_state()?
@@ -619,6 +643,59 @@ impl CommandStore for InMemoryStorage {
 
         commands.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         Ok(commands)
+    }
+}
+
+impl PolicyStore for InMemoryStorage {
+    fn put_policies(&self, tenant_id: Uuid, policies: Vec<Policy>) -> StorageResult<Vec<Policy>> {
+        let mut state = self.write_state()?;
+        state
+            .policies
+            .retain(|_, policy| policy.tenant_id != tenant_id);
+        for policy in &policies {
+            if policy.tenant_id != tenant_id {
+                return Err(StorageError::InvalidInput(
+                    "policy tenant_id does not match requested tenant".to_string(),
+                ));
+            }
+            state.policies.insert(policy.id, policy.clone());
+        }
+
+        Ok(policies)
+    }
+
+    fn query_policies(
+        &self,
+        tenant_id: Uuid,
+        target_entity_id: Option<Uuid>,
+        command_type: Option<&str>,
+    ) -> StorageResult<Vec<Policy>> {
+        let mut policies = self
+            .read_state()?
+            .policies
+            .values()
+            .filter(|policy| policy.tenant_id == tenant_id)
+            .filter(|policy| {
+                target_entity_id
+                    .map(|id| policy.target_entity_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|policy| {
+                command_type
+                    .map(|command_type| policy.command_type.as_deref() == Some(command_type))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        policies.sort_by_key(|policy| {
+            (
+                policy.target_entity_id.is_none(),
+                policy.command_type.is_none(),
+                policy.id,
+            )
+        });
+        Ok(policies)
     }
 }
 
@@ -925,6 +1002,8 @@ mod tests {
             target_entity_id,
             "StartPump",
             json!({"target_state": "on"}),
+            None,
+            None,
             None,
             None,
             now,

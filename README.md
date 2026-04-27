@@ -459,4 +459,113 @@ $result = Invoke-RestMethod `
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/action-results?command_id=$($command.id)"
 ```
 
+Create an approval-gated StartPump command:
+
+```powershell
+$pump = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "approval-pump-01"
+    entity_type = "aion:Pump"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:approval-pump:01"
+      "@type" = "aion:Pump"
+      name = "Approval Pump 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$capabilities = @(
+  @{
+    capability_name = "StartPump"
+    command_type = "StartPump"
+    protocol = "http"
+    metadata = @{ description = "Start the pump motor" }
+  }
+) | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/entities/$($pump.id)/capabilities" `
+  -ContentType "application/json" `
+  -Body $capabilities
+
+$policies = @(
+  @{
+    target_entity_id = $pump.id
+    command_type = "StartPump"
+    requires_approval = $true
+    auto_execute_allowed = $false
+    metadata = @{ reason = "Physical actuation requires approval" }
+  }
+) | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/policies" `
+  -ContentType "application/json" `
+  -Body $policies
+
+$command = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands" `
+  -ContentType "application/json" `
+  -Body (@{
+    target_entity_id = $pump.id
+    command_type = "StartPump"
+    payload = @{ target_state = "running" }
+    requested_by = "operator@example.com"
+    reason = "Water tank level is below minimum"
+  } | ConvertTo-Json -Depth 10)
+
+try {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/commands/$($command.id)/claim" `
+    -ContentType "application/json" `
+    -Body (@{ claimed_by = "edge-agent-01" } | ConvertTo-Json)
+} catch {
+  $_.ErrorDetails.Message
+}
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($command.id)/approve"
+
+$claimed = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands/$($command.id)/claim" `
+  -ContentType "application/json" `
+  -Body (@{ claimed_by = "edge-agent-01" } | ConvertTo-Json)
+
+$action = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/actions" `
+  -ContentType "application/json" `
+  -Body (@{
+    command_id = $claimed.id
+    executor_entity_id = $pump.id
+    action_type = "StartPump"
+    status = "started"
+    started_at = "2026-04-27T13:00:00Z"
+    metadata = @{ external_correlation_id = "edge-agent-001" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($claimed.id)/mark-executed"
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/action-results" `
+  -ContentType "application/json" `
+  -Body (@{
+    command_id = $claimed.id
+    action_id = $action.id
+    status = "succeeded"
+    verified = $true
+    result_payload = @{ pump_state = "running" }
+    observed_at = "2026-04-27T13:00:05Z"
+    metadata = @{ verification_source = "edge-agent-01" }
+  } | ConvertTo-Json -Depth 10)
+```
+
 In-memory data is lost when the process exits.
