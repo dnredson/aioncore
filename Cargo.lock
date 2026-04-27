@@ -8,6 +8,8 @@ version = "0.1.0"
 dependencies = [
  "aion-entity",
  "aion-observation",
+ "aion-payload",
+ "aion-raw-message",
  "aion-relationship",
  "aion-storage",
  "axum",

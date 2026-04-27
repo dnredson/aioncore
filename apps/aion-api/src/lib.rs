@@ -1,8 +1,14 @@
 use aion_entity::Entity;
 use aion_observation::{Observation, ObservationValue};
+use aion_payload::{
+    CanonicalJsonDecoder, DecodeInput, PayloadDecoder, PayloadFormat, SenMlJsonDecoder,
+    UltraLightDecoder,
+};
+use aion_raw_message::{RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_storage::{
-    EntityStore, InMemoryStorage, ObservationStore, RelationshipStore, StorageError,
+    EntityStore, InMemoryStorage, ObservationStore, RawMessageStore, RelationshipStore,
+    StorageError,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -14,6 +20,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -84,6 +91,24 @@ pub struct CreateObservationRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct HttpIngestRequest {
+    pub producer_entity_id: Uuid,
+    pub feature_of_interest_id: Uuid,
+    pub payload_format: String,
+    pub protocol: String,
+    pub content_type: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub payload: Value,
+    pub mapping: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HttpIngestResponse {
+    pub raw_message_id: Uuid,
+    pub observations: Vec<Observation>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ObservationQuery {
     pub feature_of_interest_id: Option<Uuid>,
     pub observed_property: Option<String>,
@@ -113,6 +138,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/entities/:entity_id", get(get_entity))
         .route("/entities/:entity_id/context", get(get_entity_context))
         .route("/relationships", post(create_relationship))
+        .route("/ingest/http", post(ingest_http))
         .route(
             "/observations",
             post(create_observation).get(query_observations),
@@ -313,6 +339,109 @@ async fn query_observations(
     )?;
 
     Ok(Json(observations))
+}
+
+async fn ingest_http(
+    State(state): State<AppState>,
+    Json(request): Json<HttpIngestRequest>,
+) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
+    ensure_entity_exists(&state, request.producer_entity_id)?;
+    ensure_entity_exists(&state, request.feature_of_interest_id)?;
+
+    let received_at = Utc::now();
+    let payload_bytes = payload_to_bytes(&request.payload);
+    let mut raw_message = RawMessage::new(
+        state.tenant_id,
+        RawMessageSource::Http,
+        Some("/ingest/http".to_string()),
+        Some(request.producer_entity_id.to_string()),
+        Some(request.payload_format.clone()),
+        request.content_type.clone(),
+        json!({
+            "protocol": request.protocol,
+            "payload_format": request.payload_format
+        }),
+        payload_bytes.clone(),
+        received_at,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    raw_message = state.storage.store_raw_message(raw_message)?;
+
+    let decoder = decoder_for_format(&request.payload_format)?;
+    let decode_result = decoder.decode(DecodeInput {
+        tenant_id: state.tenant_id,
+        device_key: Some(request.producer_entity_id.to_string()),
+        format: PayloadFormat::from_str(&request.payload_format).unwrap(),
+        content_type: request.content_type,
+        payload: payload_bytes,
+        received_at: request.observed_at.unwrap_or(received_at),
+        config: request.mapping,
+    });
+
+    let decoded = match decode_result {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            state.storage.mark_raw_message_failed(
+                state.tenant_id,
+                raw_message.id,
+                err.message(),
+            )?;
+            return Err(ApiError::bad_request(err.to_string()));
+        }
+    };
+
+    let mut observations = Vec::with_capacity(decoded.len());
+    for measurement in decoded {
+        let observation = Observation::new(
+            state.tenant_id,
+            request.producer_entity_id,
+            request.feature_of_interest_id,
+            measurement.observed_property,
+            measurement.value,
+            measurement.unit,
+            measurement.time,
+            received_at,
+            request.protocol.clone(),
+            request.payload_format.clone(),
+            Some(raw_message.id),
+            json!({}),
+            measurement.metadata,
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        observations.push(state.storage.store_observation(observation)?);
+    }
+
+    state
+        .storage
+        .mark_raw_message_normalized(state.tenant_id, raw_message.id)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(HttpIngestResponse {
+            raw_message_id: raw_message.id,
+            observations,
+        }),
+    ))
+}
+
+fn decoder_for_format(payload_format: &str) -> Result<Box<dyn PayloadDecoder>, ApiError> {
+    let normalized = payload_format.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "senml" | "senml_json" => Ok(Box::new(SenMlJsonDecoder)),
+        "ultralight" | "ultra_light" => Ok(Box::new(UltraLightDecoder)),
+        "canonical_json" | "canonical" => Ok(Box::new(CanonicalJsonDecoder)),
+        _ => Err(ApiError::bad_request(format!(
+            "unsupported payload_format: {payload_format}"
+        ))),
+    }
+}
+
+fn payload_to_bytes(payload: &Value) -> Vec<u8> {
+    payload
+        .as_str()
+        .map(|value| value.as_bytes().to_vec())
+        .unwrap_or_else(|| payload.to_string().into_bytes())
 }
 
 fn ensure_entity_exists(state: &AppState, entity_id: Uuid) -> Result<(), ApiError> {
@@ -518,6 +647,187 @@ mod tests {
         let observations = to_json(response).await;
         assert_eq!(observations.as_array().unwrap().len(), 1);
         assert_eq!(observations[0]["observed_property"], "temperature");
+    }
+
+    #[tokio::test]
+    async fn ingests_senml_json_payload() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "senml-json",
+                    "protocol": "http",
+                    "content_type": "application/senml+json",
+                    "payload": [
+                        {
+                            "bn": "urn:aion:farm:01:soil-sensor:01:",
+                            "bt": 1777294800,
+                            "n": "soil_moisture",
+                            "u": "%",
+                            "v": 18.5
+                        },
+                        {
+                            "n": "soil_temperature",
+                            "u": "Cel",
+                            "v": 24.1
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        assert!(ingest["raw_message_id"].as_str().is_some());
+        assert_eq!(ingest["observations"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            ingest["observations"][0]["observed_property"],
+            "soil_moisture"
+        );
+        assert_eq!(
+            ingest["observations"][1]["observed_property"],
+            "soil_temperature"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingests_ultralight_payload() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "ultralight",
+                    "protocol": "http",
+                    "content_type": "text/plain",
+                    "observed_at": "2026-04-27T13:00:00Z",
+                    "payload": "m|18.5|t|24.1",
+                    "mapping": {
+                        "m": {
+                            "observed_property": "aion:SoilMoisture",
+                            "unit": "%"
+                        },
+                        "t": {
+                            "observed_property": "aion:SoilTemperature",
+                            "unit": "Cel"
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        assert_eq!(ingest["observations"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            ingest["observations"][0]["observed_property"],
+            "aion:SoilMoisture"
+        );
+        assert_eq!(ingest["observations"][0]["unit"], "%");
+        assert_eq!(
+            ingest["observations"][1]["observed_property"],
+            "aion:SoilTemperature"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingests_canonical_json_payload() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "canonical-json",
+                    "protocol": "http",
+                    "content_type": "application/json",
+                    "payload": {
+                        "observations": [
+                            {
+                                "observed_property": "aion:SoilMoisture",
+                                "value": {"type": "number", "value": 18.5},
+                                "unit": "%",
+                                "observed_at": "2026-04-27T13:00:00Z"
+                            }
+                        ]
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        assert_eq!(ingest["observations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            ingest["observations"][0]["raw_message_id"],
+            ingest["raw_message_id"]
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/observations?feature_of_interest_id={plot_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let observations = to_json(response).await;
+        assert_eq!(observations.as_array().unwrap().len(), 1);
+        assert_eq!(observations[0]["observed_property"], "aion:SoilMoisture");
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_ingest_payload_after_raw_storage() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "senml-json",
+                    "protocol": "http",
+                    "content_type": "application/senml+json",
+                    "payload": "not json"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = to_json(response).await;
+        assert!(error["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid SenML JSON payload"));
     }
 
     async fn create_test_entity(app: &Router, key: &str, entity_type: &str) -> String {
