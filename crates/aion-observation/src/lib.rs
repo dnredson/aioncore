@@ -32,11 +32,15 @@ impl std::error::Error for ObservationError {}
 pub struct Observation {
     pub id: Uuid,
     pub tenant_id: Uuid,
-    pub entity_id: Uuid,
+    pub producer_entity_id: Uuid,
+    pub feature_of_interest_id: Uuid,
     pub observed_property: String,
-    pub time: DateTime<Utc>,
     pub value: ObservationValue,
     pub unit: Option<String>,
+    pub observed_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub protocol: String,
+    pub payload_format: String,
     pub raw_message_id: Option<Uuid>,
     pub quality: Value,
     pub metadata: Value,
@@ -46,11 +50,15 @@ impl Observation {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant_id: Uuid,
-        entity_id: Uuid,
+        producer_entity_id: Uuid,
+        feature_of_interest_id: Uuid,
         observed_property: impl Into<String>,
-        time: DateTime<Utc>,
         value: ObservationValue,
         unit: Option<String>,
+        observed_at: DateTime<Utc>,
+        received_at: DateTime<Utc>,
+        protocol: impl Into<String>,
+        payload_format: impl Into<String>,
         raw_message_id: Option<Uuid>,
         quality: Value,
         metadata: Value,
@@ -64,11 +72,15 @@ impl Observation {
         Ok(Self {
             id: Uuid::new_v4(),
             tenant_id,
-            entity_id,
+            producer_entity_id,
+            feature_of_interest_id,
             observed_property,
-            time,
             value,
             unit,
+            observed_at,
+            received_at,
+            protocol: protocol.into(),
+            payload_format: payload_format.into(),
             raw_message_id,
             quality,
             metadata,
@@ -85,17 +97,23 @@ mod tests {
     #[test]
     fn creates_numeric_observation() {
         let tenant_id = Uuid::new_v4();
-        let entity_id = Uuid::new_v4();
+        let producer_entity_id = Uuid::new_v4();
+        let feature_of_interest_id = Uuid::new_v4();
         let raw_message_id = Uuid::new_v4();
-        let time = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let observed_at = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let received_at = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 1).unwrap();
 
         let observation = Observation::new(
             tenant_id,
-            entity_id,
+            producer_entity_id,
+            feature_of_interest_id,
             "temperature",
-            time,
             ObservationValue::Number { value: 21.4 },
             Some("Cel".to_string()),
+            observed_at,
+            received_at,
+            "http",
+            "senml_json",
             Some(raw_message_id),
             json!({}),
             json!({"decoder": "senml_json"}),
@@ -103,9 +121,14 @@ mod tests {
         .expect("observation should be valid");
 
         assert_eq!(observation.tenant_id, tenant_id);
-        assert_eq!(observation.entity_id, entity_id);
+        assert_eq!(observation.producer_entity_id, producer_entity_id);
+        assert_eq!(observation.feature_of_interest_id, feature_of_interest_id);
         assert_eq!(observation.observed_property, "temperature");
         assert_eq!(observation.unit.as_deref(), Some("Cel"));
+        assert_eq!(observation.observed_at, observed_at);
+        assert_eq!(observation.received_at, received_at);
+        assert_eq!(observation.protocol, "http");
+        assert_eq!(observation.payload_format, "senml_json");
         assert_eq!(observation.raw_message_id, Some(raw_message_id));
     }
 
@@ -114,10 +137,14 @@ mod tests {
         let err = Observation::new(
             Uuid::new_v4(),
             Uuid::new_v4(),
+            Uuid::new_v4(),
             " ",
-            Utc::now(),
             ObservationValue::Bool { value: true },
             None,
+            Utc::now(),
+            Utc::now(),
+            "http",
+            "json_mapping",
             None,
             json!({}),
             json!({}),

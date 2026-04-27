@@ -6,6 +6,7 @@ members = [
     "crates/aion-payload",
     "crates/aion-raw-message",
     "crates/aion-relationship",
+    "crates/aion-storage",
 ]
 resolver = "2"
 
@@ -27,3 +28,4 @@ aion-observation = { path = "crates/aion-observation" }
 aion-payload = { path = "crates/aion-payload" }
 aion-raw-message = { path = "crates/aion-raw-message" }
 aion-relationship = { path = "crates/aion-relationship" }
+aion-storage = { path = "crates/aion-storage" }

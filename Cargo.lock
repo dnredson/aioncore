@@ -63,6 +63,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aion-storage"
+version = "0.1.0"
+dependencies = [
+ "aion-entity",
+ "aion-observation",
+ "aion-raw-message",
+ "aion-relationship",
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
