@@ -215,6 +215,61 @@ Query entity context:
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities/<entity-id>/context"
 ```
 
+Attach an UltraLight payload profile to a sensor:
+
+```powershell
+$profile = @{
+  payload_format = "ultralight"
+  protocol = "http"
+  content_type = "text/plain"
+  attribute_mapping = @{
+    m = @{
+      observed_property = "aion:SoilMoisture"
+      unit = "%"
+    }
+    t = @{
+      observed_property = "aion:SoilTemperature"
+      unit = "Cel"
+    }
+  }
+  metadata = @{
+    profile_version = 1
+  }
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/entities/<sensor-id>/payload-profile" `
+  -ContentType "application/json" `
+  -Body $profile
+```
+
+Retrieve a sensor payload profile:
+
+```text
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities/<sensor-id>/payload-profile"
+```
+
+Ingest UltraLight telemetry using the stored payload profile:
+
+```powershell
+$ingest = @{
+  producer_entity_id = "<sensor-id>"
+  feature_of_interest_id = "<plot-id>"
+  payload_format = "ultralight"
+  protocol = "http"
+  content_type = "text/plain"
+  observed_at = "2026-04-27T13:00:00Z"
+  payload = "m|18.5|t|24.1"
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingest/http" `
+  -ContentType "application/json" `
+  -Body $ingest
+```
+
 Query observations:
 
 ```text

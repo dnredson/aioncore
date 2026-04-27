@@ -50,6 +50,43 @@ pub struct Tenant {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PayloadProfile {
+    pub entity_id: Uuid,
+    pub payload_format: String,
+    pub protocol: Option<String>,
+    pub content_type: Option<String>,
+    pub attribute_mapping: Option<Value>,
+    pub metadata: Option<Value>,
+}
+
+impl PayloadProfile {
+    pub fn new(
+        entity_id: Uuid,
+        payload_format: impl Into<String>,
+        protocol: Option<String>,
+        content_type: Option<String>,
+        attribute_mapping: Option<Value>,
+        metadata: Option<Value>,
+    ) -> StorageResult<Self> {
+        let payload_format = payload_format.into();
+        if payload_format.trim().is_empty() {
+            return Err(StorageError::InvalidInput(
+                "payload_format must not be empty".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            entity_id,
+            payload_format,
+            protocol,
+            content_type,
+            attribute_mapping,
+            metadata,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
     NotFound,
@@ -130,6 +167,19 @@ pub trait ObservationStore {
     ) -> StorageResult<Vec<Observation>>;
 }
 
+pub trait PayloadProfileStore {
+    fn put_payload_profile(
+        &self,
+        tenant_id: Uuid,
+        profile: PayloadProfile,
+    ) -> StorageResult<PayloadProfile>;
+    fn get_payload_profile(
+        &self,
+        tenant_id: Uuid,
+        entity_id: Uuid,
+    ) -> StorageResult<Option<PayloadProfile>>;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStorage {
     inner: Arc<RwLock<InMemoryState>>,
@@ -144,6 +194,7 @@ struct InMemoryState {
     relationships: HashMap<Uuid, Relationship>,
     raw_messages: HashMap<Uuid, RawMessage>,
     observations: HashMap<Uuid, Observation>,
+    payload_profiles: HashMap<(Uuid, Uuid), PayloadProfile>,
 }
 
 impl InMemoryStorage {
@@ -403,6 +454,32 @@ impl ObservationStore for InMemoryStorage {
     }
 }
 
+impl PayloadProfileStore for InMemoryStorage {
+    fn put_payload_profile(
+        &self,
+        tenant_id: Uuid,
+        profile: PayloadProfile,
+    ) -> StorageResult<PayloadProfile> {
+        let mut state = self.write_state()?;
+        state
+            .payload_profiles
+            .insert((tenant_id, profile.entity_id), profile.clone());
+        Ok(profile)
+    }
+
+    fn get_payload_profile(
+        &self,
+        tenant_id: Uuid,
+        entity_id: Uuid,
+    ) -> StorageResult<Option<PayloadProfile>> {
+        Ok(self
+            .read_state()?
+            .payload_profiles
+            .get(&(tenant_id, entity_id))
+            .cloned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,5 +620,40 @@ mod tests {
 
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].observed_property, "temperature");
+    }
+
+    #[test]
+    fn in_memory_storage_puts_and_gets_payload_profiles() {
+        use serde_json::json;
+
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let entity_id = Uuid::new_v4();
+        let profile = PayloadProfile::new(
+            entity_id,
+            "ultralight",
+            Some("http".to_string()),
+            Some("text/plain".to_string()),
+            Some(json!({
+                "m": {
+                    "observed_property": "aion:SoilMoisture",
+                    "unit": "%"
+                }
+            })),
+            Some(json!({"source": "test"})),
+        )
+        .unwrap();
+
+        storage
+            .put_payload_profile(tenant_id, profile.clone())
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_payload_profile(tenant_id, entity_id)
+                .unwrap()
+                .unwrap(),
+            profile
+        );
     }
 }

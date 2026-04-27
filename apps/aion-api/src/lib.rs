@@ -7,14 +7,14 @@ use aion_payload::{
 use aion_raw_message::{RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_storage::{
-    EntityStore, InMemoryStorage, ObservationStore, RawMessageStore, RelationshipStore,
-    StorageError,
+    EntityStore, InMemoryStorage, ObservationStore, PayloadProfile, PayloadProfileStore,
+    RawMessageStore, RelationshipStore, StorageError,
 };
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -109,6 +109,15 @@ pub struct HttpIngestResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PutPayloadProfileRequest {
+    pub payload_format: String,
+    pub protocol: Option<String>,
+    pub content_type: Option<String>,
+    pub attribute_mapping: Option<Value>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ObservationQuery {
     pub feature_of_interest_id: Option<Uuid>,
     pub observed_property: Option<String>,
@@ -137,6 +146,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/entities", post(create_entity).get(list_entities))
         .route("/entities/:entity_id", get(get_entity))
         .route("/entities/:entity_id/context", get(get_entity_context))
+        .route(
+            "/entities/:entity_id/payload-profile",
+            put(put_payload_profile).get(get_payload_profile),
+        )
         .route("/relationships", post(create_relationship))
         .route("/ingest/http", post(ingest_http))
         .route(
@@ -301,6 +314,40 @@ async fn create_relationship(
     Ok((StatusCode::CREATED, Json(relationship)))
 }
 
+async fn put_payload_profile(
+    State(state): State<AppState>,
+    Path(entity_id): Path<Uuid>,
+    Json(request): Json<PutPayloadProfileRequest>,
+) -> Result<(StatusCode, Json<PayloadProfile>), ApiError> {
+    ensure_entity_exists(&state, entity_id)?;
+    let profile = PayloadProfile::new(
+        entity_id,
+        request.payload_format,
+        request.protocol,
+        request.content_type,
+        request.attribute_mapping,
+        request.metadata,
+    )?;
+    let profile = state
+        .storage
+        .put_payload_profile(state.tenant_id, profile)?;
+
+    Ok((StatusCode::OK, Json(profile)))
+}
+
+async fn get_payload_profile(
+    State(state): State<AppState>,
+    Path(entity_id): Path<Uuid>,
+) -> Result<Json<PayloadProfile>, ApiError> {
+    ensure_entity_exists(&state, entity_id)?;
+    let profile = state
+        .storage
+        .get_payload_profile(state.tenant_id, entity_id)?
+        .ok_or_else(ApiError::not_found)?;
+
+    Ok(Json(profile))
+}
+
 async fn get_entity_context(
     State(state): State<AppState>,
     Path(entity_id): Path<Uuid>,
@@ -397,6 +444,23 @@ async fn ingest_http(
 
     raw_message = state.storage.store_raw_message(raw_message)?;
 
+    let profile = state
+        .storage
+        .get_payload_profile(state.tenant_id, request.producer_entity_id)?;
+    let decoder_config = request
+        .mapping
+        .or_else(|| profile.and_then(|profile| profile.attribute_mapping));
+    if payload_format_requires_mapping(&request.payload_format) && decoder_config.is_none() {
+        let message = format!(
+            "{} payloads require request mapping or producer PayloadProfile attribute_mapping",
+            request.payload_format
+        );
+        state
+            .storage
+            .mark_raw_message_failed(state.tenant_id, raw_message.id, &message)?;
+        return Err(ApiError::bad_request(message));
+    }
+
     let decoder = decoder_for_format(&request.payload_format)?;
     let decode_result = decoder.decode(DecodeInput {
         tenant_id: state.tenant_id,
@@ -405,7 +469,7 @@ async fn ingest_http(
         content_type: request.content_type,
         payload: payload_bytes,
         received_at: request.observed_at.unwrap_or(received_at),
-        config: request.mapping,
+        config: decoder_config,
     });
 
     let decoded = match decode_result {
@@ -464,6 +528,17 @@ fn decoder_for_format(payload_format: &str) -> Result<Box<dyn PayloadDecoder>, A
             "unsupported payload_format: {payload_format}"
         ))),
     }
+}
+
+fn payload_format_requires_mapping(payload_format: &str) -> bool {
+    matches!(
+        payload_format
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .as_str(),
+        "ultralight" | "ultra_light"
+    )
 }
 
 fn payload_to_bytes(payload: &Value) -> Vec<u8> {
@@ -755,6 +830,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_payload_profile() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+
+        let response = app
+            .oneshot(json_request(
+                "PUT",
+                &format!("/entities/{sensor_id}/payload-profile"),
+                json!({
+                    "payload_format": "ultralight",
+                    "protocol": "http",
+                    "content_type": "text/plain",
+                    "attribute_mapping": {
+                        "m": {
+                            "observed_property": "aion:SoilMoisture",
+                            "unit": "%"
+                        }
+                    },
+                    "metadata": {
+                        "profile_version": 1
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let profile = to_json(response).await;
+        assert_eq!(profile["entity_id"], sensor_id);
+        assert_eq!(profile["payload_format"], "ultralight");
+        assert_eq!(
+            profile["attribute_mapping"]["m"]["observed_property"],
+            "aion:SoilMoisture"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieves_payload_profile() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/entities/{sensor_id}/payload-profile"),
+                json!({
+                    "payload_format": "ultralight",
+                    "protocol": "http",
+                    "content_type": "text/plain",
+                    "attribute_mapping": {
+                        "t": {
+                            "observed_property": "aion:SoilTemperature",
+                            "unit": "Cel"
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/entities/{sensor_id}/payload-profile"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let profile = to_json(response).await;
+        assert_eq!(profile["entity_id"], sensor_id);
+        assert_eq!(
+            profile["attribute_mapping"]["t"]["observed_property"],
+            "aion:SoilTemperature"
+        );
+    }
+
+    #[tokio::test]
     async fn ingests_senml_json_payload() {
         let app = app();
         let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
@@ -848,6 +1005,98 @@ mod tests {
             ingest["observations"][1]["observed_property"],
             "aion:SoilTemperature"
         );
+    }
+
+    #[tokio::test]
+    async fn ingests_ultralight_payload_using_payload_profile() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/entities/{sensor_id}/payload-profile"),
+                json!({
+                    "payload_format": "ultralight",
+                    "protocol": "http",
+                    "content_type": "text/plain",
+                    "attribute_mapping": {
+                        "m": {
+                            "observed_property": "aion:SoilMoisture",
+                            "unit": "%"
+                        },
+                        "t": {
+                            "observed_property": "aion:SoilTemperature",
+                            "unit": "Cel"
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "ultralight",
+                    "protocol": "http",
+                    "content_type": "text/plain",
+                    "observed_at": "2026-04-27T13:00:00Z",
+                    "payload": "m|18.5|t|24.1"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        assert_eq!(ingest["observations"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            ingest["observations"][0]["observed_property"],
+            "aion:SoilMoisture"
+        );
+        assert_eq!(
+            ingest["observations"][1]["observed_property"],
+            "aion:SoilTemperature"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_ultralight_payload_without_mapping_or_payload_profile() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "plot-01", "aion:Plot").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "ultralight",
+                    "protocol": "http",
+                    "content_type": "text/plain",
+                    "observed_at": "2026-04-27T13:00:00Z",
+                    "payload": "m|18.5|t|24.1"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = to_json(response).await;
+        assert!(error["error"]
+            .as_str()
+            .unwrap()
+            .contains("request mapping or producer PayloadProfile attribute_mapping"));
     }
 
     #[tokio::test]
