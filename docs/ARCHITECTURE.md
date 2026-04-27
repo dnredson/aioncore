@@ -1,6 +1,8 @@
 # Architecture
 
-AionCore is an AI-native IoT platform built around semantic domain context, payload-agnostic ingestion, canonical observations, and safe AI-facing query surfaces.
+AionCore is an AI-native, domain-agnostic platform built around semantic context, payload-agnostic ingestion, canonical observations, and safe AI-facing query surfaces.
+
+AionCore Core does not depend on agriculture, buildings, cities, infrastructure monitoring, or any other specific operational domain. Those domains are represented through JSON-LD entities, relationships, payload profiles, decoders, policies, and optional domain packs.
 
 ## Goals
 
@@ -12,6 +14,35 @@ AionCore is an AI-native IoT platform built around semantic domain context, payl
 - Use PostgreSQL and TimescaleDB for durable local-first persistence.
 - Expose read-oriented MCP tools for AI and LLM clients.
 - Start as an all-in-one modular monolith while preserving service boundaries.
+- Keep the core model domain-agnostic and move domain-specific vocabulary into reference examples or optional packs.
+
+## Domain-Agnostic Core
+
+AionCore Core provides primitives for semantic state and closed-loop decision support:
+
+- Entities describe things, places, systems, software components, people, assets, or abstract domain objects.
+- Relationships connect entities into a graph.
+- Observations describe measured, detected, inferred, or reported state.
+- Events describe meaningful occurrences.
+- Commands describe requested intent.
+- Actions describe execution attempts.
+- ActionResults describe the outcome of actions.
+- Capabilities describe what an entity or integration can do.
+- Policies constrain when commands and actions are allowed.
+- PayloadProfiles and Decoders connect external payloads to canonical platform records.
+
+Agriculture is the first reference use case for AionCore, not part of the core model. A smart agriculture deployment may define farms, plots, valves, pumps, crops, agronomic observations, and irrigation commands as JSON-LD domain entities and relationships. A smart building deployment may define rooms, air handlers, occupancy zones, energy meters, and comfort policies using the same core primitives.
+
+Domain packs may provide:
+
+- JSON-LD contexts and vocabularies.
+- Entity templates.
+- Relationship type suggestions.
+- Payload profiles and decoder mappings.
+- Policy templates.
+- Example commands, capabilities, and action result schemas.
+
+Domain packs must remain optional. Core migrations, runtime services, and APIs should not require a specific pack.
 
 ## Initial Modules
 
@@ -58,6 +89,18 @@ Responsibilities:
 - Store normalized time-series observations.
 - Query observations by entity, observed property, and time range.
 - Preserve links from observations to source raw messages where available.
+
+### Action
+
+Owns command, action, action result, capability, and policy concepts. MVP runtime support can be postponed, but the architecture reserves these concepts so closed-loop workflows do not become ad hoc API calls.
+
+Responsibilities:
+
+- Represent requested intent as commands.
+- Represent execution attempts as actions.
+- Record action outcomes as action results.
+- Bind executable behavior to explicit capabilities.
+- Apply policies before critical commands or actions.
 
 ### MCP
 
@@ -112,6 +155,19 @@ Client or device
   -> update raw message normalization status
 ```
 
+Closed-loop semantic flow:
+
+```text
+Observe
+  -> Contextualize
+  -> Decide
+  -> Command
+  -> Act
+  -> Verify
+```
+
+See [Action Model](ACTION_MODEL.md) for the detailed action vocabulary and safety boundaries.
+
 MQTT future flow:
 
 ```text
@@ -135,10 +191,48 @@ PostgreSQL stores:
 
 TimescaleDB should be used for canonical observation time-series storage.
 
+Future persistence areas:
+
+- Events.
+- Capabilities.
+- Policies.
+- Commands.
+- Actions.
+- Action results.
+
+## Reference Use Cases
+
+### Smart Agriculture
+
+Reference examples may include farms, plots, greenhouses, crops, soil sensors, weather stations, pumps, tanks, valves, and irrigation zones. Observations can represent soil moisture, temperature, pump state, water level, rainfall, evapotranspiration estimates, and agronomic alerts.
+
+Agriculture-specific terms should live in JSON-LD contexts, domain packs, examples, and deployments rather than in core platform assumptions.
+
+### Smart Building
+
+Examples may include buildings, floors, rooms, HVAC equipment, meters, occupancy zones, access points, and indoor environmental sensors. Observations can represent temperature, humidity, occupancy, CO2, power demand, equipment state, and comfort indicators.
+
+### Smart City
+
+Examples may include streets, intersections, lighting circuits, public assets, waste containers, air-quality stations, parking zones, and flood-prone areas. Observations can represent traffic flow, air quality, noise, fill levels, lighting status, water level, and public infrastructure events.
+
+### Operational and Infrastructure Monitoring
+
+Examples may include services, hosts, containers, jobs, APIs, databases, queues, network devices, backups, and SLOs. Observations can represent health status, deployment state, incident signals, latency summaries, error rates, saturation summaries, and operational events.
+
+High-frequency metrics can stay in specialized metric backends. AionCore stores semantic state, summarized observations, events, decisions, commands, action results, and references to external evidence.
+
+## Optional Integrations
+
+SmartSentinel can integrate with AionCore as an optional observer and executor. It is not a core dependency. AionCore can ingest SmartSentinel snapshots as raw messages and materialize selected elements as semantic entities, relationships, observations, events, commands, actions, and action results.
+
+See [SmartSentinel Integration](SMARTSENTINEL_INTEGRATION.md).
+
 ## Architectural Constraints
 
 - Do not skip raw message storage.
 - Do not couple ingestion endpoints to a single decoder.
 - Do not allow LLMs to execute critical actions by default.
 - Do not require paid cloud infrastructure for MVP 1.
+- Do not make domain-specific reference examples mandatory dependencies.
 - Document major decisions in ADRs.
