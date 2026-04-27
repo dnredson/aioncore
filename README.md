@@ -83,43 +83,107 @@ http://localhost:8080
 Check health:
 
 ```text
-curl http://localhost:8080/health
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/health"
 ```
 
-Create an entity:
+Create an entity with the envelope format:
 
-```text
-curl -X POST http://localhost:8080/entities ^
-  -H "Content-Type: application/json" ^
-  -d "{\"entity_key\":\"sensor-01\",\"entity_type\":\"aion:Sensor\",\"jsonld\":{\"@context\":{\"aion\":\"https://aioncore.org/ns#\"},\"@id\":\"urn:aion:sensor:sensor-01\",\"@type\":\"aion:Sensor\",\"name\":\"Sensor 01\"}}"
+```powershell
+$entity = @{
+  entity_key = "sensor-01"
+  entity_type = "aion:Sensor"
+  jsonld = @{
+    "@context" = @{
+      aion = "https://aioncore.org/ns#"
+    }
+    "@id" = "urn:aion:sensor:sensor-01"
+    "@type" = "aion:Sensor"
+    name = "Sensor 01"
+  }
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body $entity
+```
+
+Create an entity with native JSON-LD:
+
+```powershell
+$jsonldEntity = @{
+  "@context" = @{
+    aion = "https://aioncore.org/ns#"
+  }
+  "@id" = "urn:aion:sensor:sensor-ld-01"
+  "@type" = "aion:Sensor"
+  name = "Sensor LD 01"
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/ld+json" `
+  -Body $jsonldEntity
 ```
 
 Create a relationship after creating two entities:
 
-```text
-curl -X POST http://localhost:8080/relationships ^
-  -H "Content-Type: application/json" ^
-  -d "{\"source_entity_id\":\"<sensor-id>\",\"relationship_type\":\"aion:locatedIn\",\"target_entity_id\":\"<room-id>\",\"jsonld\":{\"@type\":\"aion:Relationship\"}}"
+```powershell
+$relationship = @{
+  source_entity_id = "<sensor-id>"
+  relationship_type = "aion:locatedIn"
+  target_entity_id = "<room-id>"
+  jsonld = @{
+    "@type" = "aion:Relationship"
+  }
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/relationships" `
+  -ContentType "application/json" `
+  -Body $relationship
 ```
 
 Create an observation:
 
-```text
-curl -X POST http://localhost:8080/observations ^
-  -H "Content-Type: application/json" ^
-  -d "{\"producer_entity_id\":\"<sensor-id>\",\"feature_of_interest_id\":\"<room-id>\",\"observed_property\":\"temperature\",\"value\":{\"type\":\"number\",\"value\":21.4},\"unit\":\"Cel\",\"observed_at\":\"2026-04-27T13:00:00Z\",\"received_at\":\"2026-04-27T13:00:01Z\",\"protocol\":\"http\",\"payload_format\":\"json_mapping\",\"quality\":{},\"metadata\":{}}"
+```powershell
+$observation = @{
+  producer_entity_id = "<sensor-id>"
+  feature_of_interest_id = "<room-id>"
+  observed_property = "temperature"
+  value = @{
+    type = "number"
+    value = 21.4
+  }
+  unit = "Cel"
+  observed_at = "2026-04-27T13:00:00Z"
+  received_at = "2026-04-27T13:00:01Z"
+  protocol = "http"
+  payload_format = "json_mapping"
+  quality = @{}
+  metadata = @{}
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/observations" `
+  -ContentType "application/json" `
+  -Body $observation
 ```
 
 Query entity context:
 
 ```text
-curl http://localhost:8080/entities/<entity-id>/context
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities/<entity-id>/context"
 ```
 
 Query observations:
 
 ```text
-curl "http://localhost:8080/observations?feature_of_interest_id=<room-id>"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/observations?feature_of_interest_id=<room-id>"
 ```
 
 In-memory data is lost when the process exits.

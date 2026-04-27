@@ -49,6 +49,13 @@ pub struct CreateEntityRequest {
     pub jsonld: Value,
 }
 
+#[derive(Debug)]
+struct EntityInput {
+    entity_key: String,
+    entity_type: String,
+    jsonld: Value,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateRelationshipRequest {
     pub source_entity_id: Uuid,
@@ -123,8 +130,9 @@ async fn health() -> Json<HealthResponse> {
 
 async fn create_entity(
     State(state): State<AppState>,
-    Json(request): Json<CreateEntityRequest>,
+    Json(request): Json<Value>,
 ) -> Result<(StatusCode, Json<Entity>), ApiError> {
+    let request = parse_entity_input(request)?;
     let entity = Entity::new(
         state.tenant_id,
         request.entity_key,
@@ -136,6 +144,69 @@ async fn create_entity(
 
     let entity = state.storage.create_entity(entity)?;
     Ok((StatusCode::CREATED, Json(entity)))
+}
+
+fn parse_entity_input(value: Value) -> Result<EntityInput, ApiError> {
+    if value.get("jsonld").is_some() {
+        let request: CreateEntityRequest =
+            serde_json::from_value(value).map_err(|err| ApiError::bad_request(err.to_string()))?;
+        return Ok(EntityInput {
+            entity_key: request.entity_key,
+            entity_type: request.entity_type,
+            jsonld: request.jsonld,
+        });
+    }
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("entity request must be a JSON object"))?;
+
+    if !object.contains_key("@context") {
+        return Err(ApiError::bad_request(
+            "native JSON-LD entity must include @context",
+        ));
+    }
+
+    let jsonld_id = object
+        .get("@id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("native JSON-LD entity must include string @id"))?;
+    let entity_type = extract_jsonld_type(object.get("@type"))
+        .ok_or_else(|| ApiError::bad_request("native JSON-LD entity must include string @type"))?;
+    let entity_key = derive_entity_key(jsonld_id).ok_or_else(|| {
+        ApiError::bad_request("could not derive entity_key from native JSON-LD @id")
+    })?;
+
+    Ok(EntityInput {
+        entity_key,
+        entity_type,
+        jsonld: value,
+    })
+}
+
+fn extract_jsonld_type(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .find_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn derive_entity_key(jsonld_id: &str) -> Option<String> {
+    let trimmed = jsonld_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    trimmed
+        .rsplit(['/', '#', ':'])
+        .find(|segment| !segment.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn get_entity(
@@ -337,7 +408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_entity_and_returns_context() {
+    async fn creates_entity_from_envelope_and_returns_context() {
         let app = app();
         let entity_body = json!({
             "entity_key": "sensor-01",
@@ -380,6 +451,30 @@ mod tests {
             context["incoming_relationships"].as_array().unwrap().len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn creates_entity_from_native_jsonld() {
+        let response = app()
+            .oneshot(json_ld_request(
+                "POST",
+                "/entities",
+                json!({
+                    "@context": {"aion": "https://aioncore.org/ns#"},
+                    "@id": "urn:aion:sensor:sensor-ld-01",
+                    "@type": "aion:Sensor",
+                    "name": "Sensor LD 01"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let entity = to_json(response).await;
+        assert_eq!(entity["entity_key"], "sensor-ld-01");
+        assert_eq!(entity["entity_type"], "aion:Sensor");
+        assert_eq!(entity["jsonld"]["@id"], "urn:aion:sensor:sensor-ld-01");
+        assert_eq!(entity["jsonld"]["name"], "Sensor LD 01");
     }
 
     #[tokio::test]
@@ -452,6 +547,15 @@ mod tests {
             .method(method)
             .uri(uri)
             .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn json_ld_request(method: &str, uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/ld+json")
             .body(Body::from(body.to_string()))
             .unwrap()
     }
