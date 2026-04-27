@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "apps/aion-api",
+    "crates/aion-entity",
+    "crates/aion-observation",
+    "crates/aion-payload",
+    "crates/aion-raw-message",
+    "crates/aion-relationship",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/aioncore/aioncore"
+
+[workspace.dependencies]
+axum = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+aion-entity = { path = "crates/aion-entity" }
+aion-observation = { path = "crates/aion-observation" }
+aion-payload = { path = "crates/aion-payload" }
+aion-raw-message = { path = "crates/aion-raw-message" }
+aion-relationship = { path = "crates/aion-relationship" }
