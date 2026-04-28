@@ -1,6 +1,6 @@
 use aion_action::{
-    Action, ActionResult, Capability, Command, CommandStatus, ExecutorAgent, ExecutorCapability,
-    ExecutorScope, Policy,
+    Action, ActionResult, Capability, Command, CommandLease, CommandLeaseStatus, CommandStatus,
+    ExecutorAgent, ExecutorCapability, ExecutorScope, Policy,
 };
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
@@ -248,6 +248,27 @@ pub trait CommandStore {
     ) -> StorageResult<Vec<Command>>;
 }
 
+pub trait CommandLeaseStore {
+    fn store_command_lease(&self, lease: CommandLease) -> StorageResult<CommandLease>;
+    fn update_command_lease(&self, lease: CommandLease) -> StorageResult<CommandLease>;
+    fn get_command_lease(
+        &self,
+        tenant_id: Uuid,
+        lease_id: Uuid,
+    ) -> StorageResult<Option<CommandLease>>;
+    fn get_active_command_lease(
+        &self,
+        tenant_id: Uuid,
+        command_id: Uuid,
+    ) -> StorageResult<Option<CommandLease>>;
+    fn get_latest_command_lease(
+        &self,
+        tenant_id: Uuid,
+        command_id: Uuid,
+    ) -> StorageResult<Option<CommandLease>>;
+    fn list_active_command_leases(&self, tenant_id: Uuid) -> StorageResult<Vec<CommandLease>>;
+}
+
 pub trait PolicyStore {
     fn put_policies(&self, tenant_id: Uuid, policies: Vec<Policy>) -> StorageResult<Vec<Policy>>;
     fn query_policies(
@@ -323,6 +344,7 @@ struct InMemoryState {
     executor_capabilities: HashMap<(Uuid, Uuid), Vec<ExecutorCapability>>,
     executor_scopes: HashMap<(Uuid, Uuid), Vec<ExecutorScope>>,
     commands: HashMap<Uuid, Command>,
+    command_leases: HashMap<Uuid, CommandLease>,
     policies: HashMap<Uuid, Policy>,
     actions: HashMap<Uuid, Action>,
     action_results: HashMap<Uuid, ActionResult>,
@@ -854,6 +876,86 @@ impl CommandStore for InMemoryStorage {
 
         commands.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         Ok(commands)
+    }
+}
+
+impl CommandLeaseStore for InMemoryStorage {
+    fn store_command_lease(&self, lease: CommandLease) -> StorageResult<CommandLease> {
+        let mut state = self.write_state()?;
+        if state.command_leases.contains_key(&lease.id) {
+            return Err(StorageError::Conflict);
+        }
+        state.command_leases.insert(lease.id, lease.clone());
+        Ok(lease)
+    }
+
+    fn update_command_lease(&self, lease: CommandLease) -> StorageResult<CommandLease> {
+        let mut state = self.write_state()?;
+        let stored = state
+            .command_leases
+            .get_mut(&lease.id)
+            .filter(|stored| stored.tenant_id == lease.tenant_id)
+            .ok_or(StorageError::NotFound)?;
+        *stored = lease.clone();
+        Ok(lease)
+    }
+
+    fn get_command_lease(
+        &self,
+        tenant_id: Uuid,
+        lease_id: Uuid,
+    ) -> StorageResult<Option<CommandLease>> {
+        Ok(self
+            .read_state()?
+            .command_leases
+            .get(&lease_id)
+            .filter(|lease| lease.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn get_active_command_lease(
+        &self,
+        tenant_id: Uuid,
+        command_id: Uuid,
+    ) -> StorageResult<Option<CommandLease>> {
+        Ok(self
+            .read_state()?
+            .command_leases
+            .values()
+            .find(|lease| {
+                lease.tenant_id == tenant_id
+                    && lease.command_id == command_id
+                    && lease.lease_status == CommandLeaseStatus::Active
+            })
+            .cloned())
+    }
+
+    fn get_latest_command_lease(
+        &self,
+        tenant_id: Uuid,
+        command_id: Uuid,
+    ) -> StorageResult<Option<CommandLease>> {
+        let state = self.read_state()?;
+        Ok(state
+            .command_leases
+            .values()
+            .filter(|lease| lease.tenant_id == tenant_id && lease.command_id == command_id)
+            .max_by_key(|lease| lease.claimed_at)
+            .cloned())
+    }
+
+    fn list_active_command_leases(&self, tenant_id: Uuid) -> StorageResult<Vec<CommandLease>> {
+        let mut leases = self
+            .read_state()?
+            .command_leases
+            .values()
+            .filter(|lease| {
+                lease.tenant_id == tenant_id && lease.lease_status == CommandLeaseStatus::Active
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        leases.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+        Ok(leases)
     }
 }
 

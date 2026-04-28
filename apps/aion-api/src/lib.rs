@@ -1,6 +1,6 @@
 use aion_action::{
-    Action, ActionResult, ApprovalStatus, Capability, Command, CommandStatus, ExecutorAgent,
-    ExecutorAgentStatus, ExecutorCapability, ExecutorScope, Policy,
+    Action, ActionResult, ApprovalStatus, Capability, Command, CommandLease, CommandStatus,
+    ExecutorAgent, ExecutorAgentStatus, ExecutorCapability, ExecutorScope, Policy,
 };
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
@@ -14,8 +14,8 @@ use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_rule::{Rule, RuleAction, RuleCondition, RuleEvaluationResult, RuleTriggerType};
 use aion_storage::{
-    ActionResultStore, ActionStore, CapabilityStore, CommandStore, EntityStore, EventFilter,
-    EventStore, ExecutorStore, InMemoryStorage, ObservationStore, PayloadProfile,
+    ActionResultStore, ActionStore, CapabilityStore, CommandLeaseStore, CommandStore, EntityStore,
+    EventFilter, EventStore, ExecutorStore, InMemoryStorage, ObservationStore, PayloadProfile,
     PayloadProfileStore, PolicyStore, RawMessageStore, RelationshipStore, RuleStore, StorageError,
 };
 use axum::{
@@ -150,6 +150,13 @@ pub struct ExecutorHeartbeatRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ExecutorClaimCommandRequest {
+    pub lease_duration_seconds: Option<i64>,
+    pub max_retries: Option<u32>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PutExecutorCapabilityRequest {
     pub command_type: String,
     pub protocol: Option<String>,
@@ -184,6 +191,24 @@ pub struct ExecutorCommandCompletionResponse {
     pub command: Command,
     pub action: Action,
     pub action_result: ActionResult,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshCommandLeaseRequest {
+    pub executor_id: Uuid,
+    pub lease_duration_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseCommandLeaseRequest {
+    pub executor_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoverExpiredLeasesResponse {
+    pub expired_lease_ids: Vec<Uuid>,
+    pub retried_command_ids: Vec<Uuid>,
+    pub failed_command_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +426,8 @@ struct ErrorResponse {
     error: String,
 }
 
+const DEFAULT_COMMAND_LEASE_SECONDS: i64 = 60;
+
 pub fn app() -> Router {
     app_with_state(AppState::local())
 }
@@ -454,6 +481,19 @@ pub fn app_with_state(state: AppState) -> Router {
             post(fail_executor_command),
         )
         .route("/commands", post(create_command).get(query_commands))
+        .route(
+            "/commands/recover-expired-leases",
+            post(recover_expired_leases),
+        )
+        .route("/commands/:command_id/lease", get(get_command_lease))
+        .route(
+            "/commands/:command_id/lease/refresh",
+            post(refresh_command_lease),
+        )
+        .route(
+            "/commands/:command_id/lease/release",
+            post(release_command_lease),
+        )
         .route("/commands/:command_id/claim", post(claim_command))
         .route("/commands/:command_id/release", post(release_command))
         .route(
@@ -1821,10 +1861,21 @@ async fn poll_executor_pending_commands(
 async fn claim_executor_command(
     State(state): State<AppState>,
     Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
+    request: Option<Json<ExecutorClaimCommandRequest>>,
 ) -> Result<Json<Command>, ApiError> {
     let executor = get_executor_agent(&state, executor_id)?;
     ensure_executor_can_run_command(&state, executor_id, command_id)?;
-    let command = claim_command_for_executor(&state, command_id, &executor.agent_key)?;
+    let request = request.map(|Json(request)| request);
+    let command = claim_command_for_executor(
+        &state,
+        command_id,
+        &executor,
+        request
+            .as_ref()
+            .and_then(|request| request.lease_duration_seconds),
+        request.as_ref().and_then(|request| request.max_retries),
+        request.and_then(|request| request.metadata),
+    )?;
     record_executor_event(
         &state,
         "aion:ExecutorClaimedCommand",
@@ -1875,6 +1926,7 @@ async fn complete_executor_command(
     let command = mutate_command_raw(&state, command_id, |command, now| {
         command.mark_executed(now)
     })?;
+    mark_active_lease_completed(&state, command_id, executor_id)?;
     record_command_event(
         &state,
         "aion:CommandExecuted",
@@ -1938,6 +1990,7 @@ async fn fail_executor_command(
     let command = mutate_command_raw(&state, command_id, |command, now| {
         command.mark_failed(request.failure_reason, now)
     })?;
+    mark_active_lease_failed(&state, command_id, executor_id)?;
     record_command_event(
         &state,
         "aion:CommandFailed",
@@ -1958,6 +2011,124 @@ async fn fail_executor_command(
         action,
         action_result,
     }))
+}
+
+async fn get_command_lease(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+) -> Result<Json<CommandLease>, ApiError> {
+    ensure_command_exists(&state, command_id)?;
+    Ok(Json(
+        state
+            .storage
+            .get_latest_command_lease(state.tenant_id, command_id)?
+            .ok_or_else(ApiError::not_found)?,
+    ))
+}
+
+async fn refresh_command_lease(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+    Json(request): Json<RefreshCommandLeaseRequest>,
+) -> Result<Json<CommandLease>, ApiError> {
+    let mut lease = active_lease_for_executor(&state, command_id, request.executor_id)?;
+    let now = Utc::now();
+    let expires_at = lease_expiry(now, request.lease_duration_seconds)?;
+    lease
+        .refresh(expires_at, now)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let lease = state.storage.update_command_lease(lease)?;
+    let mut command = state
+        .storage
+        .get_command(state.tenant_id, command_id)?
+        .ok_or_else(ApiError::not_found)?;
+    command.set_lease_expires_at(Some(expires_at), now);
+    let command = state.storage.update_command(command)?;
+    record_lease_event(
+        &state,
+        "aion:CommandLeaseRefreshed",
+        &lease,
+        Some(&command),
+        None,
+    )?;
+    Ok(Json(lease))
+}
+
+async fn release_command_lease(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+    Json(request): Json<ReleaseCommandLeaseRequest>,
+) -> Result<Json<CommandLease>, ApiError> {
+    release_active_lease(&state, command_id, request.executor_id).map(Json)
+}
+
+async fn recover_expired_leases(
+    State(state): State<AppState>,
+) -> Result<Json<RecoverExpiredLeasesResponse>, ApiError> {
+    let now = Utc::now();
+    let mut response = RecoverExpiredLeasesResponse {
+        expired_lease_ids: Vec::new(),
+        retried_command_ids: Vec::new(),
+        failed_command_ids: Vec::new(),
+    };
+
+    for mut lease in state.storage.list_active_command_leases(state.tenant_id)? {
+        if lease.expires_at > now {
+            continue;
+        }
+        lease.mark_expired(now);
+        let lease = state.storage.update_command_lease(lease)?;
+        response.expired_lease_ids.push(lease.id);
+
+        let mut command = state
+            .storage
+            .get_command(state.tenant_id, lease.command_id)?
+            .ok_or_else(ApiError::not_found)?;
+        record_lease_event(
+            &state,
+            "aion:CommandLeaseExpired",
+            &lease,
+            Some(&command),
+            None,
+        )?;
+
+        if command.retry_limit_exceeded() {
+            command.mark_failed_due_to_retry_limit("command retry limit exceeded", now);
+            let command = state.storage.update_command(command)?;
+            response.failed_command_ids.push(command.id);
+            record_lease_event(
+                &state,
+                "aion:CommandRetryLimitExceeded",
+                &lease,
+                Some(&command),
+                Some(
+                    json!({"retry_count": command.retry_count, "max_retries": command.max_retries}),
+                ),
+            )?;
+            record_command_event(
+                &state,
+                "aion:CommandFailed",
+                EventSeverity::Error,
+                &command,
+                Some("command retry limit exceeded".to_string()),
+            )?;
+        } else {
+            command.schedule_retry(now);
+            let command = state.storage.update_command(command)?;
+            response.retried_command_ids.push(command.id);
+            record_lease_event(
+                &state,
+                "aion:CommandRetryScheduled",
+                &lease,
+                Some(&command),
+                Some(
+                    json!({"retry_count": command.retry_count, "max_retries": command.max_retries}),
+                ),
+            )?;
+        }
+    }
+
+    Ok(Json(response))
 }
 
 async fn create_command(
@@ -2808,6 +2979,13 @@ fn get_command_for_executor_mutation(
             "command must be claimed by this executor before completion",
         ));
     }
+    let lease = state
+        .storage
+        .get_active_command_lease(state.tenant_id, command_id)?
+        .ok_or_else(|| ApiError::bad_request("command has no active lease"))?;
+    if !lease.is_active_at(Utc::now()) {
+        return Err(ApiError::bad_request("command lease has expired"));
+    }
 
     Ok(command)
 }
@@ -2815,11 +2993,46 @@ fn get_command_for_executor_mutation(
 fn claim_command_for_executor(
     state: &AppState,
     command_id: Uuid,
-    agent_key: &str,
+    executor: &ExecutorAgent,
+    lease_duration_seconds: Option<i64>,
+    max_retries: Option<u32>,
+    metadata: Option<Value>,
 ) -> Result<Command, ApiError> {
+    let now = Utc::now();
+    if let Some(lease) = state
+        .storage
+        .get_active_command_lease(state.tenant_id, command_id)?
+    {
+        if lease.is_active_at(now) {
+            return Err(ApiError::bad_request("command already has an active lease"));
+        }
+    }
+    let expires_at = lease_expiry(now, lease_duration_seconds)?;
     let command = mutate_command_raw(state, command_id, |command, now| {
-        command.claim(agent_key.to_string(), now)
+        if let Some(max_retries) = max_retries {
+            command.max_retries = Some(max_retries);
+        }
+        command.claim(executor.agent_key.clone(), now)?;
+        command.set_lease_expires_at(Some(expires_at), now);
+        Ok(())
     })?;
+    let lease = CommandLease::new(
+        state.tenant_id,
+        command.id,
+        executor.id,
+        now,
+        expires_at,
+        metadata,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let lease = state.storage.store_command_lease(lease)?;
+    record_lease_event(
+        state,
+        "aion:CommandLeaseCreated",
+        &lease,
+        Some(&command),
+        None,
+    )?;
     record_command_event(
         state,
         "aion:CommandClaimed",
@@ -2828,6 +3041,125 @@ fn claim_command_for_executor(
         None,
     )?;
     Ok(command)
+}
+
+fn lease_expiry(
+    now: DateTime<Utc>,
+    lease_duration_seconds: Option<i64>,
+) -> Result<DateTime<Utc>, ApiError> {
+    let seconds = lease_duration_seconds.unwrap_or(DEFAULT_COMMAND_LEASE_SECONDS);
+    if seconds <= 0 {
+        return Err(ApiError::bad_request(
+            "lease_duration_seconds must be greater than zero",
+        ));
+    }
+    Ok(now + chrono::Duration::seconds(seconds))
+}
+
+fn active_lease_for_executor(
+    state: &AppState,
+    command_id: Uuid,
+    executor_id: Uuid,
+) -> Result<CommandLease, ApiError> {
+    let lease = state
+        .storage
+        .get_active_command_lease(state.tenant_id, command_id)?
+        .ok_or_else(ApiError::not_found)?;
+    if lease.executor_id != executor_id {
+        return Err(ApiError::bad_request(
+            "active lease is owned by another executor",
+        ));
+    }
+    if !lease.is_active_at(Utc::now()) {
+        return Err(ApiError::bad_request("active lease has expired"));
+    }
+    Ok(lease)
+}
+
+fn release_active_lease(
+    state: &AppState,
+    command_id: Uuid,
+    executor_id: Uuid,
+) -> Result<CommandLease, ApiError> {
+    let mut lease = active_lease_for_executor(state, command_id, executor_id)?;
+    let now = Utc::now();
+    lease.mark_released(now);
+    let lease = state.storage.update_command_lease(lease)?;
+    let command = mutate_command_raw(state, command_id, |command, now| command.release(now))?;
+    record_lease_event(
+        state,
+        "aion:CommandLeaseReleased",
+        &lease,
+        Some(&command),
+        None,
+    )?;
+    record_command_event(
+        state,
+        "aion:CommandReleased",
+        EventSeverity::Info,
+        &command,
+        Some("command lease released".to_string()),
+    )?;
+    Ok(lease)
+}
+
+fn mark_active_lease_completed(
+    state: &AppState,
+    command_id: Uuid,
+    executor_id: Uuid,
+) -> Result<CommandLease, ApiError> {
+    let mut lease = active_lease_for_executor(state, command_id, executor_id)?;
+    lease.mark_completed(Utc::now());
+    Ok(state.storage.update_command_lease(lease)?)
+}
+
+fn mark_active_lease_failed(
+    state: &AppState,
+    command_id: Uuid,
+    executor_id: Uuid,
+) -> Result<CommandLease, ApiError> {
+    let mut lease = active_lease_for_executor(state, command_id, executor_id)?;
+    lease.mark_failed(Utc::now());
+    Ok(state.storage.update_command_lease(lease)?)
+}
+
+fn record_lease_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    lease: &CommandLease,
+    command: Option<&Command>,
+    metadata: Option<Value>,
+) -> Result<Event, ApiError> {
+    let mut event_metadata = json!({
+        "lease_id": lease.id,
+        "executor_id": lease.executor_id,
+        "lease_status": lease.lease_status,
+        "expires_at": lease.expires_at
+    });
+    if let Some(object) = event_metadata.as_object_mut() {
+        if let Some(metadata) = metadata {
+            object.insert("metadata".to_string(), metadata);
+        }
+    }
+    record_event(
+        state,
+        EventDraft {
+            event_type: event_type.into(),
+            severity: EventSeverity::Info,
+            source_entity_id: None,
+            target_entity_id: command.map(|command| command.target_entity_id),
+            message: Some("Command lease lifecycle event".to_string()),
+            occurred_at: Utc::now(),
+            observed_at: None,
+            correlation_id: None,
+            raw_message_id: None,
+            observation_id: None,
+            command_id: Some(lease.command_id),
+            action_id: None,
+            action_result_id: None,
+            metadata: Some(event_metadata),
+        },
+    )
 }
 
 fn enrich_executor_result_metadata(executor: &ExecutorAgent, metadata: Option<Value>) -> Value {
@@ -5493,6 +5825,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_creates_active_lease() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "lease-agent-01", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+
+        let claimed =
+            claim_executor_test_command_with_lease(&app, executor_id, command_id, 60, None).await;
+        let lease = get_command_lease(&app, command_id).await;
+
+        assert_eq!(claimed["status"], "claimed");
+        assert_eq!(lease["lease_status"], "active");
+        assert_eq!(lease["executor_id"], executor_id);
+        assert_eq!(claimed["lease_expires_at"], lease["expires_at"]);
+    }
+
+    #[tokio::test]
+    async fn second_executor_cannot_claim_command_with_active_lease() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-block-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let first = create_compatible_executor(&app, "lease-agent-first", &pump_id).await;
+        let second = create_compatible_executor(&app, "lease-agent-second", &pump_id).await;
+        claim_executor_test_command(&app, first["id"].as_str().unwrap(), command_id).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/executors/{}/commands/{command_id}/claim",
+                        second["id"].as_str().unwrap()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn lease_refresh_extends_expires_at() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-refresh-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "lease-agent-refresh", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command_with_lease(&app, executor_id, command_id, 60, None).await;
+        let before = get_command_lease(&app, command_id).await;
+
+        let refreshed = refresh_command_lease(&app, command_id, executor_id, 120).await;
+
+        assert!(refreshed["expires_at"].as_str().unwrap() > before["expires_at"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn lease_release_returns_command_to_pending() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-release-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "lease-agent-release", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command(&app, executor_id, command_id).await;
+
+        let lease = release_command_lease(&app, command_id, executor_id).await;
+        let commands = query_pending_commands(&app, &pump_id).await;
+
+        assert_eq!(lease["lease_status"], "released");
+        assert_eq!(commands.as_array().unwrap().len(), 1);
+        assert_eq!(commands[0]["id"], command_id);
+    }
+
+    #[tokio::test]
+    async fn complete_command_marks_lease_completed() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-complete-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "lease-agent-complete", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command(&app, executor_id, command_id).await;
+
+        complete_executor_test_command(&app, executor_id, command_id).await;
+        let lease = get_command_lease(&app, command_id).await;
+
+        assert_eq!(lease["lease_status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn fail_command_marks_lease_failed() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-fail-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "lease-agent-fail", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command(&app, executor_id, command_id).await;
+
+        fail_executor_test_command(&app, executor_id, command_id).await;
+        let lease = get_command_lease(&app, command_id).await;
+
+        assert_eq!(lease["lease_status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn recover_expired_leases_returns_command_to_pending_when_retry_limit_not_exceeded() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-retry-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "lease-agent-retry", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command_with_lease(&app, executor_id, command_id, 1, Some(2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        let recovery = recover_expired_leases(&app).await;
+        let commands = query_pending_commands(&app, &pump_id).await;
+
+        assert_eq!(recovery["retried_command_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(commands[0]["retry_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn recover_expired_leases_marks_command_failed_when_retry_limit_exceeded() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-limit-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "lease-agent-limit", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command_with_lease(&app, executor_id, command_id, 1, Some(0)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        let recovery = recover_expired_leases(&app).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/commands/{command_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let command = to_json(response).await;
+
+        assert_eq!(recovery["failed_command_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(command["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn expired_lease_emits_event() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-expired-event-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor =
+            create_compatible_executor(&app, "lease-agent-expired-event", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command_with_lease(&app, executor_id, command_id, 1, Some(2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        recover_expired_leases(&app).await;
+
+        let expired = query_events_by_type(&app, "aion:CommandLeaseExpired").await;
+        assert_eq!(expired.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_scheduled_emits_event() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "lease-retry-event-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "lease-agent-retry-event", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command_with_lease(&app, executor_id, command_id, 1, Some(2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        recover_expired_leases(&app).await;
+
+        let retried = query_events_by_type(&app, "aion:CommandRetryScheduled").await;
+        assert_eq!(retried.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn ingests_senml_json_payload() {
         let app = app();
         let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
@@ -6348,6 +6872,106 @@ mod tests {
                     .uri(format!(
                         "/executors/{executor_id}/commands/{command_id}/claim"
                     ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn claim_executor_test_command_with_lease(
+        app: &Router,
+        executor_id: &str,
+        command_id: &str,
+        lease_duration_seconds: i64,
+        max_retries: Option<u32>,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/executors/{executor_id}/commands/{command_id}/claim"),
+                json!({
+                    "lease_duration_seconds": lease_duration_seconds,
+                    "max_retries": max_retries,
+                    "metadata": {
+                        "source": "test"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn get_command_lease(app: &Router, command_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/commands/{command_id}/lease"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn refresh_command_lease(
+        app: &Router,
+        command_id: &str,
+        executor_id: &str,
+        lease_duration_seconds: i64,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/commands/{command_id}/lease/refresh"),
+                json!({
+                    "executor_id": executor_id,
+                    "lease_duration_seconds": lease_duration_seconds
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn release_command_lease(app: &Router, command_id: &str, executor_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/commands/{command_id}/lease/release"),
+                json!({
+                    "executor_id": executor_id
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn recover_expired_leases(app: &Router) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/commands/recover-expired-leases")
                     .body(Body::empty())
                     .unwrap(),
             )

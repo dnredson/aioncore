@@ -12,6 +12,7 @@ pub enum ActionModelError {
     EmptyAgentType,
     EmptyActionType,
     EmptyStatus,
+    InvalidLease(String),
     InvalidTransition(String),
 }
 
@@ -24,6 +25,7 @@ impl fmt::Display for ActionModelError {
             Self::EmptyAgentType => f.write_str("agent_type must not be empty"),
             Self::EmptyActionType => f.write_str("action_type must not be empty"),
             Self::EmptyStatus => f.write_str("status must not be empty"),
+            Self::InvalidLease(message) => f.write_str(message),
             Self::InvalidTransition(message) => f.write_str(message),
         }
     }
@@ -56,6 +58,103 @@ pub enum ExecutorAgentStatus {
     Online,
     Offline,
     Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandLeaseStatus {
+    Active,
+    Expired,
+    Released,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandLease {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub command_id: Uuid,
+    pub executor_id: Uuid,
+    pub lease_status: CommandLeaseStatus,
+    pub claimed_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub metadata: Option<Value>,
+}
+
+impl CommandLease {
+    pub fn new(
+        tenant_id: Uuid,
+        command_id: Uuid,
+        executor_id: Uuid,
+        claimed_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        metadata: Option<Value>,
+    ) -> Result<Self, ActionModelError> {
+        if expires_at <= claimed_at {
+            return Err(ActionModelError::InvalidLease(
+                "expires_at must be after claimed_at".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            tenant_id,
+            command_id,
+            executor_id,
+            lease_status: CommandLeaseStatus::Active,
+            claimed_at,
+            expires_at,
+            released_at: None,
+            completed_at: None,
+            metadata,
+        })
+    }
+
+    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
+        self.lease_status == CommandLeaseStatus::Active && self.expires_at > now
+    }
+
+    pub fn refresh(
+        &mut self,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ActionModelError> {
+        if self.lease_status != CommandLeaseStatus::Active {
+            return Err(ActionModelError::InvalidLease(
+                "only active leases can be refreshed".to_string(),
+            ));
+        }
+        if expires_at <= now {
+            return Err(ActionModelError::InvalidLease(
+                "expires_at must be in the future".to_string(),
+            ));
+        }
+        self.expires_at = expires_at;
+        Ok(())
+    }
+
+    pub fn mark_expired(&mut self, now: DateTime<Utc>) {
+        self.lease_status = CommandLeaseStatus::Expired;
+        self.released_at = Some(now);
+    }
+
+    pub fn mark_released(&mut self, now: DateTime<Utc>) {
+        self.lease_status = CommandLeaseStatus::Released;
+        self.released_at = Some(now);
+    }
+
+    pub fn mark_completed(&mut self, now: DateTime<Utc>) {
+        self.lease_status = CommandLeaseStatus::Completed;
+        self.completed_at = Some(now);
+    }
+
+    pub fn mark_failed(&mut self, now: DateTime<Utc>) {
+        self.lease_status = CommandLeaseStatus::Failed;
+        self.completed_at = Some(now);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -221,6 +320,11 @@ pub struct Command {
     pub failure_reason: Option<String>,
     pub approval_status: Option<ApprovalStatus>,
     pub policy_decision: Option<Value>,
+    pub retry_count: u32,
+    pub max_retries: Option<u32>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub last_claimed_by: Option<String>,
+    pub last_failure_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -258,6 +362,11 @@ impl Command {
             failure_reason: None,
             approval_status,
             policy_decision,
+            retry_count: 0,
+            max_retries: None,
+            lease_expires_at: None,
+            last_claimed_by: None,
+            last_failure_reason: None,
             created_at: now,
             updated_at: now,
         })
@@ -297,6 +406,7 @@ impl Command {
 
         self.status = CommandStatus::Claimed;
         self.claimed_by = Some(claimed_by);
+        self.last_claimed_by = self.claimed_by.clone();
         self.claimed_at = Some(now);
         self.updated_at = now;
         Ok(())
@@ -312,6 +422,7 @@ impl Command {
         self.status = CommandStatus::Pending;
         self.claimed_by = None;
         self.claimed_at = None;
+        self.lease_expires_at = None;
         self.updated_at = now;
         Ok(())
     }
@@ -326,6 +437,7 @@ impl Command {
         self.status = CommandStatus::Executed;
         self.completed_at = Some(now);
         self.failure_reason = None;
+        self.lease_expires_at = None;
         self.updated_at = now;
         Ok(())
     }
@@ -351,6 +463,8 @@ impl Command {
         self.status = CommandStatus::Failed;
         self.completed_at = Some(now);
         self.failure_reason = Some(failure_reason);
+        self.last_failure_reason = self.failure_reason.clone();
+        self.lease_expires_at = None;
         self.updated_at = now;
         Ok(())
     }
@@ -395,6 +509,41 @@ impl Command {
         self.approval_status = Some(ApprovalStatus::Rejected);
         self.updated_at = now;
         Ok(())
+    }
+
+    pub fn set_lease_expires_at(&mut self, expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) {
+        self.lease_expires_at = expires_at;
+        self.updated_at = now;
+    }
+
+    pub fn schedule_retry(&mut self, now: DateTime<Utc>) {
+        self.status = CommandStatus::Pending;
+        self.claimed_by = None;
+        self.claimed_at = None;
+        self.lease_expires_at = None;
+        self.retry_count = self.retry_count.saturating_add(1);
+        self.updated_at = now;
+    }
+
+    pub fn retry_limit_exceeded(&self) -> bool {
+        self.max_retries
+            .map(|max_retries| self.retry_count >= max_retries)
+            .unwrap_or(false)
+    }
+
+    pub fn mark_failed_due_to_retry_limit(
+        &mut self,
+        reason: impl Into<String>,
+        now: DateTime<Utc>,
+    ) {
+        self.status = CommandStatus::Failed;
+        self.completed_at = Some(now);
+        self.failure_reason = Some(reason.into());
+        self.last_failure_reason = self.failure_reason.clone();
+        self.claimed_by = None;
+        self.claimed_at = None;
+        self.lease_expires_at = None;
+        self.updated_at = now;
     }
 }
 

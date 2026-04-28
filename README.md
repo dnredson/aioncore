@@ -910,6 +910,147 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?command_id=$($e
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ai/context/entity/$($rulePump.id)"
 ```
 
+Exercise in-memory command leases, refresh, release, and expiry recovery:
+
+```powershell
+$leasePump = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "lease-pump-01"
+    entity_type = "aion:Pump"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:lease-pump:01"
+      "@type" = "aion:Pump"
+      name = "Lease Pump 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$leasePumpCapability = @{
+  capability_name = "StartPump"
+  command_type = "StartPump"
+  input_schema = @{ type = "object"; additionalProperties = $true }
+  metadata = @{ source = "manual-test" }
+}
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/entities/$($leasePump.id)/capabilities" `
+  -ContentType "application/json" `
+  -Body (ConvertTo-Json -InputObject (, $leasePumpCapability) -Depth 10)
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/policies" `
+  -ContentType "application/json" `
+  -Body (ConvertTo-Json -InputObject (, @{
+    target_entity_id = $leasePump.id
+    command_type = "StartPump"
+    requires_approval = $true
+    auto_execute_allowed = $false
+    metadata = @{ reason = "lease test requires approval" }
+  }) -Depth 10)
+
+$leaseCommand = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands" `
+  -ContentType "application/json" `
+  -Body (@{
+    target_entity_id = $leasePump.id
+    command_type = "StartPump"
+    payload = @{ target_state = "running" }
+    requested_by = "operator@example.com"
+    reason = "Test command lease recovery"
+  } | ConvertTo-Json -Depth 10)
+
+$leaseExecutor = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/executors" `
+  -ContentType "application/json" `
+  -Body (@{
+    agent_key = "edge-agent-01"
+    agent_type = "edge"
+    display_name = "Edge Agent 01"
+    status = "online"
+    metadata = @{ site = "building-01" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/executors/$($leaseExecutor.id)/capabilities" `
+  -ContentType "application/json" `
+  -Body (ConvertTo-Json -InputObject (, @{
+    command_type = "StartPump"
+    protocol = "local"
+    metadata = @{ source = "manual-test" }
+  }) -Depth 10)
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/executors/$($leaseExecutor.id)/scopes" `
+  -ContentType "application/json" `
+  -Body (ConvertTo-Json -InputObject (, @{
+    target_entity_id = $leasePump.id
+    metadata = @{ scope = "pump-only" }
+  }) -Depth 10)
+
+try {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/executors/$($leaseExecutor.id)/commands/$($leaseCommand.id)/claim" `
+    -ContentType "application/json" `
+    -Body (@{ lease_duration_seconds = 5 } | ConvertTo-Json)
+} catch {
+  $_.ErrorDetails.Message
+}
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($leaseCommand.id)/approve"
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/executors/$($leaseExecutor.id)/commands/$($leaseCommand.id)/claim" `
+  -ContentType "application/json" `
+  -Body (@{
+    lease_duration_seconds = 5
+    max_retries = 2
+    metadata = @{ source = "manual-lease-test" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/commands/$($leaseCommand.id)/lease"
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands/$($leaseCommand.id)/lease/refresh" `
+  -ContentType "application/json" `
+  -Body (@{
+    executor_id = $leaseExecutor.id
+    lease_duration_seconds = 10
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands/$($leaseCommand.id)/lease/release" `
+  -ContentType "application/json" `
+  -Body (@{ executor_id = $leaseExecutor.id } | ConvertTo-Json)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/executors/$($leaseExecutor.id)/commands/$($leaseCommand.id)/claim" `
+  -ContentType "application/json" `
+  -Body (@{
+    lease_duration_seconds = 1
+    max_retries = 2
+    metadata = @{ source = "expiry-test" }
+  } | ConvertTo-Json -Depth 10)
+
+Start-Sleep -Seconds 2
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/recover-expired-leases"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?command_id=$($leaseCommand.id)"
+```
+
 Build AI context for a smart-building water tank and pump:
 
 ```powershell
