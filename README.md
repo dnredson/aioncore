@@ -244,7 +244,34 @@ $raw.connector_key
 $raw.connector_profile
 ```
 
-The connector registry is in-memory in this milestone. Existing env-var MQTT config remains the default runtime MQTT connector behavior; dynamic MQTT workers per connector and TTN uplink decoding are future work.
+The connector registry is available in memory and through the PostgreSQL backend. Existing env-var MQTT config remains the default runtime MQTT connector behavior; dynamic MQTT workers per connector and TTN uplink decoding are future work.
+
+With PostgreSQL selected as the storage backend, connector records are stored durably. Example connector payloads:
+
+```json
+{
+  "connector_key": "farm-mqtt",
+  "connector_type": "mqtt",
+  "connector_profile": "generic-mqtt",
+  "enabled": false,
+  "broker_url": "mqtt://127.0.0.1:1883",
+  "client_id": "aioncore-farm-mqtt",
+  "topic_filter": "farm/+/telemetry",
+  "payload_format": "canonical-json"
+}
+```
+
+```json
+{
+  "connector_key": "ttn-demo",
+  "connector_type": "mqtt",
+  "connector_profile": "ttn-v3",
+  "enabled": false,
+  "broker_url": "mqtt://eu1.cloud.thethings.network:1883",
+  "topic_filter": "v3/demo-application/devices/+/up",
+  "payload_format": "ttn-uplink-json"
+}
+```
 
 Runtime validation scripts:
 
@@ -270,6 +297,13 @@ cargo test -p aion-storage postgres_
 ```
 
 If the environment variable is unset, the PostgreSQL adapter tests skip cleanly and the normal in-memory test suite still passes.
+
+Connector persistence is covered by the PostgreSQL parity suite:
+
+```powershell
+$env:AIONCORE_TEST_DATABASE_URL = "postgres://user:password@localhost:5432/aioncore"
+cargo test -p aion-storage postgres_parity_ingestion_connectors
+```
 
 If a postgres runtime URL is available, you can also validate the API startup path:
 

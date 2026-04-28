@@ -34,6 +34,8 @@ pub const MIGRATION_0005_CREATE_OBSERVATIONS: &str =
     include_str!("../../../migrations/0005_create_observations.sql");
 pub const MIGRATION_0006_CREATE_RUNTIME_PERSISTENCE_TABLES: &str =
     include_str!("../../../migrations/0006_create_runtime_persistence_tables.sql");
+pub const MIGRATION_0007_CREATE_INGESTION_CONNECTORS: &str =
+    include_str!("../../../migrations/0007_create_ingestion_connectors.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -53,6 +55,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0006_create_runtime_persistence_tables.sql",
         MIGRATION_0006_CREATE_RUNTIME_PERSISTENCE_TABLES,
+    ),
+    (
+        "0007_create_ingestion_connectors.sql",
+        MIGRATION_0007_CREATE_INGESTION_CONNECTORS,
     ),
 ];
 
@@ -1520,12 +1526,16 @@ mod tests {
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 6);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 7);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
             ORDERED_MIGRATIONS[5].0,
             "0006_create_runtime_persistence_tables.sql"
+        );
+        assert_eq!(
+            ORDERED_MIGRATIONS[6].0,
+            "0007_create_ingestion_connectors.sql"
         );
     }
 
@@ -1555,6 +1565,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS executor_scopes",
             "CREATE TABLE IF NOT EXISTS command_leases",
             "CREATE TABLE IF NOT EXISTS rules",
+            "CREATE TABLE IF NOT EXISTS ingestion_connectors",
         ] {
             assert!(
                 combined.contains(table),
@@ -1996,5 +2007,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(events, vec![event]);
+    }
+
+    #[test]
+    fn ingestion_connector_migration_defines_required_indexes() {
+        let migration = MIGRATION_0007_CREATE_INGESTION_CONNECTORS;
+        for index in [
+            "idx_ingestion_connectors_tenant",
+            "idx_ingestion_connectors_connector_key",
+            "idx_ingestion_connectors_connector_type",
+            "idx_ingestion_connectors_connector_profile",
+            "idx_ingestion_connectors_enabled",
+        ] {
+            assert!(migration.contains(index), "missing index: {index}");
+        }
     }
 }

@@ -113,6 +113,7 @@ The PostgreSQL adapter currently covers the control-plane subset needed for pari
 - `action_results`
 - `command_leases`
 - `rules`
+- `ingestion_connectors`
 
 The PostgreSQL adapter now also covers the telemetry-oriented core tables:
 
@@ -139,10 +140,12 @@ The migration set still covers the current in-memory domain models:
 - `executor_scopes`
 - `command_leases`
 - `rules`
+- `ingestion_connectors`
 
 Remaining adapter areas are planned for later milestones:
 
 - none for the current command and rule lifecycle scope
+- connector status persistence; connector status remains runtime-derived for now
 
 ## JSONB Fields
 
@@ -153,6 +156,7 @@ JSONB is used for structured or extensible fields:
 - Raw message headers: `raw_messages.headers`
 - Observation values, quality, and metadata: `observations.value_json`, `observations.quality`, `observations.metadata`
 - Payload profile mappings and metadata: `payload_profiles.attribute_mapping`, `payload_profiles.metadata`
+- Ingestion connector metadata: `ingestion_connectors.metadata`
 - Capability, policy, command, action, result, event, executor, lease, and rule metadata
 - Command payloads and policy decisions
 - Action result payloads
@@ -176,6 +180,19 @@ The schema includes indexes for common local API and future repository queries:
 - Executor scopes and capabilities by agent and matching fields.
 - Command leases by command, executor, status, and expiry.
 - Rules by enabled state, trigger type, observed property, and event type.
+- Ingestion connectors by tenant, key, type, profile, and enabled state.
+
+## Ingestion Connector Persistence
+
+PostgreSQL now persists ingestion connector configuration through `ingestion_connectors`.
+
+This includes generic HTTP connectors, generic AionCore MQTT connectors, generic MQTT connectors, and provider-specific profiles such as `ttn-v3`. Persisting these records is a prerequisite for future dynamic worker startup, where enabled MQTT connectors can become runtime workers after restart.
+
+Connector status remains runtime-derived in the current model. The table persists connector configuration and enablement, but it does not yet persist last error, last message time, last successful ingest time, or last failed ingest time.
+
+Secrets are not stored in ingestion connector records. Broker passwords, token material, TLS credentials, and per-device authorization remain future work.
+
+The `ttn-v3` connector profile configuration is persisted, including broker URL, topic filter, payload format, and metadata. Full TTN uplink decoding remains future work.
 
 ## Future Adapter Expectations
 
@@ -201,7 +218,7 @@ $env:AIONCORE_TEST_DATABASE_URL = "postgres://user:password@localhost:5432/aionc
 cargo test -p aion-storage postgres_
 ```
 
-Lifecycle parity coverage includes command create/query/update behavior, action and action result storage, command lease persistence, and rule create/list/enable/disable behavior.
+Lifecycle parity coverage includes command create/query/update behavior, action and action result storage, command lease persistence, rule create/list/enable/disable behavior, and ingestion connector create/list/get/enable/disable behavior.
 
 The tests apply the embedded migrations before exercising the adapter. The database must have access to the required PostgreSQL and TimescaleDB extensions.
 

@@ -43,7 +43,7 @@ Receive request
 
 ## Ingestion Connector Registry
 
-AionCore now has an in-memory `IngestionConnector` registry. An ingestion connector describes where data comes from; a connector profile describes how to interpret source-specific semantics.
+AionCore has an `IngestionConnector` registry. An ingestion connector describes where data comes from; a connector profile describes how to interpret source-specific semantics.
 
 Connector fields include:
 
@@ -80,6 +80,8 @@ Connector status is currently derived from registry state:
 - disabled connectors report `disabled`
 - enabled HTTP connectors report `ready`
 - enabled MQTT/future connectors report `degraded` because dynamic workers per connector are future work
+
+The registry is supported by in-memory storage and PostgreSQL persistence. Durable connector configuration is needed before dynamic MQTT workers can be introduced, because future startup logic will need to reload enabled connectors and start the appropriate source-specific workers.
 
 The existing environment-variable MQTT configuration acts as the default runtime MQTT connector for now. It is not yet created dynamically from the registry.
 
@@ -174,7 +176,7 @@ Full TTN uplink decoding is not implemented yet. Future TTN adapter behavior sho
 
 ## Limitations
 
-- Connector registry persistence is in-memory only in this milestone.
+- Connector registry persistence is available for in-memory and PostgreSQL storage.
 - Dynamic MQTT workers per connector are not implemented yet.
 - TTN/The Things Stack live connectivity and full uplink decoding are not implemented yet.
 - Secrets storage is not implemented yet.

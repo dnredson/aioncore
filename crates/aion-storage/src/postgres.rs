@@ -170,6 +170,73 @@ fn row_to_payload_profile(row: Row) -> PayloadProfile {
     }
 }
 
+fn row_to_ingestion_connector(row: Row) -> StorageResult<IngestionConnector> {
+    Ok(IngestionConnector {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        connector_key: row.get("connector_key"),
+        connector_type: ingestion_connector_type_from_db(row.get::<_, String>("connector_type"))?,
+        connector_profile: connector_profile_from_db(row.get::<_, String>("connector_profile"))?,
+        enabled: row.get("enabled"),
+        display_name: row.get("display_name"),
+        protocol: row.get("protocol"),
+        endpoint: row.get("endpoint"),
+        broker_url: row.get("broker_url"),
+        client_id: row.get("client_id"),
+        topic_filter: row.get("topic_filter"),
+        http_path: row.get("http_path"),
+        payload_format: row.get("payload_format"),
+        content_type: row.get("content_type"),
+        default_producer_entity_id: row.get("default_producer_entity_id"),
+        default_feature_of_interest_id: row.get("default_feature_of_interest_id"),
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn ingestion_connector_type_to_db(connector_type: &IngestionConnectorType) -> &'static str {
+    match connector_type {
+        IngestionConnectorType::Http => "http",
+        IngestionConnectorType::Mqtt => "mqtt",
+        IngestionConnectorType::Future => "future",
+    }
+}
+
+fn ingestion_connector_type_from_db(value: String) -> StorageResult<IngestionConnectorType> {
+    match value.as_str() {
+        "http" => Ok(IngestionConnectorType::Http),
+        "mqtt" => Ok(IngestionConnectorType::Mqtt),
+        "future" => Ok(IngestionConnectorType::Future),
+        other => Err(StorageError::Backend(format!(
+            "unknown ingestion connector type in database: {other}"
+        ))),
+    }
+}
+
+fn connector_profile_to_db(connector_profile: &ConnectorProfile) -> &'static str {
+    match connector_profile {
+        ConnectorProfile::GenericAionMqtt => "generic-aion-mqtt",
+        ConnectorProfile::GenericMqtt => "generic-mqtt",
+        ConnectorProfile::TtnV3 => "ttn-v3",
+        ConnectorProfile::Custom => "custom",
+    }
+}
+
+fn connector_profile_from_db(value: String) -> StorageResult<ConnectorProfile> {
+    match value.as_str() {
+        "generic-aion-mqtt" => Ok(ConnectorProfile::GenericAionMqtt),
+        "generic-mqtt" => Ok(ConnectorProfile::GenericMqtt),
+        "ttn-v3" => Ok(ConnectorProfile::TtnV3),
+        "custom" => Ok(ConnectorProfile::Custom),
+        other => Err(StorageError::Backend(format!(
+            "unknown connector profile in database: {other}"
+        ))),
+    }
+}
+
 fn row_to_capability(row: Row) -> Capability {
     let metadata = row
         .get::<_, Option<Json<Value>>>("metadata")
@@ -2007,39 +2074,180 @@ impl PayloadProfileStore for PostgresStorage {
 impl IngestionConnectorStore for PostgresStorage {
     fn create_ingestion_connector(
         &self,
-        _connector: IngestionConnector,
+        connector: IngestionConnector,
     ) -> StorageResult<IngestionConnector> {
-        Err(StorageError::Backend(
-            "postgres ingestion connector registry is not implemented yet".to_string(),
-        ))
+        self.with_client(|client| {
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO ingestion_connectors (
+                        id,
+                        tenant_id,
+                        connector_key,
+                        connector_type,
+                        connector_profile,
+                        enabled,
+                        display_name,
+                        protocol,
+                        endpoint,
+                        broker_url,
+                        client_id,
+                        topic_filter,
+                        http_path,
+                        payload_format,
+                        content_type,
+                        default_producer_entity_id,
+                        default_feature_of_interest_id,
+                        metadata,
+                        created_at,
+                        updated_at
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+                    )
+                    RETURNING id, tenant_id, connector_key, connector_type, connector_profile,
+                        enabled, display_name, protocol, endpoint, broker_url, client_id,
+                        topic_filter, http_path, payload_format, content_type,
+                        default_producer_entity_id, default_feature_of_interest_id, metadata,
+                        created_at, updated_at
+                    ",
+                    &[
+                        &connector.id,
+                        &connector.tenant_id,
+                        &connector.connector_key,
+                        &ingestion_connector_type_to_db(&connector.connector_type),
+                        &connector_profile_to_db(&connector.connector_profile),
+                        &connector.enabled,
+                        &connector.display_name,
+                        &connector.protocol,
+                        &connector.endpoint,
+                        &connector.broker_url,
+                        &connector.client_id,
+                        &connector.topic_filter,
+                        &connector.http_path,
+                        &connector.payload_format,
+                        &connector.content_type,
+                        &connector.default_producer_entity_id,
+                        &connector.default_feature_of_interest_id,
+                        &json_option_column(connector.metadata.as_ref()),
+                        &connector.created_at,
+                        &connector.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row_to_ingestion_connector(row)
+        })
     }
 
     fn get_ingestion_connector(
         &self,
-        _tenant_id: Uuid,
-        _connector_id: Uuid,
+        tenant_id: Uuid,
+        connector_id: Uuid,
     ) -> StorageResult<Option<IngestionConnector>> {
-        Err(StorageError::Backend(
-            "postgres ingestion connector registry is not implemented yet".to_string(),
-        ))
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, connector_key, connector_type, connector_profile,
+                        enabled, display_name, protocol, endpoint, broker_url, client_id,
+                        topic_filter, http_path, payload_format, content_type,
+                        default_producer_entity_id, default_feature_of_interest_id, metadata,
+                        created_at, updated_at
+                    FROM ingestion_connectors
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &connector_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_ingestion_connector).transpose()
+        })
     }
 
-    fn list_ingestion_connectors(
-        &self,
-        _tenant_id: Uuid,
-    ) -> StorageResult<Vec<IngestionConnector>> {
-        Err(StorageError::Backend(
-            "postgres ingestion connector registry is not implemented yet".to_string(),
-        ))
+    fn list_ingestion_connectors(&self, tenant_id: Uuid) -> StorageResult<Vec<IngestionConnector>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, connector_key, connector_type, connector_profile,
+                        enabled, display_name, protocol, endpoint, broker_url, client_id,
+                        topic_filter, http_path, payload_format, content_type,
+                        default_producer_entity_id, default_feature_of_interest_id, metadata,
+                        created_at, updated_at
+                    FROM ingestion_connectors
+                    WHERE tenant_id = $1
+                    ORDER BY connector_key ASC
+                    ",
+                    &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_ingestion_connector)
+                .collect::<StorageResult<Vec<_>>>()
+        })
     }
 
     fn update_ingestion_connector(
         &self,
-        _connector: IngestionConnector,
+        connector: IngestionConnector,
     ) -> StorageResult<IngestionConnector> {
-        Err(StorageError::Backend(
-            "postgres ingestion connector registry is not implemented yet".to_string(),
-        ))
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE ingestion_connectors SET
+                        connector_key = $3,
+                        connector_type = $4,
+                        connector_profile = $5,
+                        enabled = $6,
+                        display_name = $7,
+                        protocol = $8,
+                        endpoint = $9,
+                        broker_url = $10,
+                        client_id = $11,
+                        topic_filter = $12,
+                        http_path = $13,
+                        payload_format = $14,
+                        content_type = $15,
+                        default_producer_entity_id = $16,
+                        default_feature_of_interest_id = $17,
+                        metadata = $18,
+                        created_at = $19,
+                        updated_at = $20
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING id, tenant_id, connector_key, connector_type, connector_profile,
+                        enabled, display_name, protocol, endpoint, broker_url, client_id,
+                        topic_filter, http_path, payload_format, content_type,
+                        default_producer_entity_id, default_feature_of_interest_id, metadata,
+                        created_at, updated_at
+                    ",
+                    &[
+                        &connector.tenant_id,
+                        &connector.id,
+                        &connector.connector_key,
+                        &ingestion_connector_type_to_db(&connector.connector_type),
+                        &connector_profile_to_db(&connector.connector_profile),
+                        &connector.enabled,
+                        &connector.display_name,
+                        &connector.protocol,
+                        &connector.endpoint,
+                        &connector.broker_url,
+                        &connector.client_id,
+                        &connector.topic_filter,
+                        &connector.http_path,
+                        &connector.payload_format,
+                        &connector.content_type,
+                        &connector.default_producer_entity_id,
+                        &connector.default_feature_of_interest_id,
+                        &json_option_column(connector.metadata.as_ref()),
+                        &connector.created_at,
+                        &connector.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_ingestion_connector)
+                .transpose()?
+                .ok_or(StorageError::NotFound)
+        })
     }
 }
 
@@ -2554,6 +2762,37 @@ mod tests {
         }
     }
 
+    fn build_connector(
+        tenant_id: Uuid,
+        suffix: &str,
+        connector_key: &str,
+        connector_type: IngestionConnectorType,
+        connector_profile: ConnectorProfile,
+        payload_format: &str,
+    ) -> IngestionConnector {
+        IngestionConnector::new(
+            tenant_id,
+            format!("{connector_key}-{suffix}"),
+            connector_type,
+            connector_profile,
+            false,
+            Some(format!("Connector {suffix}")),
+            Some("http".to_string()),
+            Some(format!("endpoint-{suffix}")),
+            Some("mqtt://127.0.0.1:1883".to_string()),
+            Some(format!("client-{suffix}")),
+            Some("aioncore/+/+/data".to_string()),
+            Some(format!("/ingestion/{suffix}")),
+            Some(payload_format.to_string()),
+            Some("application/json".to_string()),
+            None,
+            None,
+            Some(json!({"suite": "postgres", "suffix": suffix})),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
+        )
+        .expect("valid ingestion connector")
+    }
+
     fn build_relationship(
         tenant_id: Uuid,
         source_entity_id: Uuid,
@@ -2854,6 +3093,115 @@ mod tests {
                 .expect("list capabilities");
             listed.sort_by(|left, right| left.capability_name.cmp(&right.capability_name));
             assert_eq!(listed, capabilities);
+        }
+    }
+
+    #[test]
+    fn postgres_parity_ingestion_connectors() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let http_connector = build_connector(
+            tenant.id,
+            &suffix,
+            "http",
+            IngestionConnectorType::Http,
+            ConnectorProfile::Custom,
+            "senml-json",
+        );
+        let generic_mqtt_connector = build_connector(
+            tenant.id,
+            &suffix,
+            "generic-mqtt",
+            IngestionConnectorType::Mqtt,
+            ConnectorProfile::GenericMqtt,
+            "canonical-json",
+        );
+        let ttn_connector = build_connector(
+            tenant.id,
+            &suffix,
+            "ttn",
+            IngestionConnectorType::Mqtt,
+            ConnectorProfile::TtnV3,
+            "ttn-uplink-json",
+        );
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+
+        for store in [
+            &in_memory as &dyn IngestionConnectorStore,
+            &pg as &dyn IngestionConnectorStore,
+        ] {
+            for connector in [
+                http_connector.clone(),
+                generic_mqtt_connector.clone(),
+                ttn_connector.clone(),
+            ] {
+                assert_eq!(
+                    store
+                        .create_ingestion_connector(connector.clone())
+                        .expect("create connector"),
+                    connector
+                );
+                assert_eq!(
+                    store
+                        .get_ingestion_connector(tenant.id, connector.id)
+                        .expect("get connector")
+                        .expect("missing connector"),
+                    connector
+                );
+            }
+
+            let listed = store
+                .list_ingestion_connectors(tenant.id)
+                .expect("list connectors");
+            assert_eq!(listed.len(), 3);
+            assert!(listed
+                .iter()
+                .any(|connector| connector.connector_profile == ConnectorProfile::TtnV3));
+            assert!(listed
+                .iter()
+                .any(|connector| connector.connector_profile == ConnectorProfile::GenericMqtt));
+            assert!(listed
+                .iter()
+                .any(|connector| connector.connector_type == IngestionConnectorType::Http));
+
+            let mut enabled = http_connector.clone();
+            enabled.set_enabled(true, Utc.with_ymd_and_hms(2026, 4, 27, 12, 1, 0).unwrap());
+            assert_eq!(
+                store
+                    .update_ingestion_connector(enabled.clone())
+                    .expect("enable connector"),
+                enabled
+            );
+            assert!(
+                store
+                    .get_ingestion_connector(tenant.id, http_connector.id)
+                    .expect("get enabled connector")
+                    .expect("missing enabled connector")
+                    .enabled
+            );
+
+            let mut disabled = enabled.clone();
+            disabled.set_enabled(false, Utc.with_ymd_and_hms(2026, 4, 27, 12, 2, 0).unwrap());
+            assert_eq!(
+                store
+                    .update_ingestion_connector(disabled.clone())
+                    .expect("disable connector"),
+                disabled
+            );
+            assert!(
+                !store
+                    .get_ingestion_connector(tenant.id, http_connector.id)
+                    .expect("get disabled connector")
+                    .expect("missing disabled connector")
+                    .enabled
+            );
         }
     }
 
