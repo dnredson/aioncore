@@ -1,8 +1,11 @@
 use super::*;
 use ::postgres::error::SqlState;
-use ::postgres::types::Json;
+use ::postgres::types::{Json, ToSql};
 use ::postgres::{Client, Config as PgConfig, NoTls, Row};
 use aion_action::ExecutorAgentStatus;
+use aion_event::EventSeverity;
+use aion_observation::ObservationValue;
+use aion_raw_message::{NormalizationStatus, RawMessageSource};
 use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -207,6 +210,165 @@ fn row_to_executor_scope(row: Row) -> ExecutorScope {
         relationship_type: row.get("relationship_type"),
         metadata,
     }
+}
+
+fn raw_message_source_to_db(source_type: &RawMessageSource) -> &'static str {
+    match source_type {
+        RawMessageSource::Http => "http",
+        RawMessageSource::Mqtt => "mqtt",
+    }
+}
+
+fn raw_message_source_from_db(source_type: String) -> StorageResult<RawMessageSource> {
+    match source_type.as_str() {
+        "http" => Ok(RawMessageSource::Http),
+        "mqtt" => Ok(RawMessageSource::Mqtt),
+        other => Err(StorageError::Backend(format!(
+            "unknown raw message source type in database: {other}"
+        ))),
+    }
+}
+
+fn normalization_status_to_db(status: &NormalizationStatus) -> &'static str {
+    match status {
+        NormalizationStatus::Pending => "pending",
+        NormalizationStatus::Normalized => "normalized",
+        NormalizationStatus::Failed => "failed",
+    }
+}
+
+fn normalization_status_from_db(status: String) -> StorageResult<NormalizationStatus> {
+    match status.as_str() {
+        "pending" => Ok(NormalizationStatus::Pending),
+        "normalized" => Ok(NormalizationStatus::Normalized),
+        "failed" => Ok(NormalizationStatus::Failed),
+        other => Err(StorageError::Backend(format!(
+            "unknown raw message normalization status in database: {other}"
+        ))),
+    }
+}
+
+fn event_severity_to_db(severity: &EventSeverity) -> &'static str {
+    match severity {
+        EventSeverity::Debug => "debug",
+        EventSeverity::Info => "info",
+        EventSeverity::Warning => "warning",
+        EventSeverity::Error => "error",
+        EventSeverity::Critical => "critical",
+    }
+}
+
+fn event_severity_from_db(severity: String) -> StorageResult<EventSeverity> {
+    match severity.as_str() {
+        "debug" => Ok(EventSeverity::Debug),
+        "info" => Ok(EventSeverity::Info),
+        "warning" => Ok(EventSeverity::Warning),
+        "error" => Ok(EventSeverity::Error),
+        "critical" => Ok(EventSeverity::Critical),
+        other => Err(StorageError::Backend(format!(
+            "unknown event severity in database: {other}"
+        ))),
+    }
+}
+
+fn row_to_raw_message(row: Row) -> StorageResult<RawMessage> {
+    let Json(headers) = row.get::<_, Json<Value>>("headers");
+    Ok(RawMessage {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        source_type: raw_message_source_from_db(row.get::<_, String>("source_type"))?,
+        source_ref: row.get("source_ref"),
+        device_key: row.get("device_key"),
+        decoder_hint: row.get("decoder_hint"),
+        content_type: row.get("content_type"),
+        producer_entity_id: row.get("producer_entity_id"),
+        feature_of_interest_id: row.get("feature_of_interest_id"),
+        payload_format: row.get("payload_format"),
+        headers,
+        payload: row.get("payload"),
+        received_at: row.get("received_at"),
+        normalization_status: normalization_status_from_db(
+            row.get::<_, String>("normalization_status"),
+        )?,
+        normalization_error: row.get("normalization_error"),
+    })
+}
+
+fn observation_value_to_columns(
+    value: &ObservationValue,
+) -> (
+    Option<f64>,
+    Option<String>,
+    Option<bool>,
+    Option<Json<Value>>,
+) {
+    match value {
+        ObservationValue::Number { value } => (Some(*value), None, None, None),
+        ObservationValue::Text { value } => (None, Some(value.clone()), None, None),
+        ObservationValue::Bool { value } => (None, None, Some(*value), None),
+        ObservationValue::Json { value } => (None, None, None, Some(Json(value.clone()))),
+    }
+}
+
+fn row_to_observation(row: Row) -> StorageResult<Observation> {
+    let Json(quality) = row.get::<_, Json<Value>>("quality");
+    let Json(metadata) = row.get::<_, Json<Value>>("metadata");
+    let value = if let Some(value) = row.get::<_, Option<f64>>("value_number") {
+        ObservationValue::Number { value }
+    } else if let Some(value) = row.get::<_, Option<String>>("value_string") {
+        ObservationValue::Text { value }
+    } else if let Some(value) = row.get::<_, Option<bool>>("value_bool") {
+        ObservationValue::Bool { value }
+    } else if let Some(Json(value)) = row.get::<_, Option<Json<Value>>>("value_json") {
+        ObservationValue::Json { value }
+    } else {
+        return Err(StorageError::Backend(
+            "observation row is missing a canonical value".to_string(),
+        ));
+    };
+
+    Ok(Observation {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        producer_entity_id: row.get("producer_entity_id"),
+        feature_of_interest_id: row.get("feature_of_interest_id"),
+        observed_property: row.get("observed_property"),
+        value,
+        unit: row.get("unit"),
+        observed_at: row.get("observed_at"),
+        received_at: row.get("received_at"),
+        protocol: row.get("protocol"),
+        payload_format: row.get("payload_format"),
+        raw_message_id: row.get("raw_message_id"),
+        quality,
+        metadata,
+    })
+}
+
+fn row_to_event(row: Row) -> StorageResult<Event> {
+    let severity = event_severity_from_db(row.get::<_, String>("severity"))?;
+    let metadata = row
+        .get::<_, Option<Json<Value>>>("metadata")
+        .map(|Json(value)| value);
+    Ok(Event {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        event_type: row.get("event_type"),
+        severity,
+        source_entity_id: row.get("source_entity_id"),
+        target_entity_id: row.get("target_entity_id"),
+        message: row.get("message"),
+        occurred_at: row.get("occurred_at"),
+        observed_at: row.get("observed_at"),
+        correlation_id: row.get("correlation_id"),
+        raw_message_id: row.get("raw_message_id"),
+        observation_id: row.get("observation_id"),
+        command_id: row.get("command_id"),
+        action_id: row.get("action_id"),
+        action_result_id: row.get("action_result_id"),
+        metadata,
+        created_at: row.get("created_at"),
+    })
 }
 
 fn executor_status_to_db(status: &ExecutorAgentStatus) -> &'static str {
@@ -435,6 +597,495 @@ impl RelationshipStore for PostgresStorage {
                 .collect::<Vec<_>>();
             relationships.sort_by(|left, right| left.created_at.cmp(&right.created_at));
             Ok(relationships)
+        })
+    }
+}
+
+impl RawMessageStore for PostgresStorage {
+    fn store_raw_message(&self, raw_message: RawMessage) -> StorageResult<RawMessage> {
+        self.with_client(|client| {
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO raw_messages (
+                        id,
+                        tenant_id,
+                        source_type,
+                        source_ref,
+                        device_key,
+                        decoder_hint,
+                        content_type,
+                        producer_entity_id,
+                        feature_of_interest_id,
+                        payload_format,
+                        headers,
+                        payload,
+                        received_at,
+                        normalization_status,
+                        normalization_error
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                    RETURNING id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    ",
+                    &[
+                        &raw_message.id,
+                        &raw_message.tenant_id,
+                        &raw_message_source_to_db(&raw_message.source_type),
+                        &raw_message.source_ref,
+                        &raw_message.device_key,
+                        &raw_message.decoder_hint,
+                        &raw_message.content_type,
+                        &raw_message.producer_entity_id,
+                        &raw_message.feature_of_interest_id,
+                        &raw_message.payload_format,
+                        &json_column(&raw_message.headers),
+                        &raw_message.payload,
+                        &raw_message.received_at,
+                        &normalization_status_to_db(&raw_message.normalization_status),
+                        &raw_message.normalization_error,
+                    ],
+                )
+                .map_err(|err| if is_unique_violation(&err) { StorageError::Conflict } else { map_postgres_error(err) })?;
+            row_to_raw_message(row)
+        })
+    }
+
+    fn get_raw_message(
+        &self,
+        tenant_id: Uuid,
+        raw_message_id: Uuid,
+    ) -> StorageResult<Option<RawMessage>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    FROM raw_messages
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &raw_message_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_raw_message(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_raw_messages(&self, tenant_id: Uuid) -> StorageResult<Vec<RawMessage>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    FROM raw_messages
+                    WHERE tenant_id = $1
+                    ORDER BY received_at DESC
+                    ",
+                    &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_raw_message)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn query_raw_messages(
+        &self,
+        tenant_id: Uuid,
+        producer_entity_id: Option<Uuid>,
+        feature_of_interest_id: Option<Uuid>,
+        payload_format: Option<&str>,
+    ) -> StorageResult<Vec<RawMessage>> {
+        self.with_client(|client| {
+            let mut sql = String::from(
+                "
+                SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                FROM raw_messages
+                WHERE tenant_id = $1
+                ",
+            );
+            let producer_entity_id = producer_entity_id;
+            let feature_of_interest_id = feature_of_interest_id;
+            let payload_format = payload_format.map(|value| value.to_string());
+            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&tenant_id];
+            let mut next_index = 2;
+
+            if let Some(producer_entity_id) = producer_entity_id.as_ref() {
+                sql.push_str(&format!(" AND producer_entity_id = ${next_index}"));
+                params.push(producer_entity_id);
+                next_index += 1;
+            }
+
+            if let Some(feature_of_interest_id) = feature_of_interest_id.as_ref() {
+                sql.push_str(&format!(" AND feature_of_interest_id = ${next_index}"));
+                params.push(feature_of_interest_id);
+                next_index += 1;
+            }
+
+            if let Some(payload_format) = payload_format.as_ref() {
+                sql.push_str(&format!(" AND payload_format = ${next_index}"));
+                params.push(payload_format);
+            }
+
+            sql.push_str(" ORDER BY received_at DESC");
+            let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_raw_message)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn mark_raw_message_normalized(
+        &self,
+        tenant_id: Uuid,
+        raw_message_id: Uuid,
+    ) -> StorageResult<()> {
+        self.with_client(|client| {
+            let updated = client
+                .execute(
+                    "
+                    UPDATE raw_messages
+                    SET normalization_status = $3,
+                        normalization_error = NULL
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[
+                        &tenant_id,
+                        &raw_message_id,
+                        &normalization_status_to_db(&NormalizationStatus::Normalized),
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            if updated == 0 {
+                return Err(StorageError::NotFound);
+            }
+            Ok(())
+        })
+    }
+
+    fn mark_raw_message_failed(
+        &self,
+        tenant_id: Uuid,
+        raw_message_id: Uuid,
+        error: &str,
+    ) -> StorageResult<()> {
+        self.with_client(|client| {
+            let updated = client
+                .execute(
+                    "
+                    UPDATE raw_messages
+                    SET normalization_status = $3,
+                        normalization_error = $4
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[
+                        &tenant_id,
+                        &raw_message_id,
+                        &normalization_status_to_db(&NormalizationStatus::Failed),
+                        &error,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            if updated == 0 {
+                return Err(StorageError::NotFound);
+            }
+            Ok(())
+        })
+    }
+}
+
+impl ObservationStore for PostgresStorage {
+    fn store_observation(&self, observation: Observation) -> StorageResult<Observation> {
+        self.with_client(|client| {
+            let exists = client
+                .query_opt(
+                    "
+                    SELECT 1
+                    FROM observations
+                    WHERE tenant_id = $1 AND id = $2
+                    LIMIT 1
+                    ",
+                    &[&observation.tenant_id, &observation.id],
+                )
+                .map_err(map_postgres_error)?;
+            if exists.is_some() {
+                return Err(StorageError::Conflict);
+            }
+
+            let (value_number, value_string, value_bool, value_json) =
+                observation_value_to_columns(&observation.value);
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO observations (
+                        id,
+                        tenant_id,
+                        producer_entity_id,
+                        feature_of_interest_id,
+                        observed_property,
+                        value_number,
+                        value_string,
+                        value_bool,
+                        value_json,
+                        unit,
+                        observed_at,
+                        received_at,
+                        protocol,
+                        payload_format,
+                        raw_message_id,
+                        quality,
+                        metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                    RETURNING id, tenant_id, producer_entity_id, feature_of_interest_id, observed_property, value_number, value_string, value_bool, value_json, unit, observed_at, received_at, protocol, payload_format, raw_message_id, quality, metadata
+                    ",
+                    &[
+                        &observation.id,
+                        &observation.tenant_id,
+                        &observation.producer_entity_id,
+                        &observation.feature_of_interest_id,
+                        &observation.observed_property,
+                        &value_number,
+                        &value_string,
+                        &value_bool,
+                        &value_json,
+                        &observation.unit,
+                        &observation.observed_at,
+                        &observation.received_at,
+                        &observation.protocol,
+                        &observation.payload_format,
+                        &observation.raw_message_id,
+                        &json_column(&observation.quality),
+                        &json_column(&observation.metadata),
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row_to_observation(row)
+        })
+    }
+
+    fn get_observation(
+        &self,
+        tenant_id: Uuid,
+        observation_id: Uuid,
+    ) -> StorageResult<Option<Observation>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, producer_entity_id, feature_of_interest_id, observed_property, value_number, value_string, value_bool, value_json, unit, observed_at, received_at, protocol, payload_format, raw_message_id, quality, metadata
+                    FROM observations
+                    WHERE tenant_id = $1 AND id = $2
+                    ORDER BY observed_at DESC
+                    LIMIT 1
+                    ",
+                    &[&tenant_id, &observation_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_observation(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn query_observations(
+        &self,
+        tenant_id: Uuid,
+        feature_of_interest_id: Option<Uuid>,
+        observed_property: Option<&str>,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> StorageResult<Vec<Observation>> {
+        self.with_client(|client| {
+            let mut sql = String::from(
+                "
+                SELECT id, tenant_id, producer_entity_id, feature_of_interest_id, observed_property, value_number, value_string, value_bool, value_json, unit, observed_at, received_at, protocol, payload_format, raw_message_id, quality, metadata
+                FROM observations
+                WHERE tenant_id = $1
+                ",
+            );
+            let feature_of_interest_id = feature_of_interest_id;
+            let observed_property = observed_property.map(|value| value.to_string());
+            let from = from;
+            let to = to;
+            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&tenant_id];
+            let mut next_index = 2;
+
+            if let Some(feature_of_interest_id) = feature_of_interest_id.as_ref() {
+                sql.push_str(&format!(" AND feature_of_interest_id = ${next_index}"));
+                params.push(feature_of_interest_id);
+                next_index += 1;
+            }
+
+            if let Some(observed_property) = observed_property.as_ref() {
+                sql.push_str(&format!(" AND observed_property = ${next_index}"));
+                params.push(observed_property);
+                next_index += 1;
+            }
+
+            if let Some(from) = from.as_ref() {
+                sql.push_str(&format!(" AND observed_at >= ${next_index}"));
+                params.push(from);
+                next_index += 1;
+            }
+
+            if let Some(to) = to.as_ref() {
+                sql.push_str(&format!(" AND observed_at <= ${next_index}"));
+                params.push(to);
+                next_index += 1;
+            }
+
+            let limit = limit as i64;
+            sql.push_str(&format!(" ORDER BY observed_at DESC LIMIT ${next_index}"));
+            params.push(&limit);
+
+            let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_observation)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+}
+
+impl EventStore for PostgresStorage {
+    fn store_event(&self, event: Event) -> StorageResult<Event> {
+        self.with_client(|client| {
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO events (
+                        id,
+                        tenant_id,
+                        event_type,
+                        severity,
+                        source_entity_id,
+                        target_entity_id,
+                        message,
+                        occurred_at,
+                        observed_at,
+                        correlation_id,
+                        raw_message_id,
+                        observation_id,
+                        command_id,
+                        action_id,
+                        action_result_id,
+                        metadata,
+                        created_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                    RETURNING id, tenant_id, event_type, severity, source_entity_id, target_entity_id, message, occurred_at, observed_at, correlation_id, raw_message_id, observation_id, command_id, action_id, action_result_id, metadata, created_at
+                    ",
+                    &[
+                        &event.id,
+                        &event.tenant_id,
+                        &event.event_type,
+                        &event_severity_to_db(&event.severity),
+                        &event.source_entity_id,
+                        &event.target_entity_id,
+                        &event.message,
+                        &event.occurred_at,
+                        &event.observed_at,
+                        &event.correlation_id,
+                        &event.raw_message_id,
+                        &event.observation_id,
+                        &event.command_id,
+                        &event.action_id,
+                        &event.action_result_id,
+                        &json_option_column(event.metadata.as_ref()),
+                        &event.created_at,
+                    ],
+                )
+                .map_err(|err| if is_unique_violation(&err) { StorageError::Conflict } else { map_postgres_error(err) })?;
+            row_to_event(row)
+        })
+    }
+
+    fn get_event(&self, tenant_id: Uuid, event_id: Uuid) -> StorageResult<Option<Event>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, event_type, severity, source_entity_id, target_entity_id, message, occurred_at, observed_at, correlation_id, raw_message_id, observation_id, command_id, action_id, action_result_id, metadata, created_at
+                    FROM events
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &event_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_event(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn query_events(&self, tenant_id: Uuid, filter: EventFilter) -> StorageResult<Vec<Event>> {
+        self.with_client(|client| {
+            let mut sql = String::from(
+                "
+                SELECT id, tenant_id, event_type, severity, source_entity_id, target_entity_id, message, occurred_at, observed_at, correlation_id, raw_message_id, observation_id, command_id, action_id, action_result_id, metadata, created_at
+                FROM events
+                WHERE tenant_id = $1
+                ",
+            );
+            let source_entity_id = filter.source_entity_id;
+            let target_entity_id = filter.target_entity_id;
+            let event_type = filter.event_type;
+            let severity = filter.severity.as_ref().map(event_severity_to_db);
+            let command_id = filter.command_id;
+            let raw_message_id = filter.raw_message_id;
+            let correlation_id = filter.correlation_id;
+            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&tenant_id];
+            let mut next_index = 2;
+
+            if let Some(source_entity_id) = source_entity_id.as_ref() {
+                sql.push_str(&format!(" AND source_entity_id = ${next_index}"));
+                params.push(source_entity_id);
+                next_index += 1;
+            }
+
+            if let Some(target_entity_id) = target_entity_id.as_ref() {
+                sql.push_str(&format!(" AND target_entity_id = ${next_index}"));
+                params.push(target_entity_id);
+                next_index += 1;
+            }
+
+            if let Some(event_type) = event_type.as_ref() {
+                sql.push_str(&format!(" AND event_type = ${next_index}"));
+                params.push(event_type);
+                next_index += 1;
+            }
+
+            if let Some(severity) = severity.as_ref() {
+                sql.push_str(&format!(" AND severity = ${next_index}"));
+                params.push(severity);
+                next_index += 1;
+            }
+
+            if let Some(command_id) = command_id.as_ref() {
+                sql.push_str(&format!(" AND command_id = ${next_index}"));
+                params.push(command_id);
+                next_index += 1;
+            }
+
+            if let Some(raw_message_id) = raw_message_id.as_ref() {
+                sql.push_str(&format!(" AND raw_message_id = ${next_index}"));
+                params.push(raw_message_id);
+                next_index += 1;
+            }
+
+            if let Some(correlation_id) = correlation_id.as_ref() {
+                sql.push_str(&format!(" AND correlation_id = ${next_index}"));
+                params.push(correlation_id);
+            }
+
+            sql.push_str(" ORDER BY occurred_at DESC");
+            let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_event)
+                .collect::<StorageResult<Vec<_>>>()
         })
     }
 }
@@ -947,6 +1598,7 @@ impl ExecutorStore for PostgresStorage {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use serde_json::json;
     use std::sync::{Mutex, OnceLock};
 
     static POSTGRES_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -977,6 +1629,15 @@ mod tests {
 
     fn unique_suffix() -> String {
         format!("{}", Uuid::new_v4()).replace('-', "")
+    }
+
+    fn postgres_test_client() -> Client {
+        let url = std::env::var("AIONCORE_TEST_DATABASE_URL")
+            .expect("AIONCORE_TEST_DATABASE_URL must be set for PostgreSQL tests");
+        let config: PgConfig = url.parse().expect("invalid PostgreSQL test URL");
+        config
+            .connect(NoTls)
+            .expect("failed to connect to PostgreSQL test database")
     }
 
     fn build_tenant(suffix: &str) -> Tenant {
@@ -1024,6 +1685,109 @@ mod tests {
             jsonld: serde_json::json!({"@type": "aion:Relationship"}),
             created_at: now,
         }
+    }
+
+    fn build_observation(
+        tenant_id: Uuid,
+        producer_entity_id: Uuid,
+        feature_of_interest_id: Uuid,
+        observed_property: &str,
+        value: ObservationValue,
+        unit: Option<&str>,
+        observed_at: chrono::DateTime<Utc>,
+        received_at: chrono::DateTime<Utc>,
+        protocol: &str,
+        payload_format: &str,
+        raw_message_id: Option<Uuid>,
+    ) -> Observation {
+        Observation::new(
+            tenant_id,
+            producer_entity_id,
+            feature_of_interest_id,
+            observed_property,
+            value,
+            unit.map(|value| value.to_string()),
+            observed_at,
+            received_at,
+            protocol,
+            payload_format,
+            raw_message_id,
+            json!({"quality": "good"}),
+            json!({"source": "postgres"}),
+        )
+        .expect("valid observation")
+    }
+
+    fn build_event(
+        tenant_id: Uuid,
+        event_type: &str,
+        severity: EventSeverity,
+        source_entity_id: Option<Uuid>,
+        target_entity_id: Option<Uuid>,
+        message: Option<&str>,
+        occurred_at: chrono::DateTime<Utc>,
+        observed_at: Option<chrono::DateTime<Utc>>,
+        correlation_id: Option<&str>,
+        raw_message_id: Option<Uuid>,
+        command_id: Option<Uuid>,
+    ) -> Event {
+        Event::new(
+            tenant_id,
+            event_type,
+            severity,
+            source_entity_id,
+            target_entity_id,
+            message.map(|value| value.to_string()),
+            occurred_at,
+            observed_at,
+            correlation_id.map(|value| value.to_string()),
+            raw_message_id,
+            None,
+            command_id,
+            None,
+            None,
+            Some(json!({"source": "postgres"})),
+            occurred_at,
+        )
+        .expect("valid event")
+    }
+
+    fn seed_command_row(
+        tenant_id: Uuid,
+        command_id: Uuid,
+        target_entity_id: Uuid,
+        command_type: &str,
+    ) {
+        let mut client = postgres_test_client();
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let payload = json!({"target_state": "on"});
+        client
+            .execute(
+                "
+                INSERT INTO commands (
+                    id,
+                    tenant_id,
+                    target_entity_id,
+                    command_type,
+                    payload,
+                    status,
+                    created_at,
+                    updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (id) DO NOTHING
+                ",
+                &[
+                    &command_id,
+                    &tenant_id,
+                    &target_entity_id,
+                    &command_type,
+                    &payload,
+                    &"pending",
+                    &now,
+                    &now,
+                ],
+            )
+            .expect("seed command row");
     }
 
     #[test]
@@ -1354,6 +2118,305 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>();
             assert_eq!(listed, expected);
+        }
+    }
+
+    #[test]
+    fn postgres_parity_raw_messages() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let producer_a = build_entity(tenant.id, &format!("{suffix}-producer-a"), "aion:Sensor");
+        let producer_b = build_entity(tenant.id, &format!("{suffix}-producer-b"), "aion:Sensor");
+        let feature_a = build_entity(tenant.id, &format!("{suffix}-feature-a"), "aion:Zone");
+        let feature_b = build_entity(tenant.id, &format!("{suffix}-feature-b"), "aion:Zone");
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+        for store in [&in_memory as &dyn EntityStore, &pg as &dyn EntityStore] {
+            store
+                .create_entity(producer_a.clone())
+                .expect("create producer a");
+            store
+                .create_entity(producer_b.clone())
+                .expect("create producer b");
+            store
+                .create_entity(feature_a.clone())
+                .expect("create feature a");
+            store
+                .create_entity(feature_b.clone())
+                .expect("create feature b");
+        }
+
+        let received_a = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let received_b = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 1).unwrap();
+        let received_c = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 2).unwrap();
+        let raw_a = RawMessage::new(
+            tenant.id,
+            aion_raw_message::RawMessageSource::Http,
+            Some("/ingest/http/a".to_string()),
+            Some("device-a".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/senml+json".to_string()),
+            Some(producer_a.id),
+            Some(feature_a.id),
+            Some("senml-json".to_string()),
+            json!({"source": "a"}),
+            br#"{"temperature":21.4}"#.to_vec(),
+            received_a,
+        )
+        .expect("raw a");
+        let raw_b = RawMessage::new(
+            tenant.id,
+            aion_raw_message::RawMessageSource::Http,
+            Some("/ingest/http/b".to_string()),
+            Some("device-b".to_string()),
+            Some("ultralight".to_string()),
+            Some("text/plain".to_string()),
+            Some(producer_b.id),
+            Some(feature_a.id),
+            Some("ultralight".to_string()),
+            json!({"source": "b"}),
+            br#"t|21.5"#.to_vec(),
+            received_b,
+        )
+        .expect("raw b");
+        let raw_c = RawMessage::new(
+            tenant.id,
+            aion_raw_message::RawMessageSource::Mqtt,
+            Some("aion/demo/device-c".to_string()),
+            Some("device-c".to_string()),
+            Some("json_mapping".to_string()),
+            Some("application/json".to_string()),
+            Some(producer_a.id),
+            Some(feature_b.id),
+            Some("json_mapping".to_string()),
+            json!({"source": "c"}),
+            br#"{"temperature":21.6}"#.to_vec(),
+            received_c,
+        )
+        .expect("raw c");
+
+        for store in [
+            &in_memory as &dyn RawMessageStore,
+            &pg as &dyn RawMessageStore,
+        ] {
+            assert_eq!(store.store_raw_message(raw_a.clone()).unwrap(), raw_a);
+            assert_eq!(store.store_raw_message(raw_b.clone()).unwrap(), raw_b);
+            assert_eq!(store.store_raw_message(raw_c.clone()).unwrap(), raw_c);
+            assert_eq!(
+                store.get_raw_message(tenant.id, raw_b.id).unwrap().unwrap(),
+                raw_b
+            );
+
+            let listed = store.list_raw_messages(tenant.id).unwrap();
+            assert_eq!(listed, vec![raw_c.clone(), raw_b.clone(), raw_a.clone()]);
+
+            let by_producer = store
+                .query_raw_messages(tenant.id, Some(producer_a.id), None, None)
+                .unwrap();
+            assert_eq!(by_producer, vec![raw_c.clone(), raw_a.clone()]);
+
+            let by_feature = store
+                .query_raw_messages(tenant.id, None, Some(feature_a.id), None)
+                .unwrap();
+            assert_eq!(by_feature, vec![raw_b.clone(), raw_a.clone()]);
+
+            let by_format = store
+                .query_raw_messages(tenant.id, None, None, Some("ultralight"))
+                .unwrap();
+            assert_eq!(by_format, vec![raw_b.clone()]);
+        }
+    }
+
+    #[test]
+    fn postgres_parity_observations() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let producer = build_entity(tenant.id, &format!("{suffix}-producer"), "aion:Sensor");
+        let feature = build_entity(tenant.id, &format!("{suffix}-feature"), "aion:Zone");
+        let other_feature = build_entity(tenant.id, &format!("{suffix}-feature-2"), "aion:Zone");
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+        for store in [&in_memory as &dyn EntityStore, &pg as &dyn EntityStore] {
+            store
+                .create_entity(producer.clone())
+                .expect("create producer");
+            store
+                .create_entity(feature.clone())
+                .expect("create feature");
+            store
+                .create_entity(other_feature.clone())
+                .expect("create other feature");
+        }
+
+        let raw = RawMessage::new(
+            tenant.id,
+            aion_raw_message::RawMessageSource::Http,
+            Some("/ingest/http".to_string()),
+            Some("device-01".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/senml+json".to_string()),
+            Some(producer.id),
+            Some(feature.id),
+            Some("senml-json".to_string()),
+            json!({"source": "observation"}),
+            br#"{"temperature":21.4}"#.to_vec(),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
+        )
+        .expect("raw message");
+
+        for store in [
+            &in_memory as &dyn RawMessageStore,
+            &pg as &dyn RawMessageStore,
+        ] {
+            store.store_raw_message(raw.clone()).expect("store raw");
+        }
+
+        let observation = build_observation(
+            tenant.id,
+            producer.id,
+            feature.id,
+            "temperature",
+            ObservationValue::Number { value: 21.4 },
+            Some("Cel"),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 1).unwrap(),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 2).unwrap(),
+            "http",
+            "senml-json",
+            Some(raw.id),
+        );
+        let other_observation = build_observation(
+            tenant.id,
+            producer.id,
+            other_feature.id,
+            "humidity",
+            ObservationValue::Text {
+                value: "54.2".to_string(),
+            },
+            None,
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 3).unwrap(),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 4).unwrap(),
+            "http",
+            "senml-json",
+            Some(raw.id),
+        );
+
+        for store in [
+            &in_memory as &dyn ObservationStore,
+            &pg as &dyn ObservationStore,
+        ] {
+            assert_eq!(
+                store.store_observation(observation.clone()).unwrap(),
+                observation
+            );
+            assert_eq!(
+                store.store_observation(other_observation.clone()).unwrap(),
+                other_observation
+            );
+            assert_eq!(
+                store
+                    .get_observation(tenant.id, observation.id)
+                    .unwrap()
+                    .unwrap(),
+                observation
+            );
+            let by_feature = store
+                .query_observations(tenant.id, Some(feature.id), None, None, None, 10)
+                .unwrap();
+            assert_eq!(by_feature, vec![observation.clone()]);
+            assert_eq!(by_feature[0].raw_message_id, Some(raw.id));
+        }
+    }
+
+    #[test]
+    fn postgres_parity_events() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let source = build_entity(tenant.id, &format!("{suffix}-source"), "aion:Sensor");
+        let target = build_entity(tenant.id, &format!("{suffix}-target"), "aion:Pump");
+        let raw = RawMessage::new(
+            tenant.id,
+            aion_raw_message::RawMessageSource::Http,
+            Some("/ingest/http".to_string()),
+            Some("device-evt".to_string()),
+            Some("json_mapping".to_string()),
+            Some("application/json".to_string()),
+            Some(source.id),
+            Some(target.id),
+            Some("json_mapping".to_string()),
+            json!({"source": "events"}),
+            br#"{"state":"on"}"#.to_vec(),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
+        )
+        .expect("raw message");
+        let command_id = Uuid::new_v4();
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+        for store in [&in_memory as &dyn EntityStore, &pg as &dyn EntityStore] {
+            store.create_entity(source.clone()).expect("create source");
+            store.create_entity(target.clone()).expect("create target");
+        }
+        for store in [
+            &in_memory as &dyn RawMessageStore,
+            &pg as &dyn RawMessageStore,
+        ] {
+            store.store_raw_message(raw.clone()).expect("store raw");
+        }
+
+        seed_command_row(tenant.id, command_id, target.id, "StartPump");
+
+        let event = build_event(
+            tenant.id,
+            "aion:CommandCreated",
+            EventSeverity::Info,
+            Some(source.id),
+            Some(target.id),
+            Some("command created"),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 1).unwrap(),
+            Some(Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 1).unwrap()),
+            Some("corr-001"),
+            Some(raw.id),
+            Some(command_id),
+        );
+
+        for store in [&in_memory as &dyn EventStore, &pg as &dyn EventStore] {
+            assert_eq!(store.store_event(event.clone()).unwrap(), event);
+            assert_eq!(
+                store.get_event(tenant.id, event.id).unwrap().unwrap(),
+                event
+            );
+
+            let by_type = store
+                .query_events(
+                    tenant.id,
+                    EventFilter {
+                        event_type: Some("aion:CommandCreated".to_string()),
+                        severity: Some(EventSeverity::Info),
+                        command_id: Some(command_id),
+                        raw_message_id: Some(raw.id),
+                        correlation_id: Some("corr-001".to_string()),
+                        ..EventFilter::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(by_type, vec![event.clone()]);
         }
     }
 }

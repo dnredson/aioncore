@@ -105,6 +105,12 @@ The PostgreSQL adapter currently covers the control-plane subset needed for pari
 - `executor_capabilities`
 - `executor_scopes`
 
+The PostgreSQL adapter now also covers the telemetry-oriented core tables:
+
+- `raw_messages`
+- `observations`
+- `events`
+
 The migration set still covers the current in-memory domain models:
 
 - `tenants`
@@ -125,11 +131,8 @@ The migration set still covers the current in-memory domain models:
 - `command_leases`
 - `rules`
 
-The remaining persistence areas are planned for later milestones:
+Remaining adapter areas are planned for later milestones:
 
-- `observations`
-- `raw_messages`
-- `events`
 - `commands`
 - `actions`
 - `action_results`
@@ -193,3 +196,5 @@ cargo test -p aion-storage postgres_
 ```
 
 The tests apply the embedded migrations before exercising the adapter. The database must have access to the required PostgreSQL and TimescaleDB extensions.
+
+Telemetry parity coverage includes raw message filtering, canonical observation storage and lookup, and event storage/query behavior. `InMemoryStorage` remains the runtime default and the reference for local tests outside the PostgreSQL-specific suite.

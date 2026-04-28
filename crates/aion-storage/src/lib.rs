@@ -158,6 +158,13 @@ pub trait RawMessageStore {
         raw_message_id: Uuid,
     ) -> StorageResult<Option<RawMessage>>;
     fn list_raw_messages(&self, tenant_id: Uuid) -> StorageResult<Vec<RawMessage>>;
+    fn query_raw_messages(
+        &self,
+        tenant_id: Uuid,
+        producer_entity_id: Option<Uuid>,
+        feature_of_interest_id: Option<Uuid>,
+        payload_format: Option<&str>,
+    ) -> StorageResult<Vec<RawMessage>>;
     fn mark_raw_message_normalized(
         &self,
         tenant_id: Uuid,
@@ -597,6 +604,40 @@ impl RawMessageStore for InMemoryStorage {
             .raw_messages
             .values()
             .filter(|raw_message| raw_message.tenant_id == tenant_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        raw_messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
+        Ok(raw_messages)
+    }
+
+    fn query_raw_messages(
+        &self,
+        tenant_id: Uuid,
+        producer_entity_id: Option<Uuid>,
+        feature_of_interest_id: Option<Uuid>,
+        payload_format: Option<&str>,
+    ) -> StorageResult<Vec<RawMessage>> {
+        let mut raw_messages = self
+            .read_state()?
+            .raw_messages
+            .values()
+            .filter(|raw_message| raw_message.tenant_id == tenant_id)
+            .filter(|raw_message| {
+                producer_entity_id
+                    .map(|id| raw_message.producer_entity_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|raw_message| {
+                feature_of_interest_id
+                    .map(|id| raw_message.feature_of_interest_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|raw_message| {
+                payload_format
+                    .map(|format| raw_message.payload_format.as_deref() == Some(format))
+                    .unwrap_or(true)
+            })
             .cloned()
             .collect::<Vec<_>>();
 
@@ -1562,6 +1603,9 @@ mod tests {
             Some("sensor-01".to_string()),
             Some("senml-json".to_string()),
             Some("application/senml+json".to_string()),
+            None,
+            None,
+            Some("senml-json".to_string()),
             json!({"payload_format": "senml-json"}),
             br#"[{"n":"temperature","v":21.4}]"#.to_vec(),
             received_at,
@@ -1574,6 +1618,9 @@ mod tests {
             Some("sensor-02".to_string()),
             Some("senml-json".to_string()),
             Some("application/senml+json".to_string()),
+            None,
+            None,
+            Some("senml-json".to_string()),
             json!({"payload_format": "senml-json"}),
             br#"[{"n":"temperature","v":22.4}]"#.to_vec(),
             received_at,

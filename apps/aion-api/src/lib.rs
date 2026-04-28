@@ -2580,6 +2580,9 @@ async fn ingest_http(
         Some(request.producer_entity_id.to_string()),
         Some(request.payload_format.clone()),
         request.content_type.clone(),
+        Some(request.producer_entity_id),
+        Some(request.feature_of_interest_id),
+        Some(request.payload_format.clone()),
         json!({
             "protocol": request.protocol,
             "payload_format": request.payload_format,
