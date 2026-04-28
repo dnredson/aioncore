@@ -14,8 +14,17 @@ pub struct MqttIngestConfig {
     pub client_id: String,
     pub topic_filter: String,
     pub payload_format: Option<String>,
+    pub content_type: Option<String>,
     pub username: Option<String>,
     password: Option<String>,
+    pub connector: Option<MqttConnectorMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MqttConnectorMetadata {
+    pub connector_id: Uuid,
+    pub connector_key: String,
+    pub connector_profile: ConnectorProfile,
 }
 
 impl fmt::Debug for MqttIngestConfig {
@@ -26,8 +35,10 @@ impl fmt::Debug for MqttIngestConfig {
             .field("client_id", &self.client_id)
             .field("topic_filter", &self.topic_filter)
             .field("payload_format", &self.payload_format)
+            .field("content_type", &self.content_type)
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("connector", &self.connector)
             .finish()
     }
 }
@@ -108,9 +119,32 @@ impl MqttIngestConfig {
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_MQTT_TOPIC_FILTER.to_string()),
             payload_format: optional_nonempty(values.payload_format),
+            content_type: None,
             username: optional_nonempty(values.username),
             password: optional_nonempty(values.password),
+            connector: None,
         })
+    }
+
+    pub fn for_connector(
+        broker_url: String,
+        client_id: String,
+        topic_filter: String,
+        payload_format: Option<String>,
+        content_type: Option<String>,
+        connector: MqttConnectorMetadata,
+    ) -> Self {
+        Self {
+            enabled: true,
+            broker_url,
+            client_id,
+            topic_filter,
+            payload_format,
+            content_type,
+            username: None,
+            password: None,
+            connector: Some(connector),
+        }
     }
 }
 
@@ -153,14 +187,36 @@ pub async fn start_if_enabled(state: AppState) -> Result<(), StartupError> {
 }
 
 pub async fn start(state: AppState, config: MqttIngestConfig) -> Result<(), StartupError> {
-    update_worker_state(&state, |worker| {
-        worker.enabled = config.enabled;
-        worker.connected = false;
-        worker.subscribed = false;
-        worker.broker_url = Some(config.broker_url.clone());
-        worker.topic_filter = Some(config.topic_filter.clone());
-        worker.last_error = None;
-    });
+    start_runtime(state, config, false).await
+}
+
+pub async fn start_connector_worker(
+    state: AppState,
+    config: MqttIngestConfig,
+) -> Result<(), StartupError> {
+    if let Some(connector) = config.connector.as_ref() {
+        mark_connector_worker_starting(&state, connector.connector_id);
+    }
+    start_runtime(state, config, true).await
+}
+
+async fn start_runtime(
+    state: AppState,
+    config: MqttIngestConfig,
+    connector_worker: bool,
+) -> Result<(), StartupError> {
+    update_worker_state(
+        &state,
+        |worker| {
+            worker.enabled = config.enabled;
+            worker.connected = false;
+            worker.subscribed = false;
+            worker.broker_url = Some(config.broker_url.clone());
+            worker.topic_filter = Some(config.topic_filter.clone());
+            worker.last_error = None;
+        },
+        connector_worker,
+    );
 
     if !config.enabled {
         return Ok(());
@@ -190,30 +246,43 @@ pub async fn start(state: AppState, config: MqttIngestConfig) -> Result<(), Star
             "aion:MqttWorkerStarted",
             EventSeverity::Info,
             Some("MQTT worker started".to_string()),
-            json!({
-                "broker_url": config.broker_url,
-                "topic_filter": config.topic_filter,
-                "payload_format": config.payload_format.as_deref().unwrap_or("canonical-json"),
-                "credentials_configured": config.username.is_some()
-            }),
+            metadata_with_connector(
+                json!({
+                    "broker_url": config.broker_url,
+                    "topic_filter": config.topic_filter,
+                    "payload_format": config.payload_format.as_deref().unwrap_or("canonical-json"),
+                    "credentials_configured": config.username.is_some()
+                }),
+                config.connector.as_ref(),
+            ),
         );
         loop {
             match eventloop.poll().await {
                 Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => {
-                    update_worker_state(&state, |worker| {
-                        worker.connected = true;
-                        worker.last_error = None;
-                    });
+                    update_worker_state(
+                        &state,
+                        |worker| {
+                            worker.connected = true;
+                            worker.last_error = None;
+                        },
+                        connector_worker,
+                    );
                     let _ = record_mqtt_worker_event(
                         &state,
                         "aion:MqttWorkerConnected",
                         EventSeverity::Info,
                         Some("MQTT worker connected".to_string()),
-                        json!({
-                            "broker_url": config.broker_url,
-                            "topic_filter": config.topic_filter
-                        }),
+                        metadata_with_connector(
+                            json!({
+                                "broker_url": config.broker_url,
+                                "topic_filter": config.topic_filter
+                            }),
+                            config.connector.as_ref(),
+                        ),
                     );
+                    if let Some(connector) = config.connector.as_ref() {
+                        mark_connector_worker_connected(&state, connector.connector_id);
+                    }
                     match _client
                         .subscribe(config.topic_filter.clone(), QoS::AtLeastOnce)
                         .await
@@ -222,27 +291,44 @@ pub async fn start(state: AppState, config: MqttIngestConfig) -> Result<(), Star
                         Err(err) => {
                             let message =
                                 format!("failed to subscribe to MQTT topic filter: {err}");
-                            mark_worker_failure(&state, message.clone());
+                            mark_worker_failure(&state, message.clone(), connector_worker);
+                            if let Some(connector) = config.connector.as_ref() {
+                                mark_connector_worker_failure(
+                                    &state,
+                                    connector.connector_id,
+                                    message.clone(),
+                                );
+                            }
                             let _ = record_mqtt_worker_event(
                                 &state,
                                 "aion:MqttWorkerConnectionFailed",
                                 EventSeverity::Error,
                                 Some(message.clone()),
-                                json!({
-                                    "broker_url": config.broker_url,
-                                    "topic_filter": config.topic_filter,
-                                    "reason": "subscribe_failed",
-                                    "error": message
-                                }),
+                                metadata_with_connector(
+                                    json!({
+                                        "broker_url": config.broker_url,
+                                        "topic_filter": config.topic_filter,
+                                        "reason": "subscribe_failed",
+                                        "error": message
+                                    }),
+                                    config.connector.as_ref(),
+                                ),
                             );
                         }
                     }
                 }
                 Ok(MqttEvent::Incoming(Incoming::SubAck(_))) => {
-                    update_worker_state(&state, |worker| {
-                        worker.subscribed = true;
-                        worker.last_error = None;
-                    });
+                    update_worker_state(
+                        &state,
+                        |worker| {
+                            worker.subscribed = true;
+                            worker.last_error = None;
+                        },
+                        connector_worker,
+                    );
+                    if let Some(connector) = config.connector.as_ref() {
+                        mark_connector_worker_subscribed(&state, connector.connector_id);
+                    }
                     eprintln!(
                         "mqtt startup subscribed broker_url={} topic_filter={}",
                         config.broker_url, config.topic_filter
@@ -252,19 +338,29 @@ pub async fn start(state: AppState, config: MqttIngestConfig) -> Result<(), Star
                         "aion:MqttWorkerSubscribed",
                         EventSeverity::Info,
                         Some("MQTT worker subscribed".to_string()),
-                        json!({
-                            "broker_url": config.broker_url,
-                            "topic_filter": config.topic_filter
-                        }),
+                        metadata_with_connector(
+                            json!({
+                                "broker_url": config.broker_url,
+                                "topic_filter": config.topic_filter
+                            }),
+                            config.connector.as_ref(),
+                        ),
                     );
                 }
                 Ok(MqttEvent::Incoming(Incoming::Publish(publish))) => {
-                    update_worker_state(&state, |worker| {
-                        worker.last_message_at = Some(Utc::now());
-                    });
+                    update_worker_state(
+                        &state,
+                        |worker| {
+                            worker.last_message_at = Some(Utc::now());
+                        },
+                        connector_worker,
+                    );
+                    if let Some(connector) = config.connector.as_ref() {
+                        mark_connector_worker_message(&state, connector.connector_id);
+                    }
                     if let Err(err) = handle_publish(&state, &config, publish).await {
                         eprintln!("mqtt ingest failed: {err:?}");
-                        mark_worker_ingest_failed(&state, err.message);
+                        mark_worker_ingest_failed(&state, err.message, connector_worker);
                     }
                 }
                 Ok(_) => {}
@@ -274,18 +370,28 @@ pub async fn start(state: AppState, config: MqttIngestConfig) -> Result<(), Star
                         config.broker_url
                     );
                     eprintln!("mqtt event loop stopped: {message}");
-                    mark_worker_failure(&state, message.clone());
+                    mark_worker_failure(&state, message.clone(), connector_worker);
+                    if let Some(connector) = config.connector.as_ref() {
+                        mark_connector_worker_failure(
+                            &state,
+                            connector.connector_id,
+                            message.clone(),
+                        );
+                    }
                     let _ = record_mqtt_worker_event(
                         &state,
                         "aion:MqttWorkerConnectionFailed",
                         EventSeverity::Error,
                         Some(message.clone()),
-                        json!({
-                            "broker_url": config.broker_url,
-                            "topic_filter": config.topic_filter,
-                            "reason": "event_loop_error",
-                            "error": message
-                        }),
+                        metadata_with_connector(
+                            json!({
+                                "broker_url": config.broker_url,
+                                "topic_filter": config.topic_filter,
+                                "reason": "event_loop_error",
+                                "error": message
+                            }),
+                            config.connector.as_ref(),
+                        ),
                     );
                     break;
                 }
@@ -395,35 +501,42 @@ async fn handle_publish(
         topic,
         payload.len()
     );
-    let context =
-        match mqtt_publish_to_context(&topic, &payload, config.payload_format.as_deref(), None) {
-            Ok(context) => context,
-            Err(err) => {
-                let raw_message = store_mqtt_raw_message(
-                    state,
-                    &topic,
-                    None,
-                    None,
-                    &payload,
-                    config.payload_format.as_deref(),
-                    &err,
-                )?;
-                record_mqtt_failure(
-                    state,
-                    &topic,
-                    None,
-                    None,
-                    raw_message.id,
-                    "unsupported MQTT payload format",
-                    json!({
-                        "topic": topic,
-                        "reason": "unsupported_payload_format",
-                        "error": err
-                    }),
-                )?;
-                return Ok(());
-            }
-        };
+    let context = match mqtt_publish_to_context(
+        &topic,
+        &payload,
+        config.payload_format.as_deref(),
+        config.content_type.as_deref(),
+    ) {
+        Ok(context) => context,
+        Err(err) => {
+            let raw_message = store_mqtt_raw_message(
+                state,
+                &topic,
+                None,
+                None,
+                &payload,
+                config.payload_format.as_deref(),
+                config.content_type.as_deref(),
+                config.connector.as_ref(),
+                &err,
+            )?;
+            record_mqtt_failure(
+                state,
+                &topic,
+                None,
+                None,
+                raw_message.id,
+                "unsupported MQTT payload format",
+                config.connector.as_ref(),
+                json!({
+                    "topic": topic,
+                    "reason": "unsupported_payload_format",
+                    "error": err
+                }),
+            )?;
+            return Ok(());
+        }
+    };
 
     let topic_parts = parse_mqtt_topic(&topic).ok();
     let producer_entity_id = context.producer_entity_id;
@@ -435,6 +548,8 @@ async fn handle_publish(
         feature_of_interest_id,
         &context.payload,
         Some(&context.payload_format),
+        context.content_type.as_deref(),
+        config.connector.as_ref(),
         "received",
     )?;
 
@@ -446,11 +561,14 @@ async fn handle_publish(
         feature_of_interest_id,
         Some(raw_message.id),
         Some("MQTT message received".to_string()),
-        json!({
-            "topic": topic,
-            "payload_format": context.payload_format,
-            "ingest_source": "mqtt"
-        }),
+        metadata_with_connector(
+            json!({
+                "topic": topic,
+                "payload_format": context.payload_format,
+                "ingest_source": "mqtt"
+            }),
+            config.connector.as_ref(),
+        ),
     )?;
 
     let Some(topic_parts) = topic_parts else {
@@ -461,6 +579,7 @@ async fn handle_publish(
             feature_of_interest_id,
             raw_message.id,
             "invalid MQTT topic",
+            config.connector.as_ref(),
             json!({
                 "topic": topic,
                 "reason": "invalid_topic"
@@ -477,6 +596,7 @@ async fn handle_publish(
             Some(topic_parts.feature_of_interest_id),
             raw_message.id,
             "MQTT message rejected because producer entity does not exist",
+            config.connector.as_ref(),
             json!({
                 "topic": topic,
                 "reason": "producer_entity_not_found",
@@ -495,6 +615,7 @@ async fn handle_publish(
             Some(topic_parts.feature_of_interest_id),
             raw_message.id,
             "MQTT message rejected because feature entity does not exist",
+            config.connector.as_ref(),
             json!({
                 "topic": topic,
                 "reason": "feature_entity_not_found",
@@ -521,6 +642,7 @@ async fn handle_publish(
                 feature_of_interest_id,
                 raw_message.id,
                 "UltraLight MQTT payloads require a stored producer PayloadProfile attribute_mapping",
+                config.connector.as_ref(),
                 json!({
                     "topic": topic,
                     "reason": "missing_mapping",
@@ -563,6 +685,7 @@ async fn handle_publish(
                 feature_of_interest_id,
                 raw_message.id,
                 err.to_string(),
+                config.connector.as_ref(),
                 json!({
                     "topic": topic,
                     "reason": "decoder_error",
@@ -588,10 +711,13 @@ async fn handle_publish(
             "mqtt".to_string(),
             context.payload_format.clone(),
             Some(raw_message.id),
-            json!({
-                "topic": topic,
-                "ingest_source": "mqtt"
-            }),
+            metadata_with_connector(
+                json!({
+                    "topic": topic,
+                    "ingest_source": "mqtt"
+                }),
+                config.connector.as_ref(),
+            ),
             measurement.metadata,
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -611,14 +737,20 @@ async fn handle_publish(
         feature_of_interest_id,
         Some(raw_message.id),
         Some("Payload ingested and normalized".to_string()),
-        json!({
-            "topic": topic,
-            "payload_format": context.payload_format,
-            "observation_count": observations.len(),
-            "ingest_source": "mqtt"
-        }),
+        metadata_with_connector(
+            json!({
+                "topic": topic,
+                "payload_format": context.payload_format,
+                "observation_count": observations.len(),
+                "ingest_source": "mqtt"
+            }),
+            config.connector.as_ref(),
+        ),
     )?;
-    mark_worker_ingest_success(state);
+    mark_worker_ingest_success(state, config.connector.is_some());
+    if let Some(connector) = config.connector.as_ref() {
+        mark_connector_worker_ingest_success(state, connector.connector_id);
+    }
 
     Ok(())
 }
@@ -729,21 +861,17 @@ fn store_mqtt_raw_message(
     feature_of_interest_id: Option<Uuid>,
     payload: &[u8],
     configured_payload_format: Option<&str>,
+    configured_content_type: Option<&str>,
+    connector: Option<&MqttConnectorMetadata>,
     ingest_reason: &str,
 ) -> Result<RawMessage, ApiError> {
     let payload_format = configured_payload_format
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "canonical-json".to_string());
-    let raw_message = RawMessage::new(
-        state.tenant_id,
-        RawMessageSource::Mqtt,
-        Some(topic.to_string()),
-        producer_entity_id.map(|id| id.to_string()),
-        Some(payload_format.clone()),
-        default_content_type_for_payload_format(&payload_format).map(ToOwned::to_owned),
-        producer_entity_id,
-        feature_of_interest_id,
-        Some(payload_format.clone()),
+    let content_type = configured_content_type.map(ToOwned::to_owned).or_else(|| {
+        default_content_type_for_payload_format(&payload_format).map(ToOwned::to_owned)
+    });
+    let headers = metadata_with_connector(
         json!({
             "topic": topic,
             "protocol": "mqtt",
@@ -752,7 +880,22 @@ fn store_mqtt_raw_message(
             "ingest_source": "mqtt",
             "reason": ingest_reason,
             "payload_format": payload_format,
+            "source_endpoint": connector.map(|connector| connector.connector_key.clone()).unwrap_or_else(|| "mqtt".to_string()),
+            "topic_or_path": topic,
         }),
+        connector,
+    );
+    let raw_message = RawMessage::new(
+        state.tenant_id,
+        RawMessageSource::Mqtt,
+        Some(topic.to_string()),
+        producer_entity_id.map(|id| id.to_string()),
+        Some(payload_format.clone()),
+        content_type,
+        producer_entity_id,
+        feature_of_interest_id,
+        Some(payload_format.clone()),
+        headers,
         payload.to_vec(),
         Utc::now(),
     )
@@ -767,13 +910,17 @@ fn record_mqtt_failure(
     feature_of_interest_id: Option<Uuid>,
     raw_message_id: Uuid,
     message: impl Into<String>,
+    connector: Option<&MqttConnectorMetadata>,
     metadata: Value,
 ) -> Result<(), ApiError> {
     let message = message.into();
     state
         .storage
         .mark_raw_message_failed(state.tenant_id, raw_message_id, &message)?;
-    mark_worker_ingest_failed(state, message.clone());
+    mark_worker_ingest_failed(state, message.clone(), connector.is_some());
+    if let Some(connector) = connector {
+        mark_connector_worker_ingest_failed(state, connector.connector_id, message.clone());
+    }
     record_ingest_event_optional(
         state,
         "aion:PayloadIngestionFailed",
@@ -782,12 +929,15 @@ fn record_mqtt_failure(
         feature_of_interest_id,
         Some(raw_message_id),
         Some(message.to_string()),
-        json!({
-            "topic": topic,
-            "message": message,
-            "ingest_source": "mqtt",
-            "details": metadata
-        }),
+        metadata_with_connector(
+            json!({
+                "topic": topic,
+                "message": message,
+                "ingest_source": "mqtt",
+                "details": metadata
+            }),
+            connector,
+        ),
     )?;
     Ok(())
 }
@@ -799,13 +949,17 @@ fn record_mqtt_rejection(
     feature_of_interest_id: Option<Uuid>,
     raw_message_id: Uuid,
     message: impl Into<String>,
+    connector: Option<&MqttConnectorMetadata>,
     metadata: Value,
 ) -> Result<(), ApiError> {
     let message = message.into();
     state
         .storage
         .mark_raw_message_failed(state.tenant_id, raw_message_id, &message)?;
-    mark_worker_ingest_failed(state, message.clone());
+    mark_worker_ingest_failed(state, message.clone(), connector.is_some());
+    if let Some(connector) = connector {
+        mark_connector_worker_ingest_failed(state, connector.connector_id, message.clone());
+    }
     record_ingest_event_optional(
         state,
         "aion:MqttMessageRejected",
@@ -814,12 +968,15 @@ fn record_mqtt_rejection(
         feature_of_interest_id,
         Some(raw_message_id),
         Some(message.to_string()),
-        json!({
-            "topic": topic,
-            "message": message,
-            "ingest_source": "mqtt",
-            "details": metadata
-        }),
+        metadata_with_connector(
+            json!({
+                "topic": topic,
+                "message": message,
+                "ingest_source": "mqtt",
+                "details": metadata
+            }),
+            connector,
+        ),
     )?;
     Ok(())
 }
@@ -831,32 +988,51 @@ fn entity_exists(state: &AppState, entity_id: Uuid) -> Result<bool, ApiError> {
         .is_some())
 }
 
-fn update_worker_state(state: &AppState, update: impl FnOnce(&mut MqttWorkerState)) {
+fn update_worker_state(
+    state: &AppState,
+    update: impl FnOnce(&mut MqttWorkerState),
+    connector_worker: bool,
+) {
+    if connector_worker {
+        return;
+    }
     if let Ok(mut worker) = state.mqtt_state.write() {
         update(&mut worker);
     }
 }
 
-fn mark_worker_failure(state: &AppState, message: String) {
-    update_worker_state(state, |worker| {
-        worker.connected = false;
-        worker.subscribed = false;
-        worker.last_error = Some(message);
-    });
+fn mark_worker_failure(state: &AppState, message: String, connector_worker: bool) {
+    update_worker_state(
+        state,
+        |worker| {
+            worker.connected = false;
+            worker.subscribed = false;
+            worker.last_error = Some(message);
+        },
+        connector_worker,
+    );
 }
 
-fn mark_worker_ingest_success(state: &AppState) {
-    update_worker_state(state, |worker| {
-        worker.last_successful_ingest_at = Some(Utc::now());
-        worker.last_error = None;
-    });
+fn mark_worker_ingest_success(state: &AppState, connector_worker: bool) {
+    update_worker_state(
+        state,
+        |worker| {
+            worker.last_successful_ingest_at = Some(Utc::now());
+            worker.last_error = None;
+        },
+        connector_worker,
+    );
 }
 
-fn mark_worker_ingest_failed(state: &AppState, message: String) {
-    update_worker_state(state, |worker| {
-        worker.last_failed_ingest_at = Some(Utc::now());
-        worker.last_error = Some(message);
-    });
+fn mark_worker_ingest_failed(state: &AppState, message: String, connector_worker: bool) {
+    update_worker_state(
+        state,
+        |worker| {
+            worker.last_failed_ingest_at = Some(Utc::now());
+            worker.last_error = Some(message);
+        },
+        connector_worker,
+    );
 }
 
 fn record_mqtt_worker_event(
@@ -869,6 +1045,30 @@ fn record_mqtt_worker_event(
     record_ingest_event_optional(
         state, event_type, severity, None, None, None, message, metadata,
     )
+}
+
+fn metadata_with_connector(
+    mut metadata: Value,
+    connector: Option<&MqttConnectorMetadata>,
+) -> Value {
+    let Some(connector) = connector else {
+        return metadata;
+    };
+    if let Some(object) = metadata.as_object_mut() {
+        let connector_metadata = json!({
+            "connector_id": connector.connector_id,
+            "connector_key": connector.connector_key,
+            "connector_profile": connector.connector_profile
+        });
+        object.insert("connector".to_string(), connector_metadata);
+        object.insert("connector_id".to_string(), json!(connector.connector_id));
+        object.insert("connector_key".to_string(), json!(connector.connector_key));
+        object.insert(
+            "connector_profile".to_string(),
+            json!(connector.connector_profile),
+        );
+    }
+    metadata
 }
 
 #[allow(dead_code)]
@@ -899,8 +1099,10 @@ mod tests {
         assert_eq!(config.client_id, DEFAULT_MQTT_CLIENT_ID);
         assert_eq!(config.topic_filter, DEFAULT_MQTT_TOPIC_FILTER);
         assert_eq!(config.payload_format, None);
+        assert_eq!(config.content_type, None);
         assert_eq!(config.username, None);
         assert_eq!(config.password, None);
+        assert_eq!(config.connector, None);
     }
 
     #[test]
@@ -1082,8 +1284,10 @@ mod tests {
             client_id: DEFAULT_MQTT_CLIENT_ID.to_string(),
             topic_filter: DEFAULT_MQTT_TOPIC_FILTER.to_string(),
             payload_format: Some(payload_format.to_string()),
+            content_type: None,
             username: None,
             password: None,
+            connector: None,
         }
     }
 

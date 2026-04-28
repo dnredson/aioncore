@@ -29,6 +29,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     env,
     str::FromStr,
     sync::{Arc, RwLock},
@@ -139,6 +140,8 @@ pub struct AppState {
     storage_backend: StorageBackendName,
     tenant_id: Uuid,
     mqtt_state: Arc<RwLock<mqtt_ingest::MqttWorkerState>>,
+    connector_workers_enabled: Arc<RwLock<bool>>,
+    connector_worker_statuses: Arc<RwLock<HashMap<Uuid, ConnectorWorkerRuntimeStatus>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +174,8 @@ impl AppState {
             storage_backend,
             tenant_id,
             mqtt_state: Arc::new(RwLock::new(mqtt_ingest::MqttWorkerState::default())),
+            connector_workers_enabled: Arc::new(RwLock::new(false)),
+            connector_worker_statuses: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -242,6 +247,7 @@ struct ReadyResponse {
     storage: &'static str,
     mqtt: mqtt_ingest::MqttReadiness,
     worker_plan: ReadyWorkerPlanSummary,
+    connector_workers: ConnectorWorkersReadiness,
     migrations_ready: Option<bool>,
     details: Option<String>,
 }
@@ -359,7 +365,7 @@ pub struct IngestionConnectorStatusResponse {
     pub last_failed_ingest_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IngestionWorkerKind {
     HttpListener,
@@ -367,7 +373,7 @@ pub enum IngestionWorkerKind {
     Unsupported,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IngestionWorkerSpecStatus {
     Planned,
@@ -376,7 +382,7 @@ pub enum IngestionWorkerSpecStatus {
     Unsupported,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct IngestionWorkerValidationIssue {
     pub code: String,
     pub message: String,
@@ -408,6 +414,70 @@ pub struct IngestionWorkerPlan {
     pub skipped_workers: usize,
     pub invalid_workers: usize,
     pub unsupported_workers: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorWorkerConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectorWorkerEnvValues {
+    pub enabled: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorWorkerRuntimeState {
+    Planned,
+    Starting,
+    Running,
+    Degraded,
+    Skipped,
+    Invalid,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorWorkerRuntimeStatus {
+    pub connector_id: Uuid,
+    pub connector_key: String,
+    pub connector_type: IngestionConnectorType,
+    pub connector_profile: ConnectorProfile,
+    pub enabled: bool,
+    pub worker_kind: IngestionWorkerKind,
+    pub status: ConnectorWorkerRuntimeState,
+    pub connected: bool,
+    pub subscribed: bool,
+    pub broker_url: Option<String>,
+    pub client_id: Option<String>,
+    pub topic_filter: Option<String>,
+    pub http_path: Option<String>,
+    pub payload_format: Option<String>,
+    pub content_type: Option<String>,
+    pub last_error: Option<String>,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub last_successful_ingest_at: Option<DateTime<Utc>>,
+    pub last_failed_ingest_at: Option<DateTime<Utc>>,
+    pub validation_issues: Vec<IngestionWorkerValidationIssue>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorWorkersReadiness {
+    pub enabled: bool,
+    pub total: usize,
+    pub running: usize,
+    pub degraded: usize,
+    pub skipped: usize,
+    pub invalid: usize,
+    pub errors: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestionWorkersStatusResponse {
+    pub connector_workers: ConnectorWorkersReadiness,
+    pub workers: Vec<ConnectorWorkerRuntimeStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -739,8 +809,31 @@ pub fn app_from_env_with_diagnostics() -> Result<(Router, StartupDiagnostics), S
     Ok((app_with_state(state), diagnostics))
 }
 
+impl ConnectorWorkerConfig {
+    pub fn from_env() -> Result<Self, StartupError> {
+        Self::from_env_values(ConnectorWorkerEnvValues {
+            enabled: env::var("AIONCORE_CONNECTOR_WORKERS_ENABLED").ok(),
+        })
+    }
+
+    pub fn from_env_values(values: ConnectorWorkerEnvValues) -> Result<Self, StartupError> {
+        Ok(Self {
+            enabled: parse_bool_env_value(
+                values.enabled.as_deref(),
+                false,
+                "AIONCORE_CONNECTOR_WORKERS_ENABLED",
+            )?,
+        })
+    }
+}
+
 pub async fn start_mqtt_ingest_if_enabled(state: AppState) -> Result<(), StartupError> {
     mqtt_ingest::start_if_enabled(state).await
+}
+
+pub async fn start_connector_workers_if_enabled(state: AppState) -> Result<(), StartupError> {
+    let config = ConnectorWorkerConfig::from_env()?;
+    start_connector_workers(state, config).await
 }
 
 pub fn app_with_state(state: AppState) -> Router {
@@ -857,6 +950,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(ingest_http_for_connector),
         )
         .route("/ingestion/workers/plan", get(get_ingestion_worker_plan))
+        .route(
+            "/ingestion/workers/status",
+            get(get_ingestion_workers_status),
+        )
         .route("/ingest/http", post(ingest_http))
         .route("/raw-messages", get(query_raw_messages))
         .route("/raw-messages/:raw_message_id", get(get_raw_message))
@@ -880,6 +977,7 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse
     let storage_ready = storage_readiness.is_ok();
     let mqtt = mqtt_ingest::readiness(&state);
     let worker_plan = worker_plan_summary(&state);
+    let connector_workers = connector_workers_readiness(&state);
     let ready = storage_ready && mqtt.ready;
 
     let details = match (
@@ -909,6 +1007,7 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse
             storage: state.storage_backend.as_str(),
             mqtt,
             worker_plan,
+            connector_workers,
             migrations_ready: match (state.storage_backend, storage_ready) {
                 (StorageBackendName::Memory, _) => None,
                 (StorageBackendName::Postgres, true) => Some(true),
@@ -3017,13 +3116,19 @@ async fn get_ingestion_connector_status(
     Path(connector_id): Path<Uuid>,
 ) -> Result<Json<IngestionConnectorStatusResponse>, ApiError> {
     let connector = get_connector(&state, connector_id)?;
-    Ok(Json(connector_status(&connector)))
+    Ok(Json(connector_status(&state, &connector)))
 }
 
 async fn get_ingestion_worker_plan(
     State(state): State<AppState>,
 ) -> Result<Json<IngestionWorkerPlan>, ApiError> {
     Ok(Json(build_ingestion_worker_plan(&state)?))
+}
+
+async fn get_ingestion_workers_status(
+    State(state): State<AppState>,
+) -> Result<Json<IngestionWorkersStatusResponse>, ApiError> {
+    Ok(Json(connector_workers_status(&state)?))
 }
 
 async fn ingest_http_for_connector(
@@ -3407,18 +3512,41 @@ fn get_connector(state: &AppState, connector_id: Uuid) -> Result<IngestionConnec
         .ok_or_else(ApiError::not_found)
 }
 
-fn connector_status(connector: &IngestionConnector) -> IngestionConnectorStatusResponse {
+fn connector_status(
+    state: &AppState,
+    connector: &IngestionConnector,
+) -> IngestionConnectorStatusResponse {
+    if let Some(worker) = state
+        .connector_worker_statuses
+        .read()
+        .ok()
+        .and_then(|statuses| statuses.get(&connector.id).cloned())
+    {
+        return IngestionConnectorStatusResponse {
+            connector_id: connector.id,
+            connector_key: connector.connector_key.clone(),
+            connector_type: connector.connector_type.clone(),
+            connector_profile: connector.connector_profile.clone(),
+            enabled: connector.enabled,
+            status: connector_runtime_state_label(&worker.status),
+            last_error: worker.last_error,
+            last_message_at: worker.last_message_at,
+            last_successful_ingest_at: worker.last_successful_ingest_at,
+            last_failed_ingest_at: worker.last_failed_ingest_at,
+        };
+    }
+
     let (status, last_error) = if !connector.enabled {
         ("disabled", None)
     } else {
         match connector.connector_type {
             IngestionConnectorType::Http => ("ready", None),
             IngestionConnectorType::Mqtt => (
-                "degraded",
-                Some("dynamic MQTT workers per connector are not implemented yet".to_string()),
+                "planned",
+                Some("dynamic connector workers are disabled unless AIONCORE_CONNECTOR_WORKERS_ENABLED=true".to_string()),
             ),
             IngestionConnectorType::Future => (
-                "degraded",
+                "unsupported",
                 Some("future connector runtime is not implemented yet".to_string()),
             ),
         }
@@ -3438,6 +3566,18 @@ fn connector_status(connector: &IngestionConnector) -> IngestionConnectorStatusR
     }
 }
 
+fn connector_runtime_state_label(status: &ConnectorWorkerRuntimeState) -> &'static str {
+    match status {
+        ConnectorWorkerRuntimeState::Planned => "planned",
+        ConnectorWorkerRuntimeState::Starting => "starting",
+        ConnectorWorkerRuntimeState::Running => "ready",
+        ConnectorWorkerRuntimeState::Degraded => "degraded",
+        ConnectorWorkerRuntimeState::Skipped => "skipped",
+        ConnectorWorkerRuntimeState::Invalid => "error",
+        ConnectorWorkerRuntimeState::Unsupported => "unsupported",
+    }
+}
+
 fn worker_plan_summary(state: &AppState) -> ReadyWorkerPlanSummary {
     build_ingestion_worker_plan(state)
         .map(|plan| ReadyWorkerPlanSummary {
@@ -3450,6 +3590,44 @@ fn worker_plan_summary(state: &AppState) -> ReadyWorkerPlanSummary {
             invalid_workers: 0,
             unsupported_workers: 0,
         })
+}
+
+async fn start_connector_workers(
+    state: AppState,
+    config: ConnectorWorkerConfig,
+) -> Result<(), StartupError> {
+    set_connector_workers_enabled(&state, config.enabled);
+    let plan = build_ingestion_worker_plan(&state)
+        .map_err(|err| StartupError::backend_initialization(err.message))?;
+    apply_connector_worker_plan(&state, &plan, config.enabled)?;
+
+    if !config.enabled {
+        return Ok(());
+    }
+
+    for spec in plan.specs {
+        if connector_worker_start_decision(&spec) != ConnectorWorkerStartDecision::StartMqtt {
+            continue;
+        }
+
+        let mqtt_config = mqtt_ingest::MqttIngestConfig::for_connector(
+            spec.broker_url.clone().unwrap_or_default(),
+            spec.client_id
+                .clone()
+                .unwrap_or_else(|| format!("aioncore-connector-{}", spec.connector_id)),
+            spec.topic_filter.clone().unwrap_or_default(),
+            spec.payload_format.clone(),
+            spec.content_type.clone(),
+            mqtt_ingest::MqttConnectorMetadata {
+                connector_id: spec.connector_id,
+                connector_key: spec.connector_key.clone(),
+                connector_profile: spec.connector_profile.clone(),
+            },
+        );
+        mqtt_ingest::start_connector_worker(state.clone(), mqtt_config).await?;
+    }
+
+    Ok(())
 }
 
 fn build_ingestion_worker_plan(state: &AppState) -> Result<IngestionWorkerPlan, ApiError> {
@@ -3483,6 +3661,216 @@ fn build_ingestion_worker_plan(state: &AppState) -> Result<IngestionWorkerPlan, 
         invalid_workers,
         unsupported_workers,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectorWorkerStartDecision {
+    StartMqtt,
+    Skip,
+    Invalid,
+    Unsupported,
+    PlannedOnly,
+}
+
+fn connector_worker_start_decision(spec: &IngestionWorkerSpec) -> ConnectorWorkerStartDecision {
+    match spec.status {
+        IngestionWorkerSpecStatus::Skipped => ConnectorWorkerStartDecision::Skip,
+        IngestionWorkerSpecStatus::Invalid => ConnectorWorkerStartDecision::Invalid,
+        IngestionWorkerSpecStatus::Unsupported => ConnectorWorkerStartDecision::Unsupported,
+        IngestionWorkerSpecStatus::Planned => match (&spec.worker_kind, &spec.connector_profile) {
+            (IngestionWorkerKind::MqttSubscriber, ConnectorProfile::GenericAionMqtt)
+            | (IngestionWorkerKind::MqttSubscriber, ConnectorProfile::GenericMqtt) => {
+                ConnectorWorkerStartDecision::StartMqtt
+            }
+            (IngestionWorkerKind::MqttSubscriber, ConnectorProfile::TtnV3) => {
+                ConnectorWorkerStartDecision::Skip
+            }
+            (IngestionWorkerKind::Unsupported, _) => ConnectorWorkerStartDecision::Unsupported,
+            _ => ConnectorWorkerStartDecision::PlannedOnly,
+        },
+    }
+}
+
+fn apply_connector_worker_plan(
+    state: &AppState,
+    plan: &IngestionWorkerPlan,
+    emit_runtime_events: bool,
+) -> Result<(), StartupError> {
+    for spec in &plan.specs {
+        let status = connector_runtime_status_from_spec(spec);
+        set_connector_worker_runtime_status(state, status);
+
+        if emit_runtime_events
+            && connector_worker_start_decision(spec) == ConnectorWorkerStartDecision::Skip
+            && spec.enabled
+            && spec.connector_profile == ConnectorProfile::TtnV3
+        {
+            record_connector_worker_event(
+                state,
+                "aion:IngestionConnectorWorkerSkipped",
+                EventSeverity::Warning,
+                Some(
+                    "TTN v3 connector worker skipped because TTN decoding is future work"
+                        .to_string(),
+                ),
+                json!({
+                    "connector_id": spec.connector_id,
+                    "connector_key": spec.connector_key,
+                    "connector_profile": spec.connector_profile,
+                    "reason": "ttn_decoding_not_implemented"
+                }),
+            )
+            .map_err(|err| StartupError::backend_initialization(err.message))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn connector_runtime_status_from_spec(spec: &IngestionWorkerSpec) -> ConnectorWorkerRuntimeStatus {
+    let decision = connector_worker_start_decision(spec);
+    let status = match decision {
+        ConnectorWorkerStartDecision::StartMqtt => ConnectorWorkerRuntimeState::Planned,
+        ConnectorWorkerStartDecision::Skip => ConnectorWorkerRuntimeState::Skipped,
+        ConnectorWorkerStartDecision::Invalid => ConnectorWorkerRuntimeState::Invalid,
+        ConnectorWorkerStartDecision::Unsupported => ConnectorWorkerRuntimeState::Unsupported,
+        ConnectorWorkerStartDecision::PlannedOnly => ConnectorWorkerRuntimeState::Planned,
+    };
+    let last_error = if spec.connector_profile == ConnectorProfile::TtnV3
+        && status == ConnectorWorkerRuntimeState::Skipped
+    {
+        Some(
+            "TTN v3 connector workers are not started yet; TTN decoding is future work".to_string(),
+        )
+    } else if matches!(
+        status,
+        ConnectorWorkerRuntimeState::Invalid | ConnectorWorkerRuntimeState::Unsupported
+    ) {
+        Some(
+            spec.validation_issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+        .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+
+    ConnectorWorkerRuntimeStatus {
+        connector_id: spec.connector_id,
+        connector_key: spec.connector_key.clone(),
+        connector_type: spec.connector_type.clone(),
+        connector_profile: spec.connector_profile.clone(),
+        enabled: spec.enabled,
+        worker_kind: spec.worker_kind.clone(),
+        status,
+        connected: false,
+        subscribed: false,
+        broker_url: spec.broker_url.clone(),
+        client_id: spec.client_id.clone(),
+        topic_filter: spec.topic_filter.clone(),
+        http_path: spec.http_path.clone(),
+        payload_format: spec.payload_format.clone(),
+        content_type: spec.content_type.clone(),
+        last_error,
+        last_message_at: None,
+        last_successful_ingest_at: None,
+        last_failed_ingest_at: None,
+        validation_issues: spec.validation_issues.clone(),
+        metadata: spec.metadata.clone(),
+    }
+}
+
+fn connector_workers_status(state: &AppState) -> Result<IngestionWorkersStatusResponse, ApiError> {
+    let plan = build_ingestion_worker_plan(state)?;
+    let runtime_statuses = state
+        .connector_worker_statuses
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let workers = plan
+        .specs
+        .iter()
+        .map(|spec| {
+            runtime_statuses
+                .get(&spec.connector_id)
+                .cloned()
+                .unwrap_or_else(|| connector_runtime_status_from_spec(spec))
+        })
+        .collect::<Vec<_>>();
+
+    Ok(IngestionWorkersStatusResponse {
+        connector_workers: connector_workers_readiness_from_workers(
+            connector_workers_enabled(state),
+            &workers,
+        ),
+        workers,
+    })
+}
+
+fn connector_workers_readiness(state: &AppState) -> ConnectorWorkersReadiness {
+    connector_workers_status(state)
+        .map(|status| status.connector_workers)
+        .unwrap_or_else(|_| ConnectorWorkersReadiness {
+            enabled: connector_workers_enabled(state),
+            total: 0,
+            running: 0,
+            degraded: 0,
+            skipped: 0,
+            invalid: 0,
+            errors: 1,
+        })
+}
+
+fn connector_workers_readiness_from_workers(
+    enabled: bool,
+    workers: &[ConnectorWorkerRuntimeStatus],
+) -> ConnectorWorkersReadiness {
+    ConnectorWorkersReadiness {
+        enabled,
+        total: workers.len(),
+        running: workers
+            .iter()
+            .filter(|worker| worker.status == ConnectorWorkerRuntimeState::Running)
+            .count(),
+        degraded: workers
+            .iter()
+            .filter(|worker| worker.status == ConnectorWorkerRuntimeState::Degraded)
+            .count(),
+        skipped: workers
+            .iter()
+            .filter(|worker| worker.status == ConnectorWorkerRuntimeState::Skipped)
+            .count(),
+        invalid: workers
+            .iter()
+            .filter(|worker| worker.status == ConnectorWorkerRuntimeState::Invalid)
+            .count(),
+        errors: workers
+            .iter()
+            .filter(|worker| {
+                matches!(
+                    worker.status,
+                    ConnectorWorkerRuntimeState::Degraded | ConnectorWorkerRuntimeState::Invalid
+                )
+            })
+            .count(),
+    }
+}
+
+fn connector_workers_enabled(state: &AppState) -> bool {
+    state
+        .connector_workers_enabled
+        .read()
+        .map(|guard| *guard)
+        .unwrap_or(false)
+}
+
+fn set_connector_workers_enabled(state: &AppState, enabled: bool) {
+    if let Ok(mut guard) = state.connector_workers_enabled.write() {
+        *guard = enabled;
+    }
 }
 
 fn connector_worker_spec(connector: IngestionConnector) -> IngestionWorkerSpec {
@@ -3630,6 +4018,97 @@ fn metadata_with_connector(mut metadata: Value, connector_metadata: Option<Value
     }
 
     metadata
+}
+
+fn parse_bool_env_value(
+    value: Option<&str>,
+    default: bool,
+    variable_name: &str,
+) -> Result<bool, StartupError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(default),
+        Some(value) if value.eq_ignore_ascii_case("true") || value == "1" => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") || value == "0" => Ok(false),
+        Some(other) => Err(StartupError::backend_initialization(format!(
+            "invalid boolean value '{other}' for {variable_name}"
+        ))),
+    }
+}
+
+fn set_connector_worker_runtime_status(state: &AppState, status: ConnectorWorkerRuntimeStatus) {
+    if let Ok(mut statuses) = state.connector_worker_statuses.write() {
+        statuses.insert(status.connector_id, status);
+    }
+}
+
+fn update_connector_worker_runtime_status(
+    state: &AppState,
+    connector_id: Uuid,
+    update: impl FnOnce(&mut ConnectorWorkerRuntimeStatus),
+) {
+    if let Ok(mut statuses) = state.connector_worker_statuses.write() {
+        if let Some(status) = statuses.get_mut(&connector_id) {
+            update(status);
+        }
+    }
+}
+
+fn mark_connector_worker_starting(state: &AppState, connector_id: Uuid) {
+    update_connector_worker_runtime_status(state, connector_id, |worker| {
+        worker.status = ConnectorWorkerRuntimeState::Starting;
+        worker.connected = false;
+        worker.subscribed = false;
+        worker.last_error = None;
+    });
+}
+
+fn mark_connector_worker_connected(state: &AppState, connector_id: Uuid) {
+    update_connector_worker_runtime_status(state, connector_id, |worker| {
+        worker.status = ConnectorWorkerRuntimeState::Degraded;
+        worker.connected = true;
+        worker.last_error = None;
+    });
+}
+
+fn mark_connector_worker_subscribed(state: &AppState, connector_id: Uuid) {
+    update_connector_worker_runtime_status(state, connector_id, |worker| {
+        worker.status = ConnectorWorkerRuntimeState::Running;
+        worker.connected = true;
+        worker.subscribed = true;
+        worker.last_error = None;
+    });
+}
+
+fn mark_connector_worker_failure(state: &AppState, connector_id: Uuid, message: String) {
+    update_connector_worker_runtime_status(state, connector_id, |worker| {
+        worker.status = ConnectorWorkerRuntimeState::Degraded;
+        worker.connected = false;
+        worker.subscribed = false;
+        worker.last_error = Some(message);
+    });
+}
+
+fn mark_connector_worker_message(state: &AppState, connector_id: Uuid) {
+    update_connector_worker_runtime_status(state, connector_id, |worker| {
+        worker.last_message_at = Some(Utc::now());
+    });
+}
+
+fn mark_connector_worker_ingest_success(state: &AppState, connector_id: Uuid) {
+    update_connector_worker_runtime_status(state, connector_id, |worker| {
+        worker.last_successful_ingest_at = Some(Utc::now());
+        worker.last_error = None;
+    });
+}
+
+fn mark_connector_worker_ingest_failed(state: &AppState, connector_id: Uuid, message: String) {
+    update_connector_worker_runtime_status(state, connector_id, |worker| {
+        worker.last_failed_ingest_at = Some(Utc::now());
+        worker.last_error = Some(message);
+        if worker.status == ConnectorWorkerRuntimeState::Running {
+            worker.status = ConnectorWorkerRuntimeState::Degraded;
+        }
+    });
 }
 
 fn ensure_command_exists(state: &AppState, command_id: Uuid) -> Result<(), ApiError> {
@@ -4084,6 +4563,34 @@ fn record_connector_event(
             action_id: None,
             action_result_id: None,
             metadata: Some(connector_event_metadata(connector)),
+        },
+    )
+}
+
+fn record_connector_worker_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    severity: EventSeverity,
+    message: Option<String>,
+    metadata: Value,
+) -> Result<Event, ApiError> {
+    record_event(
+        state,
+        EventDraft {
+            event_type: event_type.into(),
+            severity,
+            source_entity_id: None,
+            target_entity_id: None,
+            message,
+            occurred_at: Utc::now(),
+            observed_at: None,
+            correlation_id: None,
+            raw_message_id: None,
+            observation_id: None,
+            command_id: None,
+            action_id: None,
+            action_result_id: None,
+            metadata: Some(metadata),
         },
     )
 }
@@ -7529,6 +8036,143 @@ mod tests {
         assert_eq!(ready["worker_plan"]["planned_workers"], 1);
     }
 
+    #[test]
+    fn connector_worker_config_defaults_disabled() {
+        let config =
+            ConnectorWorkerConfig::from_env_values(ConnectorWorkerEnvValues::default()).unwrap();
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    fn connector_worker_config_parses_enabled() {
+        let config = ConnectorWorkerConfig::from_env_values(ConnectorWorkerEnvValues {
+            enabled: Some("true".to_string()),
+        })
+        .unwrap();
+        assert!(config.enabled);
+    }
+
+    #[tokio::test]
+    async fn connector_workers_status_reports_disabled_by_default() {
+        let app = app();
+        create_mqtt_connector(
+            &app,
+            "mqtt-runtime-disabled",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let status = get_worker_status(&app).await;
+        assert_eq!(status["connector_workers"]["enabled"], false);
+        assert_eq!(status["workers"][0]["status"], "planned");
+    }
+
+    #[tokio::test]
+    async fn ttn_v3_connector_worker_is_skipped_when_runtime_enabled() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        create_mqtt_connector(
+            &app,
+            "ttn-runtime-skip",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        start_connector_workers(state.clone(), ConnectorWorkerConfig { enabled: true })
+            .await
+            .unwrap();
+
+        let status = connector_workers_status(&state).unwrap();
+        assert!(status.connector_workers.enabled);
+        assert_eq!(
+            status.workers[0].status,
+            ConnectorWorkerRuntimeState::Skipped
+        );
+        assert!(status.workers[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("TTN v3"));
+    }
+
+    #[tokio::test]
+    async fn invalid_mqtt_connector_worker_is_not_started() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        create_mqtt_connector(
+            &app,
+            "mqtt-runtime-invalid",
+            "generic-mqtt",
+            true,
+            None,
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        start_connector_workers(state.clone(), ConnectorWorkerConfig { enabled: true })
+            .await
+            .unwrap();
+
+        let status = connector_workers_status(&state).unwrap();
+        assert_eq!(
+            status.workers[0].status,
+            ConnectorWorkerRuntimeState::Invalid
+        );
+        assert!(!status.workers[0].connected);
+        assert!(!status.workers[0].subscribed);
+    }
+
+    #[tokio::test]
+    async fn valid_generic_mqtt_connector_has_startable_worker_spec() {
+        let app = app();
+        create_mqtt_connector(
+            &app,
+            "mqtt-runtime-startable",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let plan = get_worker_plan(&app).await;
+        let spec = IngestionWorkerSpec {
+            connector_id: Uuid::parse_str(plan["specs"][0]["connector_id"].as_str().unwrap())
+                .unwrap(),
+            connector_key: plan["specs"][0]["connector_key"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            connector_type: IngestionConnectorType::Mqtt,
+            connector_profile: ConnectorProfile::GenericMqtt,
+            enabled: true,
+            worker_kind: IngestionWorkerKind::MqttSubscriber,
+            broker_url: Some("mqtt://127.0.0.1:1883".to_string()),
+            client_id: Some("mqtt-runtime-startable-client".to_string()),
+            topic_filter: Some("aioncore/+/+/data".to_string()),
+            http_path: None,
+            payload_format: Some("canonical-json".to_string()),
+            content_type: None,
+            status: IngestionWorkerSpecStatus::Planned,
+            validation_issues: Vec::new(),
+            metadata: None,
+        };
+        assert_eq!(
+            connector_worker_start_decision(&spec),
+            ConnectorWorkerStartDecision::StartMqtt
+        );
+    }
+
     #[tokio::test]
     async fn queries_raw_message_by_id() {
         let app = app();
@@ -8622,6 +9266,22 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/ingestion/workers/plan")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn get_worker_status(app: &Router) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ingestion/workers/status")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -22,6 +22,11 @@ async fn main() {
             .unwrap_or_else(|| "n/a".to_string())
     );
 
+    if let Err(error) = aion_api::start_connector_workers_if_enabled(state.clone()).await {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
     if let Err(error) = aion_api::start_mqtt_ingest_if_enabled(state).await {
         eprintln!("{error}");
         std::process::exit(1);

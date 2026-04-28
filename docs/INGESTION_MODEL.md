@@ -80,11 +80,12 @@ Connector status is currently derived from registry state:
 
 - disabled connectors report `disabled`
 - enabled HTTP connectors report `ready`
-- enabled MQTT/future connectors report `degraded` because dynamic workers per connector are future work
+- enabled MQTT connectors report `planned`, `ready`, `degraded`, `skipped`, or `error` depending on connector-worker runtime state
+- future connectors report `unsupported`
 
-The registry is supported by in-memory storage and PostgreSQL persistence. Durable connector configuration is needed before dynamic MQTT workers can be introduced, because future startup logic will need to reload enabled connectors and start the appropriate source-specific workers.
+The registry is supported by in-memory storage and PostgreSQL persistence. Durable connector configuration allows startup logic to reload enabled connectors and start source-specific workers when connector workers are enabled.
 
-The existing environment-variable MQTT configuration acts as the default runtime MQTT connector for now. It is not yet created dynamically from the registry.
+The existing environment-variable MQTT configuration remains the default runtime MQTT connector path. It is independent of connector-based MQTT workers.
 
 ## Worker Planner
 
@@ -94,7 +95,7 @@ The worker planner is a read-only inspection endpoint:
 GET /ingestion/workers/plan
 ```
 
-It reads registered ingestion connectors and returns the worker specifications AionCore would intend to run in a future dynamic-worker runtime. It does not start workers, open network connections, subscribe to MQTT topics, or call external services.
+It reads registered ingestion connectors and returns the worker specifications AionCore would intend to run. It does not start workers, open network connections, subscribe to MQTT topics, or call external services.
 
 Planned worker specs include connector identity, connector type/profile, worker kind, source settings, payload defaults, status, validation issues, and connector metadata.
 
@@ -106,16 +107,61 @@ Worker kinds:
 
 Spec status values:
 
-- `planned`: connector is enabled and has enough configuration for a future worker.
+- `planned`: connector is enabled and has enough configuration for a worker.
 - `skipped`: connector is disabled.
 - `invalid`: connector is enabled but missing required fields.
 - `unsupported`: connector type is not supported by the current runtime planner.
 
 Enabled HTTP connectors plan `http_listener` specs when they have `http_path` or `endpoint`. Enabled MQTT connectors plan `mqtt_subscriber` specs when they have `broker_url` and `topic_filter`. TTN v3 connectors also plan MQTT subscriber specs, but include a validation note when their payload format is not implemented by the current decoder path.
 
-`GET /ready` includes a cheap worker-plan summary with planned, invalid, and unsupported counts. Connector plan issues do not make readiness fail in this milestone because no dynamic workers are started yet.
+`GET /ready` includes a cheap worker-plan summary with planned, invalid, and unsupported counts. Connector plan issues do not make readiness fail in this milestone.
 
-Dynamic workers are future work. The planner exists first so connector configuration can be validated and inspected safely before runtime worker orchestration is introduced.
+## Connector-Based Worker Runtime
+
+Dynamic connector workers are opt-in:
+
+```text
+AIONCORE_CONNECTOR_WORKERS_ENABLED=true|false
+```
+
+The default is `false`. When disabled, AionCore does not start connector-based workers and `/ingestion/workers/plan` remains read-only.
+
+When enabled, startup reads the planner and starts one MQTT subscriber worker for each valid enabled MQTT connector whose profile is:
+
+- `generic-aion-mqtt`
+- `generic-mqtt`
+
+Each connector worker uses the connector `broker_url`, `client_id`, `topic_filter`, `payload_format`, and `content_type` defaults. Raw messages and ingestion events include `connector_id`, `connector_key`, and `connector_profile`.
+
+Connector worker runtime state is exposed through:
+
+```text
+GET /ingestion/workers/status
+```
+
+Status values include:
+
+- `planned`
+- `starting`
+- `running`
+- `degraded`
+- `skipped`
+- `invalid`
+- `unsupported`
+
+`GET /ready` includes a `connector_workers` summary with:
+
+- `enabled`
+- `total`
+- `running`
+- `degraded`
+- `skipped`
+- `invalid`
+- `errors`
+
+Connector workers do not replace the env-var MQTT worker. If `AIONCORE_MQTT_ENABLED=true` and `AIONCORE_CONNECTOR_WORKERS_ENABLED=true`, both worker families may run.
+
+TTN v3 connectors are planned but skipped by the dynamic runtime because TTN uplink decoding is not implemented yet. No network connection is attempted for TTN v3 connector workers in this milestone.
 
 ## MQTT Ingestion
 
@@ -187,7 +233,7 @@ Broker receives message
   -> worker emits ingestion events
 ```
 
-Future MQTT work should support one worker per enabled MQTT connector so multiple controlled or external brokers can run side by side. That future model should support generic AionCore topics, user-defined generic MQTT mappings, and provider-specific profiles.
+Connector-based MQTT workers support one worker per enabled generic MQTT connector so multiple controlled brokers can run side by side. Provider-specific profiles such as TTN v3 are modeled but not dynamically consumed yet.
 
 ## The Things Stack Profile
 
@@ -209,7 +255,7 @@ Full TTN uplink decoding is not implemented yet. Future TTN adapter behavior sho
 ## Limitations
 
 - Connector registry persistence is available for in-memory and PostgreSQL storage.
-- Dynamic MQTT workers per connector are not implemented yet.
+- Dynamic MQTT workers are implemented only for `generic-aion-mqtt` and `generic-mqtt` connector profiles and must be explicitly enabled.
 - TTN/The Things Stack live connectivity and full uplink decoding are not implemented yet.
 - Secrets storage is not implemented yet.
 - Connector authentication is not implemented yet.

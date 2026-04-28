@@ -99,7 +99,7 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/health"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
 ```
 
-`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` checks storage and MQTT readiness. In memory mode storage returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable. When MQTT is disabled, `/ready` still succeeds and reports `mqtt.enabled = false`.
+`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` checks storage and MQTT readiness. In memory mode storage returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable. When MQTT is disabled, `/ready` still succeeds and reports `mqtt.enabled = false`. Connector workers are also disabled by default and reported under `connector_workers.enabled = false`.
 
 MQTT ingestion is optional and remains disabled unless you enable it explicitly:
 
@@ -269,7 +269,46 @@ Planner behavior:
 
 `GET /ingestion/workers/plan` is read-only. It does not connect to brokers or start dynamic workers.
 
-The connector registry is available in memory and through the PostgreSQL backend. Existing env-var MQTT config remains the default runtime MQTT connector behavior; dynamic MQTT workers per connector and TTN uplink decoding are future work.
+The connector registry is available in memory and through the PostgreSQL backend. Existing env-var MQTT config remains the default runtime MQTT connector behavior. Dynamic MQTT workers per connector are opt-in and TTN uplink decoding is future work.
+
+Dynamic connector workers are disabled unless explicitly enabled:
+
+```powershell
+$env:AIONCORE_CONNECTOR_WORKERS_ENABLED = "false"
+cargo run -p aion-api
+```
+
+Enable connector-based MQTT workers only when you want AionCore to start one worker for each valid enabled `generic-aion-mqtt` or `generic-mqtt` connector:
+
+```powershell
+$env:AIONCORE_CONNECTOR_WORKERS_ENABLED = "true"
+cargo run -p aion-api
+```
+
+If both `AIONCORE_MQTT_ENABLED=true` and `AIONCORE_CONNECTOR_WORKERS_ENABLED=true` are set, the env-var MQTT worker and connector-based MQTT workers may run at the same time.
+
+Inspect intended and runtime connector workers:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/workers/plan"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/workers/status"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
+```
+
+`/ingestion/workers/status` reports `planned`, `starting`, `running`, `degraded`, `skipped`, `invalid`, or `unsupported` per connector. `/ready` includes `connector_workers.total`, `running`, `degraded`, `skipped`, `invalid`, and `errors`; connector worker issues do not replace the existing storage/env-var MQTT readiness rules.
+
+Example test publish for a connector using the generic AionCore MQTT topic convention:
+
+```powershell
+mosquitto_pub.exe `
+  -h 127.0.0.1 `
+  -p 1883 `
+  -t "aioncore/11111111-1111-1111-1111-111111111111/22222222-2222-2222-2222-222222222222/data" `
+  -m '{ "e": [ { "n": "soil_moisture", "u": "%", "v": 18.5 } ] }' `
+  -V mqttv5
+```
+
+TTN v3 connectors can be registered and planned, but connector workers skip them for now because `ttn-uplink-json` decoding is not implemented yet.
 
 With PostgreSQL selected as the storage backend, connector records are stored durably. Example connector payloads:
 
