@@ -806,6 +806,110 @@ Invoke-RestMethod `
   } | ConvertTo-Json -Depth 10)
 ```
 
+Register an external executor and let it poll, claim, and complete the generated command:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/observations" `
+  -ContentType "application/json" `
+  -Body (@{
+    producer_entity_id = $ruleTank.id
+    feature_of_interest_id = $ruleTank.id
+    observed_property = "WaterTankLevel"
+    value = @{ type = "number"; value = 11 }
+    unit = "%"
+    observed_at = "2026-04-28T12:05:00Z"
+    received_at = "2026-04-28T12:05:01Z"
+    protocol = "http"
+    payload_format = "json_mapping"
+    quality = @{}
+    metadata = @{}
+  } | ConvertTo-Json -Depth 10)
+
+$executorRuleCommands = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/commands?target_entity_id=$($rulePump.id)&status=pending"
+
+$executorRuleCommand = $executorRuleCommands[0]
+
+$executor = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/executors" `
+  -ContentType "application/json" `
+  -Body (@{
+    agent_key = "edge-agent-01"
+    agent_type = "edge"
+    display_name = "Edge Agent 01"
+    status = "online"
+    metadata = @{ site = "building-01" }
+  } | ConvertTo-Json -Depth 10)
+
+$executorCapability = @{
+  command_type = "StartPump"
+  protocol = "local"
+  metadata = @{ source = "manual-test" }
+}
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/executors/$($executor.id)/capabilities" `
+  -ContentType "application/json" `
+  -Body (ConvertTo-Json -InputObject (, $executorCapability) -Depth 10)
+
+$executorScope = @{
+  target_entity_id = $rulePump.id
+  metadata = @{ scope = "pump-only" }
+}
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/executors/$($executor.id)/scopes" `
+  -ContentType "application/json" `
+  -Body (ConvertTo-Json -InputObject (, $executorScope) -Depth 10)
+
+try {
+  Invoke-RestMethod -Method Post -Uri "http://localhost:8080/executors/$($executor.id)/commands/$($executorRuleCommand.id)/claim"
+} catch {
+  $_.ErrorDetails.Message
+}
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($executorRuleCommand.id)/approve"
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/executors/$($executor.id)/heartbeat" `
+  -ContentType "application/json" `
+  -Body (@{
+    status = "online"
+    metadata = @{ last_poll = "manual-test" }
+  } | ConvertTo-Json -Depth 10)
+
+$executorCommands = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/executors/$($executor.id)/commands/pending"
+
+$executorCommand = $executorCommands[0]
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/executors/$($executor.id)/commands/$($executorCommand.id)/claim"
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/executors/$($executor.id)/commands/$($executorCommand.id)/complete" `
+  -ContentType "application/json" `
+  -Body (@{
+    result_payload = @{ pump_state = "running" }
+    verified = $true
+    status = "succeeded"
+    metadata = @{ source = "edge-agent-01" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?command_id=$($executorCommand.id)"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ai/context/entity/$($rulePump.id)"
+```
+
 Build AI context for a smart-building water tank and pump:
 
 ```powershell

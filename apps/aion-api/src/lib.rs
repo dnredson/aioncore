@@ -1,5 +1,6 @@
 use aion_action::{
-    Action, ActionResult, ApprovalStatus, Capability, Command, CommandStatus, Policy,
+    Action, ActionResult, ApprovalStatus, Capability, Command, CommandStatus, ExecutorAgent,
+    ExecutorAgentStatus, ExecutorCapability, ExecutorScope, Policy,
 };
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
@@ -14,8 +15,8 @@ use aion_relationship::Relationship;
 use aion_rule::{Rule, RuleAction, RuleCondition, RuleEvaluationResult, RuleTriggerType};
 use aion_storage::{
     ActionResultStore, ActionStore, CapabilityStore, CommandStore, EntityStore, EventFilter,
-    EventStore, InMemoryStorage, ObservationStore, PayloadProfile, PayloadProfileStore,
-    PolicyStore, RawMessageStore, RelationshipStore, RuleStore, StorageError,
+    EventStore, ExecutorStore, InMemoryStorage, ObservationStore, PayloadProfile,
+    PayloadProfileStore, PolicyStore, RawMessageStore, RelationshipStore, RuleStore, StorageError,
 };
 use axum::{
     body::Bytes,
@@ -131,6 +132,58 @@ pub struct PutCapabilityRequest {
     pub command_type: String,
     pub protocol: Option<String>,
     pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateExecutorRequest {
+    pub agent_key: String,
+    pub agent_type: String,
+    pub display_name: Option<String>,
+    pub status: Option<ExecutorAgentStatus>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExecutorHeartbeatRequest {
+    pub status: ExecutorAgentStatus,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutExecutorCapabilityRequest {
+    pub command_type: String,
+    pub protocol: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutExecutorScopeRequest {
+    pub target_entity_id: Option<Uuid>,
+    pub entity_type: Option<String>,
+    pub relationship_type: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExecutorCompleteCommandRequest {
+    pub result_payload: Value,
+    pub verified: Option<bool>,
+    pub status: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExecutorFailCommandRequest {
+    pub failure_reason: String,
+    pub result_payload: Option<Value>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExecutorCommandCompletionResponse {
+    pub command: Command,
+    pub action: Action,
+    pub action_result: ActionResult,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,6 +426,33 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/rules/:rule_id", get(get_rule))
         .route("/rules/:rule_id/enable", put(enable_rule))
         .route("/rules/:rule_id/disable", put(disable_rule))
+        .route("/executors", post(create_executor).get(list_executors))
+        .route("/executors/:executor_id", get(get_executor))
+        .route("/executors/:executor_id/heartbeat", put(heartbeat_executor))
+        .route(
+            "/executors/:executor_id/capabilities",
+            put(put_executor_capabilities).get(get_executor_capabilities),
+        )
+        .route(
+            "/executors/:executor_id/scopes",
+            put(put_executor_scopes).get(get_executor_scopes),
+        )
+        .route(
+            "/executors/:executor_id/commands/pending",
+            get(poll_executor_pending_commands),
+        )
+        .route(
+            "/executors/:executor_id/commands/:command_id/claim",
+            post(claim_executor_command),
+        )
+        .route(
+            "/executors/:executor_id/commands/:command_id/complete",
+            post(complete_executor_command),
+        )
+        .route(
+            "/executors/:executor_id/commands/:command_id/fail",
+            post(fail_executor_command),
+        )
         .route("/commands", post(create_command).get(query_commands))
         .route("/commands/:command_id/claim", post(claim_command))
         .route("/commands/:command_id/release", post(release_command))
@@ -1579,6 +1659,307 @@ async fn evaluate_rules_manually(
     evaluate_rules_for_event(&state, &event, false).map(Json)
 }
 
+async fn create_executor(
+    State(state): State<AppState>,
+    Json(request): Json<CreateExecutorRequest>,
+) -> Result<(StatusCode, Json<ExecutorAgent>), ApiError> {
+    let now = Utc::now();
+    let executor = ExecutorAgent::new(
+        state.tenant_id,
+        request.agent_key,
+        request.agent_type,
+        request.display_name,
+        request.status.unwrap_or(ExecutorAgentStatus::Online),
+        request.metadata,
+        now,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let executor = state.storage.create_executor(executor)?;
+    record_executor_event(
+        &state,
+        "aion:ExecutorRegistered",
+        &executor,
+        None,
+        Some(json!({"agent_type": executor.agent_type})),
+    )?;
+
+    Ok((StatusCode::CREATED, Json(executor)))
+}
+
+async fn list_executors(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ExecutorAgent>>, ApiError> {
+    Ok(Json(state.storage.list_executors(state.tenant_id)?))
+}
+
+async fn get_executor(
+    State(state): State<AppState>,
+    Path(executor_id): Path<Uuid>,
+) -> Result<Json<ExecutorAgent>, ApiError> {
+    Ok(Json(get_executor_agent(&state, executor_id)?))
+}
+
+async fn heartbeat_executor(
+    State(state): State<AppState>,
+    Path(executor_id): Path<Uuid>,
+    Json(request): Json<ExecutorHeartbeatRequest>,
+) -> Result<Json<ExecutorAgent>, ApiError> {
+    let mut executor = get_executor_agent(&state, executor_id)?;
+    executor.heartbeat(request.status, Utc::now());
+    if request.metadata.is_some() {
+        executor.metadata = request.metadata;
+    }
+    let executor = state.storage.update_executor(executor)?;
+    record_executor_event(
+        &state,
+        "aion:ExecutorHeartbeat",
+        &executor,
+        None,
+        Some(json!({"status": executor.status})),
+    )?;
+
+    Ok(Json(executor))
+}
+
+async fn put_executor_capabilities(
+    State(state): State<AppState>,
+    Path(executor_id): Path<Uuid>,
+    Json(requests): Json<Vec<PutExecutorCapabilityRequest>>,
+) -> Result<(StatusCode, Json<Vec<ExecutorCapability>>), ApiError> {
+    ensure_executor_exists(&state, executor_id)?;
+    let capabilities = requests
+        .into_iter()
+        .map(|request| {
+            ExecutorCapability::new(
+                executor_id,
+                request.command_type,
+                request.protocol,
+                request.metadata,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(state.storage.put_executor_capabilities(
+            state.tenant_id,
+            executor_id,
+            capabilities,
+        )?),
+    ))
+}
+
+async fn get_executor_capabilities(
+    State(state): State<AppState>,
+    Path(executor_id): Path<Uuid>,
+) -> Result<Json<Vec<ExecutorCapability>>, ApiError> {
+    ensure_executor_exists(&state, executor_id)?;
+    Ok(Json(state.storage.list_executor_capabilities(
+        state.tenant_id,
+        executor_id,
+    )?))
+}
+
+async fn put_executor_scopes(
+    State(state): State<AppState>,
+    Path(executor_id): Path<Uuid>,
+    Json(requests): Json<Vec<PutExecutorScopeRequest>>,
+) -> Result<(StatusCode, Json<Vec<ExecutorScope>>), ApiError> {
+    ensure_executor_exists(&state, executor_id)?;
+    let mut scopes = Vec::with_capacity(requests.len());
+    for request in requests {
+        if let Some(target_entity_id) = request.target_entity_id {
+            ensure_entity_exists(&state, target_entity_id)?;
+        }
+        scopes.push(ExecutorScope::new(
+            executor_id,
+            request.target_entity_id,
+            request.entity_type,
+            request.relationship_type,
+            request.metadata,
+        ));
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            state
+                .storage
+                .put_executor_scopes(state.tenant_id, executor_id, scopes)?,
+        ),
+    ))
+}
+
+async fn get_executor_scopes(
+    State(state): State<AppState>,
+    Path(executor_id): Path<Uuid>,
+) -> Result<Json<Vec<ExecutorScope>>, ApiError> {
+    ensure_executor_exists(&state, executor_id)?;
+    Ok(Json(
+        state
+            .storage
+            .list_executor_scopes(state.tenant_id, executor_id)?,
+    ))
+}
+
+async fn poll_executor_pending_commands(
+    State(state): State<AppState>,
+    Path(executor_id): Path<Uuid>,
+) -> Result<Json<Vec<Command>>, ApiError> {
+    ensure_executor_exists(&state, executor_id)?;
+    let commands = state
+        .storage
+        .query_commands(state.tenant_id, None, Some(CommandStatus::Pending))?
+        .into_iter()
+        .filter(|command| executor_can_run_command(&state, executor_id, command).unwrap_or(false))
+        .collect::<Vec<_>>();
+
+    Ok(Json(commands))
+}
+
+async fn claim_executor_command(
+    State(state): State<AppState>,
+    Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Command>, ApiError> {
+    let executor = get_executor_agent(&state, executor_id)?;
+    ensure_executor_can_run_command(&state, executor_id, command_id)?;
+    let command = claim_command_for_executor(&state, command_id, &executor.agent_key)?;
+    record_executor_event(
+        &state,
+        "aion:ExecutorClaimedCommand",
+        &executor,
+        Some(&command),
+        None,
+    )?;
+
+    Ok(Json(command))
+}
+
+async fn complete_executor_command(
+    State(state): State<AppState>,
+    Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ExecutorCompleteCommandRequest>,
+) -> Result<Json<ExecutorCommandCompletionResponse>, ApiError> {
+    let executor = get_executor_agent(&state, executor_id)?;
+    let command = get_command_for_executor_mutation(&state, command_id, &executor.agent_key)?;
+    let now = Utc::now();
+    let action = Action::new(
+        state.tenant_id,
+        command.id,
+        None,
+        command.command_type.clone(),
+        "completed",
+        command.claimed_at,
+        Some(now),
+        Some(json!({
+            "executor_id": executor.id,
+            "agent_key": executor.agent_key,
+            "source": "executor_api"
+        })),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let action = state.storage.store_action(action)?;
+    let action_result = ActionResult::new(
+        state.tenant_id,
+        command.id,
+        action.id,
+        request.status.unwrap_or_else(|| "succeeded".to_string()),
+        request.verified.unwrap_or(true),
+        request.result_payload,
+        now,
+        Some(enrich_executor_result_metadata(&executor, request.metadata)),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let action_result = state.storage.store_action_result(action_result)?;
+    let command = mutate_command_raw(&state, command_id, |command, now| {
+        command.mark_executed(now)
+    })?;
+    record_command_event(
+        &state,
+        "aion:CommandExecuted",
+        EventSeverity::Info,
+        &command,
+        None,
+    )?;
+    record_executor_event(
+        &state,
+        "aion:ExecutorCompletedCommand",
+        &executor,
+        Some(&command),
+        Some(json!({"action_id": action.id, "action_result_id": action_result.id})),
+    )?;
+
+    Ok(Json(ExecutorCommandCompletionResponse {
+        command,
+        action,
+        action_result,
+    }))
+}
+
+async fn fail_executor_command(
+    State(state): State<AppState>,
+    Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ExecutorFailCommandRequest>,
+) -> Result<Json<ExecutorCommandCompletionResponse>, ApiError> {
+    let executor = get_executor_agent(&state, executor_id)?;
+    let command = get_command_for_executor_mutation(&state, command_id, &executor.agent_key)?;
+    let now = Utc::now();
+    let action = Action::new(
+        state.tenant_id,
+        command.id,
+        None,
+        command.command_type.clone(),
+        "failed",
+        command.claimed_at,
+        Some(now),
+        Some(json!({
+            "executor_id": executor.id,
+            "agent_key": executor.agent_key,
+            "source": "executor_api"
+        })),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let action = state.storage.store_action(action)?;
+    let action_result = ActionResult::new(
+        state.tenant_id,
+        command.id,
+        action.id,
+        "failed",
+        false,
+        request
+            .result_payload
+            .unwrap_or_else(|| json!({"failure_reason": request.failure_reason})),
+        now,
+        Some(enrich_executor_result_metadata(&executor, request.metadata)),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let action_result = state.storage.store_action_result(action_result)?;
+    let command = mutate_command_raw(&state, command_id, |command, now| {
+        command.mark_failed(request.failure_reason, now)
+    })?;
+    record_command_event(
+        &state,
+        "aion:CommandFailed",
+        EventSeverity::Error,
+        &command,
+        None,
+    )?;
+    record_executor_event(
+        &state,
+        "aion:ExecutorFailedCommand",
+        &executor,
+        Some(&command),
+        Some(json!({"action_id": action.id, "action_result_id": action_result.id})),
+    )?;
+
+    Ok(Json(ExecutorCommandCompletionResponse {
+        command,
+        action,
+        action_result,
+    }))
+}
+
 async fn create_command(
     State(state): State<AppState>,
     Json(request): Json<CreateCommandRequest>,
@@ -2304,6 +2685,207 @@ fn ensure_raw_message_exists(state: &AppState, raw_message_id: Uuid) -> Result<(
         .ok_or_else(ApiError::not_found)
 }
 
+fn ensure_executor_exists(state: &AppState, executor_id: Uuid) -> Result<(), ApiError> {
+    state
+        .storage
+        .get_executor(state.tenant_id, executor_id)?
+        .map(|_| ())
+        .ok_or_else(ApiError::not_found)
+}
+
+fn get_executor_agent(state: &AppState, executor_id: Uuid) -> Result<ExecutorAgent, ApiError> {
+    state
+        .storage
+        .get_executor(state.tenant_id, executor_id)?
+        .ok_or_else(ApiError::not_found)
+}
+
+fn ensure_executor_can_run_command(
+    state: &AppState,
+    executor_id: Uuid,
+    command_id: Uuid,
+) -> Result<Command, ApiError> {
+    let command = state
+        .storage
+        .get_command(state.tenant_id, command_id)?
+        .ok_or_else(ApiError::not_found)?;
+
+    if !executor_can_run_command(state, executor_id, &command)? {
+        return Err(ApiError::bad_request(
+            "command is not compatible with executor capabilities or scopes",
+        ));
+    }
+
+    Ok(command)
+}
+
+fn executor_can_run_command(
+    state: &AppState,
+    executor_id: Uuid,
+    command: &Command,
+) -> Result<bool, ApiError> {
+    let capabilities = state
+        .storage
+        .list_executor_capabilities(state.tenant_id, executor_id)?;
+    let has_capability = capabilities
+        .iter()
+        .any(|capability| capability.command_type == command.command_type);
+    if !has_capability {
+        return Ok(false);
+    }
+
+    let scopes = state
+        .storage
+        .list_executor_scopes(state.tenant_id, executor_id)?;
+    if scopes.is_empty() {
+        return Ok(false);
+    }
+
+    for scope in scopes {
+        if executor_scope_matches_command(state, &scope, command)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn executor_scope_matches_command(
+    state: &AppState,
+    scope: &ExecutorScope,
+    command: &Command,
+) -> Result<bool, ApiError> {
+    if let Some(target_entity_id) = scope.target_entity_id {
+        if target_entity_id != command.target_entity_id {
+            return Ok(false);
+        }
+    }
+
+    if let Some(entity_type) = scope.entity_type.as_deref() {
+        let entity = state
+            .storage
+            .get_entity(state.tenant_id, command.target_entity_id)?
+            .ok_or_else(ApiError::not_found)?;
+        if entity.entity_type != entity_type {
+            return Ok(false);
+        }
+    }
+
+    if let Some(relationship_type) = scope.relationship_type.as_deref() {
+        let outgoing = state.storage.list_relationships(
+            state.tenant_id,
+            Some(command.target_entity_id),
+            None,
+        )?;
+        let incoming = state.storage.list_relationships(
+            state.tenant_id,
+            None,
+            Some(command.target_entity_id),
+        )?;
+        if !outgoing
+            .iter()
+            .chain(incoming.iter())
+            .any(|relationship| relationship.relationship_type == relationship_type)
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn get_command_for_executor_mutation(
+    state: &AppState,
+    command_id: Uuid,
+    agent_key: &str,
+) -> Result<Command, ApiError> {
+    let command = state
+        .storage
+        .get_command(state.tenant_id, command_id)?
+        .ok_or_else(ApiError::not_found)?;
+    if command.claimed_by.as_deref() != Some(agent_key) {
+        return Err(ApiError::bad_request(
+            "command must be claimed by this executor before completion",
+        ));
+    }
+
+    Ok(command)
+}
+
+fn claim_command_for_executor(
+    state: &AppState,
+    command_id: Uuid,
+    agent_key: &str,
+) -> Result<Command, ApiError> {
+    let command = mutate_command_raw(state, command_id, |command, now| {
+        command.claim(agent_key.to_string(), now)
+    })?;
+    record_command_event(
+        state,
+        "aion:CommandClaimed",
+        EventSeverity::Info,
+        &command,
+        None,
+    )?;
+    Ok(command)
+}
+
+fn enrich_executor_result_metadata(executor: &ExecutorAgent, metadata: Option<Value>) -> Value {
+    let mut enriched = json!({
+        "executor_id": executor.id,
+        "agent_key": executor.agent_key,
+        "source": "executor_api"
+    });
+    if let (Some(object), Some(metadata)) = (enriched.as_object_mut(), metadata) {
+        object.insert("executor_metadata".to_string(), metadata);
+    }
+
+    enriched
+}
+
+fn record_executor_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    executor: &ExecutorAgent,
+    command: Option<&Command>,
+    metadata: Option<Value>,
+) -> Result<Event, ApiError> {
+    let mut event_metadata = json!({
+        "executor_id": executor.id,
+        "agent_key": executor.agent_key,
+        "agent_type": executor.agent_type
+    });
+    if let Some(object) = event_metadata.as_object_mut() {
+        if let Some(command) = command {
+            object.insert("command_id".to_string(), json!(command.id));
+            object.insert("command_type".to_string(), json!(command.command_type));
+        }
+        if let Some(metadata) = metadata {
+            object.insert("metadata".to_string(), metadata);
+        }
+    }
+
+    record_event(
+        state,
+        EventDraft {
+            event_type: event_type.into(),
+            severity: EventSeverity::Info,
+            source_entity_id: None,
+            target_entity_id: command.map(|command| command.target_entity_id),
+            message: Some(format!("Executor {} event", executor.agent_key)),
+            occurred_at: Utc::now(),
+            observed_at: None,
+            correlation_id: None,
+            raw_message_id: None,
+            observation_id: None,
+            command_id: command.map(|command| command.id),
+            action_id: None,
+            action_result_id: None,
+            metadata: Some(event_metadata),
+        },
+    )
+}
+
 fn record_command_event(
     state: &AppState,
     event_type: impl Into<String>,
@@ -2418,14 +3000,23 @@ fn mutate_command(
     severity: EventSeverity,
     mutate: impl FnOnce(&mut Command, DateTime<Utc>) -> Result<(), aion_action::ActionModelError>,
 ) -> Result<Json<Command>, ApiError> {
+    let command = mutate_command_raw(state, command_id, mutate)?;
+    record_command_event(state, event_type, severity, &command, None)?;
+    Ok(Json(command))
+}
+
+fn mutate_command_raw(
+    state: &AppState,
+    command_id: Uuid,
+    mutate: impl FnOnce(&mut Command, DateTime<Utc>) -> Result<(), aion_action::ActionModelError>,
+) -> Result<Command, ApiError> {
     let mut command = state
         .storage
         .get_command(state.tenant_id, command_id)?
         .ok_or_else(ApiError::not_found)?;
     mutate(&mut command, Utc::now()).map_err(|err| ApiError::bad_request(err.to_string()))?;
     let command = state.storage.update_command(command)?;
-    record_command_event(state, event_type, severity, &command, None)?;
-    Ok(Json(command))
+    Ok(command)
 }
 
 fn ensure_rule_action_targets_exist(state: &AppState, action: &RuleAction) -> Result<(), ApiError> {
@@ -4733,6 +5324,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registers_executor() {
+        let app = app();
+
+        let executor = create_test_executor(&app, "edge-agent-01").await;
+
+        assert_eq!(executor["agent_key"], "edge-agent-01");
+        assert_eq!(executor["agent_type"], "edge");
+        assert_eq!(executor["status"], "online");
+    }
+
+    #[tokio::test]
+    async fn sets_executor_capabilities() {
+        let app = app();
+        let executor = create_test_executor(&app, "edge-agent-cap-01").await;
+        let executor_id = executor["id"].as_str().unwrap();
+
+        let capabilities = put_executor_capabilities(&app, executor_id, &["StartPump"]).await;
+
+        assert_eq!(capabilities.as_array().unwrap().len(), 1);
+        assert_eq!(capabilities[0]["command_type"], "StartPump");
+    }
+
+    #[tokio::test]
+    async fn sets_executor_scopes() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "executor-scope-pump-01", "aion:Pump").await;
+        let executor = create_test_executor(&app, "edge-agent-scope-01").await;
+        let executor_id = executor["id"].as_str().unwrap();
+
+        let scopes = put_executor_scope_for_target(&app, executor_id, &pump_id).await;
+
+        assert_eq!(scopes.as_array().unwrap().len(), 1);
+        assert_eq!(scopes[0]["target_entity_id"], pump_id);
+    }
+
+    #[tokio::test]
+    async fn polling_returns_compatible_pending_commands() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "executor-compatible-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let executor = create_test_executor(&app, "edge-agent-compatible-01").await;
+        let executor_id = executor["id"].as_str().unwrap();
+        put_executor_capabilities(&app, executor_id, &["StartPump"]).await;
+        put_executor_scope_for_target(&app, executor_id, &pump_id).await;
+
+        let commands = poll_executor_commands(&app, executor_id).await;
+
+        assert!(commands
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == command["id"]));
+    }
+
+    #[tokio::test]
+    async fn polling_does_not_return_incompatible_command_type() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "executor-type-pump-01", "aion:Pump").await;
+        create_test_command(&app, &pump_id, "StopPump").await;
+        let executor = create_test_executor(&app, "edge-agent-type-01").await;
+        let executor_id = executor["id"].as_str().unwrap();
+        put_executor_capabilities(&app, executor_id, &["StartPump"]).await;
+        put_executor_scope_for_target(&app, executor_id, &pump_id).await;
+
+        let commands = poll_executor_commands(&app, executor_id).await;
+
+        assert!(commands.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn polling_does_not_return_out_of_scope_target_entity() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "executor-out-pump-01", "aion:Pump").await;
+        let other_pump_id = create_test_entity(&app, "executor-out-pump-02", "aion:Pump").await;
+        create_test_command(&app, &pump_id, "StartPump").await;
+        let executor = create_test_executor(&app, "edge-agent-out-01").await;
+        let executor_id = executor["id"].as_str().unwrap();
+        put_executor_capabilities(&app, executor_id, &["StartPump"]).await;
+        put_executor_scope_for_target(&app, executor_id, &other_pump_id).await;
+
+        let commands = poll_executor_commands(&app, executor_id).await;
+
+        assert!(commands.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn executor_claim_blocked_if_approval_required() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "executor-approval-pump-01", "aion:Pump").await;
+        put_start_pump_policy(&app, &pump_id, true).await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let executor = create_compatible_executor(&app, "edge-agent-approval-01", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/executors/{executor_id}/commands/{}/claim",
+                        command["id"].as_str().unwrap()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn approved_command_can_be_claimed_by_compatible_executor() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "executor-claim-pump-01", "aion:Pump").await;
+        put_start_pump_policy(&app, &pump_id, true).await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "edge-agent-claim-01", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        approve_test_command(&app, command_id).await;
+
+        let claimed = claim_executor_test_command(&app, executor_id, command_id).await;
+
+        assert_eq!(claimed["status"], "claimed");
+        assert_eq!(claimed["claimed_by"], "edge-agent-claim-01");
+    }
+
+    #[tokio::test]
+    async fn complete_command_creates_action_result_and_event() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "executor-complete-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "edge-agent-complete-01", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command(&app, executor_id, command_id).await;
+
+        let completed = complete_executor_test_command(&app, executor_id, command_id).await;
+
+        assert_eq!(completed["command"]["status"], "executed");
+        assert_eq!(completed["action"]["status"], "completed");
+        assert_eq!(completed["action_result"]["status"], "succeeded");
+        let events = query_events_by_type(&app, "aion:ExecutorCompletedCommand").await;
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["command_id"], command_id);
+    }
+
+    #[tokio::test]
+    async fn fail_command_marks_failed_and_creates_event() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "executor-fail-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = create_compatible_executor(&app, "edge-agent-fail-01", &pump_id).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        claim_executor_test_command(&app, executor_id, command_id).await;
+
+        let failed = fail_executor_test_command(&app, executor_id, command_id).await;
+
+        assert_eq!(failed["command"]["status"], "failed");
+        assert_eq!(failed["command"]["failure_reason"], "executor timeout");
+        assert_eq!(failed["action_result"]["status"], "failed");
+        let events = query_events_by_type(&app, "aion:ExecutorFailedCommand").await;
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["command_id"], command_id);
+    }
+
+    #[tokio::test]
     async fn ingests_senml_json_payload() {
         let app = app();
         let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
@@ -5446,6 +6206,204 @@ mod tests {
                         }
                     }
                 ]),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn create_test_executor(app: &Router, agent_key: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/executors",
+                json!({
+                    "agent_key": agent_key,
+                    "agent_type": "edge",
+                    "display_name": agent_key,
+                    "status": "online",
+                    "metadata": {
+                        "test": true
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_compatible_executor(app: &Router, agent_key: &str, pump_id: &str) -> Value {
+        let executor = create_test_executor(app, agent_key).await;
+        let executor_id = executor["id"].as_str().unwrap();
+        put_executor_capabilities(app, executor_id, &["StartPump"]).await;
+        put_executor_scope_for_target(app, executor_id, pump_id).await;
+        executor
+    }
+
+    async fn put_executor_capabilities(
+        app: &Router,
+        executor_id: &str,
+        command_types: &[&str],
+    ) -> Value {
+        let capabilities = command_types
+            .iter()
+            .map(|command_type| {
+                json!({
+                    "command_type": command_type,
+                    "protocol": "local",
+                    "metadata": {
+                        "test": true
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/executors/{executor_id}/capabilities"),
+                json!(capabilities),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn put_executor_scope_for_target(
+        app: &Router,
+        executor_id: &str,
+        target_entity_id: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/executors/{executor_id}/scopes"),
+                json!([
+                    {
+                        "target_entity_id": target_entity_id,
+                        "metadata": {
+                            "test": true
+                        }
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn poll_executor_commands(app: &Router, executor_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/executors/{executor_id}/commands/pending"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn approve_test_command(app: &Router, command_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/commands/{command_id}/approve"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn claim_executor_test_command(
+        app: &Router,
+        executor_id: &str,
+        command_id: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/executors/{executor_id}/commands/{command_id}/claim"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn complete_executor_test_command(
+        app: &Router,
+        executor_id: &str,
+        command_id: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/executors/{executor_id}/commands/{command_id}/complete"),
+                json!({
+                    "result_payload": {
+                        "pump_state": "running"
+                    },
+                    "verified": true,
+                    "metadata": {
+                        "source": "test"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn fail_executor_test_command(
+        app: &Router,
+        executor_id: &str,
+        command_id: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/executors/{executor_id}/commands/{command_id}/fail"),
+                json!({
+                    "failure_reason": "executor timeout",
+                    "result_payload": {
+                        "error": "timeout"
+                    },
+                    "metadata": {
+                        "source": "test"
+                    }
+                }),
             ))
             .await
             .unwrap();

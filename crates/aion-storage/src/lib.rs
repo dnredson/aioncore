@@ -1,4 +1,7 @@
-use aion_action::{Action, ActionResult, Capability, Command, CommandStatus, Policy};
+use aion_action::{
+    Action, ActionResult, Capability, Command, CommandStatus, ExecutorAgent, ExecutorCapability,
+    ExecutorScope, Policy,
+};
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
 use aion_observation::Observation;
@@ -200,6 +203,39 @@ pub trait CapabilityStore {
         -> StorageResult<Vec<Capability>>;
 }
 
+pub trait ExecutorStore {
+    fn create_executor(&self, executor: ExecutorAgent) -> StorageResult<ExecutorAgent>;
+    fn update_executor(&self, executor: ExecutorAgent) -> StorageResult<ExecutorAgent>;
+    fn get_executor(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+    ) -> StorageResult<Option<ExecutorAgent>>;
+    fn list_executors(&self, tenant_id: Uuid) -> StorageResult<Vec<ExecutorAgent>>;
+    fn put_executor_capabilities(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+        capabilities: Vec<ExecutorCapability>,
+    ) -> StorageResult<Vec<ExecutorCapability>>;
+    fn list_executor_capabilities(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+    ) -> StorageResult<Vec<ExecutorCapability>>;
+    fn put_executor_scopes(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+        scopes: Vec<ExecutorScope>,
+    ) -> StorageResult<Vec<ExecutorScope>>;
+    fn list_executor_scopes(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+    ) -> StorageResult<Vec<ExecutorScope>>;
+}
+
 pub trait CommandStore {
     fn store_command(&self, command: Command) -> StorageResult<Command>;
     fn update_command(&self, command: Command) -> StorageResult<Command>;
@@ -282,6 +318,10 @@ struct InMemoryState {
     observations: HashMap<Uuid, Observation>,
     payload_profiles: HashMap<(Uuid, Uuid), PayloadProfile>,
     capabilities: HashMap<(Uuid, Uuid), Vec<Capability>>,
+    executors: HashMap<Uuid, ExecutorAgent>,
+    executor_key_index: HashMap<(Uuid, String), Uuid>,
+    executor_capabilities: HashMap<(Uuid, Uuid), Vec<ExecutorCapability>>,
+    executor_scopes: HashMap<(Uuid, Uuid), Vec<ExecutorScope>>,
     commands: HashMap<Uuid, Command>,
     policies: HashMap<Uuid, Policy>,
     actions: HashMap<Uuid, Action>,
@@ -627,6 +667,131 @@ impl CapabilityStore for InMemoryStorage {
 
         capabilities.sort_by(|left, right| left.capability_name.cmp(&right.capability_name));
         Ok(capabilities)
+    }
+}
+
+impl ExecutorStore for InMemoryStorage {
+    fn create_executor(&self, executor: ExecutorAgent) -> StorageResult<ExecutorAgent> {
+        let mut state = self.write_state()?;
+        let index_key = (executor.tenant_id, executor.agent_key.clone());
+        if state.executors.contains_key(&executor.id)
+            || state.executor_key_index.contains_key(&index_key)
+        {
+            return Err(StorageError::Conflict);
+        }
+
+        state.executor_key_index.insert(index_key, executor.id);
+        state.executors.insert(executor.id, executor.clone());
+        Ok(executor)
+    }
+
+    fn update_executor(&self, executor: ExecutorAgent) -> StorageResult<ExecutorAgent> {
+        let mut state = self.write_state()?;
+        let stored = state
+            .executors
+            .get_mut(&executor.id)
+            .filter(|stored| stored.tenant_id == executor.tenant_id)
+            .ok_or(StorageError::NotFound)?;
+
+        *stored = executor.clone();
+        Ok(executor)
+    }
+
+    fn get_executor(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+    ) -> StorageResult<Option<ExecutorAgent>> {
+        Ok(self
+            .read_state()?
+            .executors
+            .get(&executor_id)
+            .filter(|executor| executor.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn list_executors(&self, tenant_id: Uuid) -> StorageResult<Vec<ExecutorAgent>> {
+        let mut executors = self
+            .read_state()?
+            .executors
+            .values()
+            .filter(|executor| executor.tenant_id == tenant_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        executors.sort_by(|left, right| left.agent_key.cmp(&right.agent_key));
+        Ok(executors)
+    }
+
+    fn put_executor_capabilities(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+        capabilities: Vec<ExecutorCapability>,
+    ) -> StorageResult<Vec<ExecutorCapability>> {
+        let mut state = self.write_state()?;
+        if !state
+            .executors
+            .get(&executor_id)
+            .map(|executor| executor.tenant_id == tenant_id)
+            .unwrap_or(false)
+        {
+            return Err(StorageError::NotFound);
+        }
+        state
+            .executor_capabilities
+            .insert((tenant_id, executor_id), capabilities.clone());
+        Ok(capabilities)
+    }
+
+    fn list_executor_capabilities(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+    ) -> StorageResult<Vec<ExecutorCapability>> {
+        let mut capabilities = self
+            .read_state()?
+            .executor_capabilities
+            .get(&(tenant_id, executor_id))
+            .cloned()
+            .unwrap_or_default();
+
+        capabilities.sort_by(|left, right| left.command_type.cmp(&right.command_type));
+        Ok(capabilities)
+    }
+
+    fn put_executor_scopes(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+        scopes: Vec<ExecutorScope>,
+    ) -> StorageResult<Vec<ExecutorScope>> {
+        let mut state = self.write_state()?;
+        if !state
+            .executors
+            .get(&executor_id)
+            .map(|executor| executor.tenant_id == tenant_id)
+            .unwrap_or(false)
+        {
+            return Err(StorageError::NotFound);
+        }
+        state
+            .executor_scopes
+            .insert((tenant_id, executor_id), scopes.clone());
+        Ok(scopes)
+    }
+
+    fn list_executor_scopes(
+        &self,
+        tenant_id: Uuid,
+        executor_id: Uuid,
+    ) -> StorageResult<Vec<ExecutorScope>> {
+        Ok(self
+            .read_state()?
+            .executor_scopes
+            .get(&(tenant_id, executor_id))
+            .cloned()
+            .unwrap_or_default())
     }
 }
 

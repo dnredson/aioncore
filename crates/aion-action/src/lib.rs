@@ -8,6 +8,8 @@ use uuid::Uuid;
 pub enum ActionModelError {
     EmptyCapabilityName,
     EmptyCommandType,
+    EmptyAgentKey,
+    EmptyAgentType,
     EmptyActionType,
     EmptyStatus,
     InvalidTransition(String),
@@ -18,6 +20,8 @@ impl fmt::Display for ActionModelError {
         match self {
             Self::EmptyCapabilityName => f.write_str("capability_name must not be empty"),
             Self::EmptyCommandType => f.write_str("command_type must not be empty"),
+            Self::EmptyAgentKey => f.write_str("agent_key must not be empty"),
+            Self::EmptyAgentType => f.write_str("agent_type must not be empty"),
             Self::EmptyActionType => f.write_str("action_type must not be empty"),
             Self::EmptyStatus => f.write_str("status must not be empty"),
             Self::InvalidTransition(message) => f.write_str(message),
@@ -44,6 +48,124 @@ pub enum ApprovalStatus {
     Required,
     Approved,
     Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorAgentStatus {
+    Online,
+    Offline,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutorAgent {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub agent_key: String,
+    pub agent_type: String,
+    pub display_name: Option<String>,
+    pub status: ExecutorAgentStatus,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ExecutorAgent {
+    pub fn new(
+        tenant_id: Uuid,
+        agent_key: impl Into<String>,
+        agent_type: impl Into<String>,
+        display_name: Option<String>,
+        status: ExecutorAgentStatus,
+        metadata: Option<Value>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, ActionModelError> {
+        let agent_key = agent_key.into();
+        let agent_type = agent_type.into();
+        if agent_key.trim().is_empty() {
+            return Err(ActionModelError::EmptyAgentKey);
+        }
+        if agent_type.trim().is_empty() {
+            return Err(ActionModelError::EmptyAgentType);
+        }
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            tenant_id,
+            agent_key,
+            agent_type,
+            display_name,
+            status,
+            last_seen_at: None,
+            metadata,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn heartbeat(&mut self, status: ExecutorAgentStatus, now: DateTime<Utc>) {
+        self.status = status;
+        self.last_seen_at = Some(now);
+        self.updated_at = now;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutorCapability {
+    pub agent_id: Uuid,
+    pub command_type: String,
+    pub protocol: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+impl ExecutorCapability {
+    pub fn new(
+        agent_id: Uuid,
+        command_type: impl Into<String>,
+        protocol: Option<String>,
+        metadata: Option<Value>,
+    ) -> Result<Self, ActionModelError> {
+        let command_type = command_type.into();
+        if command_type.trim().is_empty() {
+            return Err(ActionModelError::EmptyCommandType);
+        }
+
+        Ok(Self {
+            agent_id,
+            command_type,
+            protocol,
+            metadata,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutorScope {
+    pub agent_id: Uuid,
+    pub target_entity_id: Option<Uuid>,
+    pub entity_type: Option<String>,
+    pub relationship_type: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+impl ExecutorScope {
+    pub fn new(
+        agent_id: Uuid,
+        target_entity_id: Option<Uuid>,
+        entity_type: Option<String>,
+        relationship_type: Option<String>,
+        metadata: Option<Value>,
+    ) -> Self {
+        Self {
+            agent_id,
+            target_entity_id,
+            entity_type,
+            relationship_type,
+            metadata,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -502,5 +624,25 @@ mod tests {
     fn rejects_empty_capability_name() {
         let err = Capability::new(Uuid::new_v4(), " ", "StartPump", None, None).unwrap_err();
         assert_eq!(err, ActionModelError::EmptyCapabilityName);
+    }
+
+    #[test]
+    fn creates_executor_agent() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 28, 12, 0, 0).unwrap();
+        let agent = ExecutorAgent::new(
+            Uuid::new_v4(),
+            "edge-agent-01",
+            "edge",
+            Some("Edge Agent 01".to_string()),
+            ExecutorAgentStatus::Online,
+            Some(json!({"site": "building-01"})),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(agent.agent_key, "edge-agent-01");
+        assert_eq!(agent.status, ExecutorAgentStatus::Online);
+        assert_eq!(agent.created_at, now);
+        assert!(agent.last_seen_at.is_none());
     }
 }
