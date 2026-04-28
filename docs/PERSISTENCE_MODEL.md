@@ -5,8 +5,9 @@ AionCore currently runs on the in-memory storage implementation. The PostgreSQL 
 ## Current Runtime Boundary
 
 - `InMemoryStorage` remains the reference behavior for the local API.
+- `PostgresStorage` is introduced as an opt-in adapter skeleton, but it is not the default runtime backend.
 - Migrations define the durable schema contract only.
-- No SQLx adapter, connection pool, runtime database selection, or production persistence wiring is implemented in this milestone.
+- No runtime backend selection, connection pool wiring into the API, or production persistence switching is implemented in this milestone.
 - Docker or a running PostgreSQL instance is not required for the Rust test suite.
 
 ## Pluggable Storage Strategy
@@ -90,9 +91,21 @@ The durable target is PostgreSQL with TimescaleDB enabled. Migration `0001_creat
 
 Canonical observations remain TimescaleDB-compatible through the `observations` hypertable partitioned by `observed_at`.
 
-## Tables
+## Adapter Coverage
 
-The migration set covers the current in-memory domain models:
+The PostgreSQL adapter currently covers the control-plane subset needed for parity testing and future expansion:
+
+- `tenants`
+- `entities`
+- `entity_relationships`
+- `payload_profiles`
+- `capabilities`
+- `policies`
+- `executor_agents`
+- `executor_capabilities`
+- `executor_scopes`
+
+The migration set still covers the current in-memory domain models:
 
 - `tenants`
 - `entities`
@@ -109,6 +122,17 @@ The migration set covers the current in-memory domain models:
 - `executor_agents`
 - `executor_capabilities`
 - `executor_scopes`
+- `command_leases`
+- `rules`
+
+The remaining persistence areas are planned for later milestones:
+
+- `observations`
+- `raw_messages`
+- `events`
+- `commands`
+- `actions`
+- `action_results`
 - `command_leases`
 - `rules`
 
@@ -156,3 +180,16 @@ The future PostgreSQL repository adapter should preserve the same behavior as th
 - Keep SmartSentinel or any other domain pack optional.
 
 Runtime persistence, migrations execution strategy, connection configuration, and operational hardening are future work.
+
+## Optional PostgreSQL Tests
+
+PostgreSQL parity tests are opt-in and skip cleanly when `AIONCORE_TEST_DATABASE_URL` is not set.
+
+Run them with:
+
+```powershell
+$env:AIONCORE_TEST_DATABASE_URL = "postgres://user:password@localhost:5432/aioncore"
+cargo test -p aion-storage postgres_
+```
+
+The tests apply the embedded migrations before exercising the adapter. The database must have access to the required PostgreSQL and TimescaleDB extensions.

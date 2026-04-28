@@ -17,3 +17,4 @@ aion-observation.workspace = true
 aion-raw-message.workspace = true
 aion-relationship.workspace = true
 aion-rule.workspace = true
+postgres = { version = "0.19", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }

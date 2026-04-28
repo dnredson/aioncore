@@ -67,9 +67,22 @@ AionCore currently has a minimal Rust workspace, core domain models, SQL migrati
 
 The PostgreSQL and TimescaleDB migration foundation now covers the current in-memory models, including commands, actions, events, executor agents, command leases, and rules. Runtime persistence is not wired yet; the local API still uses in-memory storage.
 
+The PostgreSQL adapter is now available as an opt-in storage skeleton for control-plane tables, but the API runtime still defaults to memory.
+
 ## Run Locally Without Docker
 
 The early local runtime uses in-memory storage. It does not require Docker, PostgreSQL, TimescaleDB, NATS, or Mosquitto.
+
+## Optional PostgreSQL Adapter Tests
+
+Set `AIONCORE_TEST_DATABASE_URL` to a PostgreSQL database that has the required extensions available, then run the storage crate tests that target the adapter:
+
+```powershell
+$env:AIONCORE_TEST_DATABASE_URL = "postgres://user:password@localhost:5432/aioncore"
+cargo test -p aion-storage postgres_
+```
+
+If the environment variable is unset, the PostgreSQL adapter tests skip cleanly and the normal in-memory test suite still passes.
 
 Start the API:
 

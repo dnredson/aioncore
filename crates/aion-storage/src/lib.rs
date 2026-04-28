@@ -18,6 +18,10 @@ use std::{
 };
 use uuid::Uuid;
 
+mod postgres;
+
+pub use postgres::{PostgresStorage, PostgresStorageConfig};
+
 pub const MIGRATION_0001_CREATE_TENANTS: &str =
     include_str!("../../../migrations/0001_create_tenants.sql");
 pub const MIGRATION_0002_CREATE_ENTITIES: &str =
