@@ -93,6 +93,15 @@ cargo test -p aion-storage postgres_parity_observations
 cargo test -p aion-storage postgres_parity_events
 ```
 
+Lifecycle parity tests cover commands, actions, action results, leases, and rules:
+
+```powershell
+$env:AIONCORE_TEST_DATABASE_URL = "postgres://user:password@localhost:5432/aioncore"
+cargo test -p aion-storage postgres_parity_commands_actions_and_results
+cargo test -p aion-storage postgres_parity_command_leases
+cargo test -p aion-storage postgres_parity_rules
+```
+
 Start the API:
 
 ```text

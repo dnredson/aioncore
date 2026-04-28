@@ -2,10 +2,12 @@ use super::*;
 use ::postgres::error::SqlState;
 use ::postgres::types::{Json, ToSql};
 use ::postgres::{Client, Config as PgConfig, NoTls, Row};
-use aion_action::ExecutorAgentStatus;
+use aion_action::{ApprovalStatus, ExecutorAgentStatus};
 use aion_event::EventSeverity;
 use aion_observation::ObservationValue;
 use aion_raw_message::{NormalizationStatus, RawMessageSource};
+use aion_rule::RuleTriggerType;
+use serde::Serialize;
 use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -269,6 +271,205 @@ fn event_severity_from_db(severity: String) -> StorageResult<EventSeverity> {
             "unknown event severity in database: {other}"
         ))),
     }
+}
+
+fn json_serializable<T: Serialize>(value: &T) -> StorageResult<Json<Value>> {
+    serde_json::to_value(value)
+        .map(Json)
+        .map_err(|err| StorageError::Backend(format!("failed to serialize JSON value: {err}")))
+}
+
+fn command_status_to_db(status: &CommandStatus) -> &'static str {
+    match status {
+        CommandStatus::Pending => "pending",
+        CommandStatus::Claimed => "claimed",
+        CommandStatus::Executed => "executed",
+        CommandStatus::Failed => "failed",
+        CommandStatus::Cancelled => "cancelled",
+    }
+}
+
+fn command_status_from_db(status: String) -> StorageResult<CommandStatus> {
+    match status.as_str() {
+        "pending" => Ok(CommandStatus::Pending),
+        "claimed" => Ok(CommandStatus::Claimed),
+        "executed" => Ok(CommandStatus::Executed),
+        "failed" => Ok(CommandStatus::Failed),
+        "cancelled" => Ok(CommandStatus::Cancelled),
+        other => Err(StorageError::Backend(format!(
+            "unknown command status in database: {other}"
+        ))),
+    }
+}
+
+fn approval_status_to_db(status: &ApprovalStatus) -> &'static str {
+    match status {
+        ApprovalStatus::NotRequired => "not_required",
+        ApprovalStatus::Required => "required",
+        ApprovalStatus::Approved => "approved",
+        ApprovalStatus::Rejected => "rejected",
+    }
+}
+
+fn approval_status_from_db(status: String) -> StorageResult<ApprovalStatus> {
+    match status.as_str() {
+        "not_required" => Ok(ApprovalStatus::NotRequired),
+        "required" => Ok(ApprovalStatus::Required),
+        "approved" => Ok(ApprovalStatus::Approved),
+        "rejected" => Ok(ApprovalStatus::Rejected),
+        other => Err(StorageError::Backend(format!(
+            "unknown approval status in database: {other}"
+        ))),
+    }
+}
+
+fn command_lease_status_to_db(status: &CommandLeaseStatus) -> &'static str {
+    match status {
+        CommandLeaseStatus::Active => "active",
+        CommandLeaseStatus::Expired => "expired",
+        CommandLeaseStatus::Released => "released",
+        CommandLeaseStatus::Completed => "completed",
+        CommandLeaseStatus::Failed => "failed",
+    }
+}
+
+fn command_lease_status_from_db(status: String) -> StorageResult<CommandLeaseStatus> {
+    match status.as_str() {
+        "active" => Ok(CommandLeaseStatus::Active),
+        "expired" => Ok(CommandLeaseStatus::Expired),
+        "released" => Ok(CommandLeaseStatus::Released),
+        "completed" => Ok(CommandLeaseStatus::Completed),
+        "failed" => Ok(CommandLeaseStatus::Failed),
+        other => Err(StorageError::Backend(format!(
+            "unknown command lease status in database: {other}"
+        ))),
+    }
+}
+
+fn rule_trigger_type_to_db(trigger_type: &RuleTriggerType) -> &'static str {
+    match trigger_type {
+        RuleTriggerType::ObservationCreated => "observation_created",
+        RuleTriggerType::EventCreated => "event_created",
+        RuleTriggerType::Manual => "manual",
+    }
+}
+
+fn rule_trigger_type_from_db(trigger_type: String) -> StorageResult<RuleTriggerType> {
+    match trigger_type.as_str() {
+        "observation_created" => Ok(RuleTriggerType::ObservationCreated),
+        "event_created" => Ok(RuleTriggerType::EventCreated),
+        "manual" => Ok(RuleTriggerType::Manual),
+        other => Err(StorageError::Backend(format!(
+            "unknown rule trigger type in database: {other}"
+        ))),
+    }
+}
+
+fn row_to_command(row: Row) -> StorageResult<Command> {
+    Ok(Command {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        target_entity_id: row.get("target_entity_id"),
+        command_type: row.get("command_type"),
+        payload: row.get("payload"),
+        status: command_status_from_db(row.get::<_, String>("status"))?,
+        requested_by: row.get("requested_by"),
+        reason: row.get("reason"),
+        claimed_by: row.get("claimed_by"),
+        claimed_at: row.get("claimed_at"),
+        completed_at: row.get("completed_at"),
+        failure_reason: row.get("failure_reason"),
+        approval_status: row
+            .get::<_, Option<String>>("approval_status")
+            .map(approval_status_from_db)
+            .transpose()?,
+        policy_decision: row
+            .get::<_, Option<Json<Value>>>("policy_decision")
+            .map(|Json(value)| value),
+        retry_count: row.get::<_, i32>("retry_count") as u32,
+        max_retries: row
+            .get::<_, Option<i32>>("max_retries")
+            .map(|value| value as u32),
+        lease_expires_at: row.get("lease_expires_at"),
+        last_claimed_by: row.get("last_claimed_by"),
+        last_failure_reason: row.get("last_failure_reason"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_command_lease(row: Row) -> StorageResult<CommandLease> {
+    Ok(CommandLease {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        command_id: row.get("command_id"),
+        executor_id: row.get("executor_id"),
+        lease_status: command_lease_status_from_db(row.get::<_, String>("lease_status"))?,
+        claimed_at: row.get("claimed_at"),
+        expires_at: row.get("expires_at"),
+        released_at: row.get("released_at"),
+        completed_at: row.get("completed_at"),
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+    })
+}
+
+fn row_to_action(row: Row) -> Action {
+    Action {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        command_id: row.get("command_id"),
+        executor_entity_id: row.get("executor_entity_id"),
+        action_type: row.get("action_type"),
+        status: row.get("status"),
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+    }
+}
+
+fn row_to_action_result(row: Row) -> ActionResult {
+    ActionResult {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        command_id: row.get("command_id"),
+        action_id: row.get("action_id"),
+        status: row.get("status"),
+        verified: row.get("verified"),
+        result_payload: row.get("result_payload"),
+        observed_at: row.get("observed_at"),
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+    }
+}
+
+fn row_to_rule(row: Row) -> StorageResult<Rule> {
+    let Json(condition) = row.get::<_, Json<Value>>("condition");
+    let Json(action) = row.get::<_, Json<Value>>("action");
+    Ok(Rule {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        name: row.get("name"),
+        description: row.get("description"),
+        enabled: row.get("enabled"),
+        trigger_type: rule_trigger_type_from_db(row.get::<_, String>("trigger_type"))?,
+        target_entity_id: row.get("target_entity_id"),
+        observed_property: row.get("observed_property"),
+        event_type: row.get("event_type"),
+        condition: serde_json::from_value(condition)
+            .map_err(|err| StorageError::Backend(format!("invalid rule condition: {err}")))?,
+        action: serde_json::from_value(action)
+            .map_err(|err| StorageError::Backend(format!("invalid rule action: {err}")))?,
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
 }
 
 fn row_to_raw_message(row: Row) -> StorageResult<RawMessage> {
@@ -1085,6 +1286,640 @@ impl EventStore for PostgresStorage {
             let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
             rows.into_iter()
                 .map(row_to_event)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+}
+
+impl CommandStore for PostgresStorage {
+    fn store_command(&self, command: Command) -> StorageResult<Command> {
+        self.with_client(|client| {
+            let approval_status = command.approval_status.as_ref().map(approval_status_to_db);
+            let policy_decision = json_option_column(command.policy_decision.as_ref());
+            let retry_count = command.retry_count as i32;
+            let max_retries = command.max_retries.map(|value| value as i32);
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO commands (
+                        id,
+                        tenant_id,
+                        target_entity_id,
+                        command_type,
+                        payload,
+                        status,
+                        requested_by,
+                        reason,
+                        claimed_by,
+                        claimed_at,
+                        completed_at,
+                        failure_reason,
+                        approval_status,
+                        policy_decision,
+                        retry_count,
+                        max_retries,
+                        lease_expires_at,
+                        last_claimed_by,
+                        last_failure_reason,
+                        created_at,
+                        updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                    RETURNING id, tenant_id, target_entity_id, command_type, payload, status, requested_by, reason, claimed_by, claimed_at, completed_at, failure_reason, approval_status, policy_decision, retry_count, max_retries, lease_expires_at, last_claimed_by, last_failure_reason, created_at, updated_at
+                    ",
+                    &[
+                        &command.id,
+                        &command.tenant_id,
+                        &command.target_entity_id,
+                        &command.command_type,
+                        &command.payload,
+                        &command_status_to_db(&command.status),
+                        &command.requested_by,
+                        &command.reason,
+                        &command.claimed_by,
+                        &command.claimed_at,
+                        &command.completed_at,
+                        &command.failure_reason,
+                        &approval_status,
+                        &policy_decision,
+                        &retry_count,
+                        &max_retries,
+                        &command.lease_expires_at,
+                        &command.last_claimed_by,
+                        &command.last_failure_reason,
+                        &command.created_at,
+                        &command.updated_at,
+                    ],
+                )
+                .map_err(|err| if is_unique_violation(&err) { StorageError::Conflict } else { map_postgres_error(err) })?;
+            row_to_command(row)
+        })
+    }
+
+    fn update_command(&self, command: Command) -> StorageResult<Command> {
+        self.with_client(|client| {
+            let approval_status = command.approval_status.as_ref().map(approval_status_to_db);
+            let policy_decision = json_option_column(command.policy_decision.as_ref());
+            let retry_count = command.retry_count as i32;
+            let max_retries = command.max_retries.map(|value| value as i32);
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE commands
+                    SET target_entity_id = $3,
+                        command_type = $4,
+                        payload = $5,
+                        status = $6,
+                        requested_by = $7,
+                        reason = $8,
+                        claimed_by = $9,
+                        claimed_at = $10,
+                        completed_at = $11,
+                        failure_reason = $12,
+                        approval_status = $13,
+                        policy_decision = $14,
+                        retry_count = $15,
+                        max_retries = $16,
+                        lease_expires_at = $17,
+                        last_claimed_by = $18,
+                        last_failure_reason = $19,
+                        updated_at = $20
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING id, tenant_id, target_entity_id, command_type, payload, status, requested_by, reason, claimed_by, claimed_at, completed_at, failure_reason, approval_status, policy_decision, retry_count, max_retries, lease_expires_at, last_claimed_by, last_failure_reason, created_at, updated_at
+                    ",
+                    &[
+                        &command.tenant_id,
+                        &command.id,
+                        &command.target_entity_id,
+                        &command.command_type,
+                        &command.payload,
+                        &command_status_to_db(&command.status),
+                        &command.requested_by,
+                        &command.reason,
+                        &command.claimed_by,
+                        &command.claimed_at,
+                        &command.completed_at,
+                        &command.failure_reason,
+                        &approval_status,
+                        &policy_decision,
+                        &retry_count,
+                        &max_retries,
+                        &command.lease_expires_at,
+                        &command.last_claimed_by,
+                        &command.last_failure_reason,
+                        &command.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_command).transpose()?.ok_or(StorageError::NotFound)
+        })
+    }
+
+    fn get_command(&self, tenant_id: Uuid, command_id: Uuid) -> StorageResult<Option<Command>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, target_entity_id, command_type, payload, status, requested_by, reason, claimed_by, claimed_at, completed_at, failure_reason, approval_status, policy_decision, retry_count, max_retries, lease_expires_at, last_claimed_by, last_failure_reason, created_at, updated_at
+                    FROM commands
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &command_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_command(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn query_commands(
+        &self,
+        tenant_id: Uuid,
+        target_entity_id: Option<Uuid>,
+        status: Option<CommandStatus>,
+    ) -> StorageResult<Vec<Command>> {
+        self.with_client(|client| {
+            let mut sql = String::from(
+                "
+                SELECT id, tenant_id, target_entity_id, command_type, payload, status, requested_by, reason, claimed_by, claimed_at, completed_at, failure_reason, approval_status, policy_decision, retry_count, max_retries, lease_expires_at, last_claimed_by, last_failure_reason, created_at, updated_at
+                FROM commands
+                WHERE tenant_id = $1
+                ",
+            );
+            let target_entity_id = target_entity_id;
+            let status = status.map(|status| command_status_to_db(&status));
+            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&tenant_id];
+            let mut next_index = 2;
+
+            if let Some(target_entity_id) = target_entity_id.as_ref() {
+                sql.push_str(&format!(" AND target_entity_id = ${next_index}"));
+                params.push(target_entity_id);
+                next_index += 1;
+            }
+
+            if let Some(status) = status.as_ref() {
+                sql.push_str(&format!(" AND status = ${next_index}"));
+                params.push(status);
+            }
+
+            sql.push_str(" ORDER BY created_at DESC");
+            let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_command)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+}
+
+impl CommandLeaseStore for PostgresStorage {
+    fn store_command_lease(&self, lease: CommandLease) -> StorageResult<CommandLease> {
+        self.with_client(|client| {
+            let metadata = json_option_column(lease.metadata.as_ref());
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO command_leases (
+                        id,
+                        tenant_id,
+                        command_id,
+                        executor_id,
+                        lease_status,
+                        claimed_at,
+                        expires_at,
+                        released_at,
+                        completed_at,
+                        metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    RETURNING id, tenant_id, command_id, executor_id, lease_status, claimed_at, expires_at, released_at, completed_at, metadata
+                    ",
+                    &[
+                        &lease.id,
+                        &lease.tenant_id,
+                        &lease.command_id,
+                        &lease.executor_id,
+                        &command_lease_status_to_db(&lease.lease_status),
+                        &lease.claimed_at,
+                        &lease.expires_at,
+                        &lease.released_at,
+                        &lease.completed_at,
+                        &metadata,
+                    ],
+                )
+                .map_err(|err| if is_unique_violation(&err) { StorageError::Conflict } else { map_postgres_error(err) })?;
+            row_to_command_lease(row)
+        })
+    }
+
+    fn update_command_lease(&self, lease: CommandLease) -> StorageResult<CommandLease> {
+        self.with_client(|client| {
+            let metadata = json_option_column(lease.metadata.as_ref());
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE command_leases
+                    SET command_id = $3,
+                        executor_id = $4,
+                        lease_status = $5,
+                        claimed_at = $6,
+                        expires_at = $7,
+                        released_at = $8,
+                        completed_at = $9,
+                        metadata = $10
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING id, tenant_id, command_id, executor_id, lease_status, claimed_at, expires_at, released_at, completed_at, metadata
+                    ",
+                    &[
+                        &lease.tenant_id,
+                        &lease.id,
+                        &lease.command_id,
+                        &lease.executor_id,
+                        &command_lease_status_to_db(&lease.lease_status),
+                        &lease.claimed_at,
+                        &lease.expires_at,
+                        &lease.released_at,
+                        &lease.completed_at,
+                        &metadata,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_command_lease).transpose()?.ok_or(StorageError::NotFound)
+        })
+    }
+
+    fn get_command_lease(
+        &self,
+        tenant_id: Uuid,
+        lease_id: Uuid,
+    ) -> StorageResult<Option<CommandLease>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, command_id, executor_id, lease_status, claimed_at, expires_at, released_at, completed_at, metadata
+                    FROM command_leases
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &lease_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_command_lease(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn get_active_command_lease(
+        &self,
+        tenant_id: Uuid,
+        command_id: Uuid,
+    ) -> StorageResult<Option<CommandLease>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, command_id, executor_id, lease_status, claimed_at, expires_at, released_at, completed_at, metadata
+                    FROM command_leases
+                    WHERE tenant_id = $1 AND command_id = $2 AND lease_status = 'active'
+                    ORDER BY claimed_at DESC
+                    LIMIT 1
+                    ",
+                    &[&tenant_id, &command_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_command_lease(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn get_latest_command_lease(
+        &self,
+        tenant_id: Uuid,
+        command_id: Uuid,
+    ) -> StorageResult<Option<CommandLease>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, command_id, executor_id, lease_status, claimed_at, expires_at, released_at, completed_at, metadata
+                    FROM command_leases
+                    WHERE tenant_id = $1 AND command_id = $2
+                    ORDER BY claimed_at DESC
+                    LIMIT 1
+                    ",
+                    &[&tenant_id, &command_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_command_lease(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_active_command_leases(&self, tenant_id: Uuid) -> StorageResult<Vec<CommandLease>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, command_id, executor_id, lease_status, claimed_at, expires_at, released_at, completed_at, metadata
+                    FROM command_leases
+                    WHERE tenant_id = $1 AND lease_status = 'active'
+                    ORDER BY expires_at ASC
+                    ",
+                    &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_command_lease)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+}
+
+impl ActionStore for PostgresStorage {
+    fn store_action(&self, action: Action) -> StorageResult<Action> {
+        self.with_client(|client| {
+            let metadata = json_option_column(action.metadata.as_ref());
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO actions (
+                        id,
+                        tenant_id,
+                        command_id,
+                        executor_entity_id,
+                        action_type,
+                        status,
+                        started_at,
+                        finished_at,
+                        metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    RETURNING id, tenant_id, command_id, executor_entity_id, action_type, status, started_at, finished_at, metadata
+                    ",
+                    &[
+                        &action.id,
+                        &action.tenant_id,
+                        &action.command_id,
+                        &action.executor_entity_id,
+                        &action.action_type,
+                        &action.status,
+                        &action.started_at,
+                        &action.finished_at,
+                        &metadata,
+                    ],
+                )
+                .map_err(|err| if is_unique_violation(&err) { StorageError::Conflict } else { map_postgres_error(err) })?;
+            Ok(row_to_action(row))
+        })
+    }
+
+    fn get_action(&self, tenant_id: Uuid, action_id: Uuid) -> StorageResult<Option<Action>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, command_id, executor_entity_id, action_type, status, started_at, finished_at, metadata
+                    FROM actions
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &action_id],
+                )
+                .map_err(map_postgres_error)?;
+            Ok(row.map(row_to_action))
+        })
+    }
+
+    fn query_actions(
+        &self,
+        tenant_id: Uuid,
+        command_id: Option<Uuid>,
+    ) -> StorageResult<Vec<Action>> {
+        self.with_client(|client| {
+            let mut sql = String::from(
+                "
+                SELECT id, tenant_id, command_id, executor_entity_id, action_type, status, started_at, finished_at, metadata
+                FROM actions
+                WHERE tenant_id = $1
+                ",
+            );
+            let command_id = command_id;
+            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&tenant_id];
+            if let Some(command_id) = command_id.as_ref() {
+                sql.push_str(" AND command_id = $2");
+                params.push(command_id);
+            }
+            sql.push_str(" ORDER BY started_at ASC NULLS FIRST, id ASC");
+            let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            Ok(rows.into_iter().map(row_to_action).collect())
+        })
+    }
+}
+
+impl ActionResultStore for PostgresStorage {
+    fn store_action_result(&self, result: ActionResult) -> StorageResult<ActionResult> {
+        self.with_client(|client| {
+            let metadata = json_option_column(result.metadata.as_ref());
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO action_results (
+                        id,
+                        tenant_id,
+                        command_id,
+                        action_id,
+                        status,
+                        verified,
+                        result_payload,
+                        observed_at,
+                        metadata
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    RETURNING id, tenant_id, command_id, action_id, status, verified, result_payload, observed_at, metadata
+                    ",
+                    &[
+                        &result.id,
+                        &result.tenant_id,
+                        &result.command_id,
+                        &result.action_id,
+                        &result.status,
+                        &result.verified,
+                        &result.result_payload,
+                        &result.observed_at,
+                        &metadata,
+                    ],
+                )
+                .map_err(|err| if is_unique_violation(&err) { StorageError::Conflict } else { map_postgres_error(err) })?;
+            Ok(row_to_action_result(row))
+        })
+    }
+
+    fn query_action_results(
+        &self,
+        tenant_id: Uuid,
+        action_id: Option<Uuid>,
+        command_id: Option<Uuid>,
+    ) -> StorageResult<Vec<ActionResult>> {
+        self.with_client(|client| {
+            let mut sql = String::from(
+                "
+                SELECT id, tenant_id, command_id, action_id, status, verified, result_payload, observed_at, metadata
+                FROM action_results
+                WHERE tenant_id = $1
+                ",
+            );
+            let action_id = action_id;
+            let command_id = command_id;
+            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&tenant_id];
+            let mut next_index = 2;
+
+            if let Some(action_id) = action_id.as_ref() {
+                sql.push_str(&format!(" AND action_id = ${next_index}"));
+                params.push(action_id);
+                next_index += 1;
+            }
+
+            if let Some(command_id) = command_id.as_ref() {
+                sql.push_str(&format!(" AND command_id = ${next_index}"));
+                params.push(command_id);
+            }
+
+            sql.push_str(" ORDER BY observed_at DESC");
+            let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            Ok(rows.into_iter().map(row_to_action_result).collect())
+        })
+    }
+}
+
+impl RuleStore for PostgresStorage {
+    fn store_rule(&self, rule: Rule) -> StorageResult<Rule> {
+        self.with_client(|client| {
+            let condition = json_serializable(&rule.condition)?;
+            let action = json_serializable(&rule.action)?;
+            let metadata = json_option_column(rule.metadata.as_ref());
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO rules (
+                        id,
+                        tenant_id,
+                        name,
+                        description,
+                        enabled,
+                        trigger_type,
+                        target_entity_id,
+                        observed_property,
+                        event_type,
+                        condition,
+                        action,
+                        metadata,
+                        created_at,
+                        updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    RETURNING id, tenant_id, name, description, enabled, trigger_type, target_entity_id, observed_property, event_type, condition, action, metadata, created_at, updated_at
+                    ",
+                    &[
+                        &rule.id,
+                        &rule.tenant_id,
+                        &rule.name,
+                        &rule.description,
+                        &rule.enabled,
+                        &rule_trigger_type_to_db(&rule.trigger_type),
+                        &rule.target_entity_id,
+                        &rule.observed_property,
+                        &rule.event_type,
+                        &condition,
+                        &action,
+                        &metadata,
+                        &rule.created_at,
+                        &rule.updated_at,
+                    ],
+                )
+                .map_err(|err| if is_unique_violation(&err) { StorageError::Conflict } else { map_postgres_error(err) })?;
+            row_to_rule(row)
+        })
+    }
+
+    fn update_rule(&self, rule: Rule) -> StorageResult<Rule> {
+        self.with_client(|client| {
+            let condition = json_serializable(&rule.condition)?;
+            let action = json_serializable(&rule.action)?;
+            let metadata = json_option_column(rule.metadata.as_ref());
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE rules
+                    SET name = $3,
+                        description = $4,
+                        enabled = $5,
+                        trigger_type = $6,
+                        target_entity_id = $7,
+                        observed_property = $8,
+                        event_type = $9,
+                        condition = $10,
+                        action = $11,
+                        metadata = $12,
+                        updated_at = $13
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING id, tenant_id, name, description, enabled, trigger_type, target_entity_id, observed_property, event_type, condition, action, metadata, created_at, updated_at
+                    ",
+                    &[
+                        &rule.tenant_id,
+                        &rule.id,
+                        &rule.name,
+                        &rule.description,
+                        &rule.enabled,
+                        &rule_trigger_type_to_db(&rule.trigger_type),
+                        &rule.target_entity_id,
+                        &rule.observed_property,
+                        &rule.event_type,
+                        &condition,
+                        &action,
+                        &metadata,
+                        &rule.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_rule).transpose()?.ok_or(StorageError::NotFound)
+        })
+    }
+
+    fn get_rule(&self, tenant_id: Uuid, rule_id: Uuid) -> StorageResult<Option<Rule>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, name, description, enabled, trigger_type, target_entity_id, observed_property, event_type, condition, action, metadata, created_at, updated_at
+                    FROM rules
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &rule_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_rule(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_rules(&self, tenant_id: Uuid) -> StorageResult<Vec<Rule>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, name, description, enabled, trigger_type, target_entity_id, observed_property, event_type, condition, action, metadata, created_at, updated_at
+                    FROM rules
+                    WHERE tenant_id = $1
+                    ORDER BY created_at ASC
+                    ",
+                    &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_rule)
                 .collect::<StorageResult<Vec<_>>>()
         })
     }
@@ -2417,6 +3252,572 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(by_type, vec![event.clone()]);
+        }
+    }
+
+    fn build_command(
+        tenant_id: Uuid,
+        target_entity_id: Uuid,
+        command_type: &str,
+        approval_status: Option<ApprovalStatus>,
+        now: chrono::DateTime<Utc>,
+    ) -> Command {
+        let mut command = Command::new(
+            tenant_id,
+            target_entity_id,
+            command_type,
+            json!({"target_state": "on"}),
+            Some("operator".to_string()),
+            Some("rule generated".to_string()),
+            approval_status,
+            Some(json!({"source": "postgres"})),
+            now,
+        )
+        .expect("valid command");
+        command.created_at = now;
+        command.updated_at = now;
+        command
+    }
+
+    #[test]
+    fn postgres_parity_commands_actions_and_results() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let target = build_entity(tenant.id, &format!("{suffix}-target"), "aion:Pump");
+        let executor_entity =
+            build_entity(tenant.id, &format!("{suffix}-executor"), "aion:Controller");
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+        for store in [&in_memory as &dyn EntityStore, &pg as &dyn EntityStore] {
+            store.create_entity(target.clone()).expect("create target");
+            store
+                .create_entity(executor_entity.clone())
+                .expect("create executor entity");
+        }
+
+        let base = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let mut approved_command = build_command(
+            tenant.id,
+            target.id,
+            "StartPump",
+            Some(ApprovalStatus::Required),
+            base,
+        );
+        let mut claimed_command = build_command(
+            tenant.id,
+            target.id,
+            "ClaimPump",
+            Some(ApprovalStatus::NotRequired),
+            base + chrono::Duration::seconds(1),
+        );
+        let mut executed_command = build_command(
+            tenant.id,
+            target.id,
+            "ExecutePump",
+            Some(ApprovalStatus::NotRequired),
+            base + chrono::Duration::seconds(2),
+        );
+        let mut failed_command = build_command(
+            tenant.id,
+            target.id,
+            "FailPump",
+            Some(ApprovalStatus::NotRequired),
+            base + chrono::Duration::seconds(3),
+        );
+        let mut cancelled_command = build_command(
+            tenant.id,
+            target.id,
+            "CancelPump",
+            Some(ApprovalStatus::NotRequired),
+            base + chrono::Duration::seconds(4),
+        );
+        let mut retry_command = build_command(
+            tenant.id,
+            target.id,
+            "RetryPump",
+            Some(ApprovalStatus::NotRequired),
+            base + chrono::Duration::seconds(5),
+        );
+        retry_command.max_retries = Some(3);
+
+        for store in [&in_memory as &dyn CommandStore, &pg as &dyn CommandStore] {
+            assert_eq!(
+                store.store_command(approved_command.clone()).unwrap(),
+                approved_command
+            );
+            assert_eq!(
+                store.store_command(claimed_command.clone()).unwrap(),
+                claimed_command
+            );
+            assert_eq!(
+                store.store_command(executed_command.clone()).unwrap(),
+                executed_command
+            );
+            assert_eq!(
+                store.store_command(failed_command.clone()).unwrap(),
+                failed_command
+            );
+            assert_eq!(
+                store.store_command(cancelled_command.clone()).unwrap(),
+                cancelled_command
+            );
+            assert_eq!(
+                store.store_command(retry_command.clone()).unwrap(),
+                retry_command
+            );
+
+            let listed = store
+                .query_commands(tenant.id, Some(target.id), None)
+                .expect("query commands by target");
+            assert_eq!(
+                listed.iter().map(|command| command.id).collect::<Vec<_>>(),
+                vec![
+                    retry_command.id,
+                    cancelled_command.id,
+                    failed_command.id,
+                    executed_command.id,
+                    claimed_command.id,
+                    approved_command.id,
+                ]
+            );
+
+            let mut updated = approved_command.clone();
+            updated
+                .approve(base + chrono::Duration::seconds(10))
+                .unwrap();
+            assert_eq!(store.update_command(updated.clone()).unwrap(), updated);
+            approved_command = updated;
+
+            let mut updated = claimed_command.clone();
+            updated
+                .claim("edge-agent-01", base + chrono::Duration::seconds(11))
+                .unwrap();
+            updated.set_lease_expires_at(
+                Some(base + chrono::Duration::seconds(71)),
+                base + chrono::Duration::seconds(11),
+            );
+            assert_eq!(store.update_command(updated.clone()).unwrap(), updated);
+            claimed_command = updated;
+
+            let mut updated = executed_command.clone();
+            updated
+                .claim("edge-agent-01", base + chrono::Duration::seconds(12))
+                .unwrap();
+            updated.set_lease_expires_at(
+                Some(base + chrono::Duration::seconds(72)),
+                base + chrono::Duration::seconds(12),
+            );
+            updated
+                .mark_executed(base + chrono::Duration::seconds(13))
+                .unwrap();
+            assert_eq!(store.update_command(updated.clone()).unwrap(), updated);
+            executed_command = updated;
+
+            let mut updated = failed_command.clone();
+            updated
+                .claim("edge-agent-01", base + chrono::Duration::seconds(14))
+                .unwrap();
+            updated.set_lease_expires_at(
+                Some(base + chrono::Duration::seconds(74)),
+                base + chrono::Duration::seconds(14),
+            );
+            updated
+                .mark_failed("pump jammed", base + chrono::Duration::seconds(15))
+                .unwrap();
+            assert_eq!(store.update_command(updated.clone()).unwrap(), updated);
+            failed_command = updated;
+
+            let mut updated = cancelled_command.clone();
+            updated
+                .cancel(base + chrono::Duration::seconds(16))
+                .unwrap();
+            assert_eq!(store.update_command(updated.clone()).unwrap(), updated);
+            cancelled_command = updated;
+
+            let mut updated = retry_command.clone();
+            updated
+                .claim("edge-agent-01", base + chrono::Duration::seconds(17))
+                .unwrap();
+            updated.set_lease_expires_at(
+                Some(base + chrono::Duration::seconds(77)),
+                base + chrono::Duration::seconds(17),
+            );
+            updated.schedule_retry(base + chrono::Duration::seconds(18));
+            updated.set_lease_expires_at(
+                Some(base + chrono::Duration::seconds(78)),
+                base + chrono::Duration::seconds(18),
+            );
+            assert_eq!(store.update_command(updated.clone()).unwrap(), updated);
+            retry_command = updated;
+
+            assert_eq!(
+                store
+                    .get_command(tenant.id, approved_command.id)
+                    .unwrap()
+                    .unwrap(),
+                approved_command
+            );
+            assert_eq!(
+                store
+                    .get_command(tenant.id, claimed_command.id)
+                    .unwrap()
+                    .unwrap(),
+                claimed_command
+            );
+            assert_eq!(
+                store
+                    .get_command(tenant.id, executed_command.id)
+                    .unwrap()
+                    .unwrap(),
+                executed_command
+            );
+            assert_eq!(
+                store
+                    .get_command(tenant.id, failed_command.id)
+                    .unwrap()
+                    .unwrap(),
+                failed_command
+            );
+            assert_eq!(
+                store
+                    .get_command(tenant.id, cancelled_command.id)
+                    .unwrap()
+                    .unwrap(),
+                cancelled_command
+            );
+            assert_eq!(
+                store
+                    .get_command(tenant.id, retry_command.id)
+                    .unwrap()
+                    .unwrap(),
+                retry_command
+            );
+
+            assert_eq!(
+                store
+                    .query_commands(tenant.id, Some(target.id), Some(CommandStatus::Pending))
+                    .unwrap()
+                    .iter()
+                    .map(|command| command.id)
+                    .collect::<Vec<_>>(),
+                vec![retry_command.id, approved_command.id]
+            );
+            assert_eq!(
+                store
+                    .query_commands(tenant.id, Some(target.id), Some(CommandStatus::Claimed))
+                    .unwrap()
+                    .iter()
+                    .map(|command| command.id)
+                    .collect::<Vec<_>>(),
+                vec![claimed_command.id]
+            );
+            assert_eq!(
+                store
+                    .query_commands(tenant.id, Some(target.id), Some(CommandStatus::Executed))
+                    .unwrap()
+                    .iter()
+                    .map(|command| command.id)
+                    .collect::<Vec<_>>(),
+                vec![executed_command.id]
+            );
+            assert_eq!(
+                store
+                    .query_commands(tenant.id, Some(target.id), Some(CommandStatus::Failed))
+                    .unwrap()
+                    .iter()
+                    .map(|command| command.id)
+                    .collect::<Vec<_>>(),
+                vec![failed_command.id]
+            );
+            assert_eq!(
+                store
+                    .query_commands(tenant.id, Some(target.id), Some(CommandStatus::Cancelled))
+                    .unwrap()
+                    .iter()
+                    .map(|command| command.id)
+                    .collect::<Vec<_>>(),
+                vec![cancelled_command.id]
+            );
+
+            let action = Action::new(
+                tenant.id,
+                executed_command.id,
+                Some(executor_entity.id),
+                "StartPump",
+                "started",
+                Some(base + chrono::Duration::seconds(12)),
+                None,
+                Some(json!({"source": "postgres"})),
+            )
+            .expect("valid action");
+            for store in [&in_memory as &dyn ActionStore, &pg as &dyn ActionStore] {
+                assert_eq!(store.store_action(action.clone()).unwrap(), action);
+                assert_eq!(
+                    store.get_action(tenant.id, action.id).unwrap().unwrap(),
+                    action
+                );
+                assert_eq!(
+                    store
+                        .query_actions(tenant.id, Some(executed_command.id))
+                        .unwrap(),
+                    vec![action.clone()]
+                );
+            }
+
+            let result = ActionResult::new(
+                tenant.id,
+                executed_command.id,
+                action.id,
+                "succeeded",
+                true,
+                json!({"pump_state": "running"}),
+                base + chrono::Duration::seconds(13),
+                Some(json!({"source": "postgres"})),
+            )
+            .expect("valid action result");
+            for store in [
+                &in_memory as &dyn ActionResultStore,
+                &pg as &dyn ActionResultStore,
+            ] {
+                assert_eq!(store.store_action_result(result.clone()).unwrap(), result);
+                assert_eq!(
+                    store
+                        .query_action_results(tenant.id, Some(action.id), None)
+                        .unwrap(),
+                    vec![result.clone()]
+                );
+                assert_eq!(
+                    store
+                        .query_action_results(tenant.id, None, Some(executed_command.id))
+                        .unwrap(),
+                    vec![result.clone()]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn postgres_parity_command_leases() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let command_target = build_entity(tenant.id, &format!("{suffix}-target"), "aion:Pump");
+        let executor_entity =
+            build_entity(tenant.id, &format!("{suffix}-executor"), "aion:Controller");
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+        for store in [&in_memory as &dyn EntityStore, &pg as &dyn EntityStore] {
+            store
+                .create_entity(command_target.clone())
+                .expect("create target");
+            store
+                .create_entity(executor_entity.clone())
+                .expect("create executor entity");
+        }
+
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let command = build_command(
+            tenant.id,
+            command_target.id,
+            "StartPump",
+            Some(ApprovalStatus::Approved),
+            now,
+        );
+        let lease = CommandLease::new(
+            tenant.id,
+            command.id,
+            executor_entity.id,
+            now,
+            now + chrono::Duration::seconds(60),
+            Some(json!({"source": "postgres"})),
+        )
+        .expect("valid lease");
+
+        for store in [
+            &in_memory as &dyn CommandLeaseStore,
+            &pg as &dyn CommandLeaseStore,
+        ] {
+            assert_eq!(store.store_command_lease(lease.clone()).unwrap(), lease);
+            assert_eq!(
+                store
+                    .get_command_lease(tenant.id, lease.id)
+                    .unwrap()
+                    .unwrap(),
+                lease
+            );
+            assert_eq!(
+                store
+                    .get_active_command_lease(tenant.id, command.id)
+                    .unwrap()
+                    .unwrap(),
+                lease
+            );
+            assert_eq!(
+                store.list_active_command_leases(tenant.id).unwrap(),
+                vec![lease.clone()]
+            );
+
+            let mut refreshed = lease.clone();
+            refreshed
+                .refresh(
+                    now + chrono::Duration::seconds(90),
+                    now + chrono::Duration::seconds(15),
+                )
+                .expect("refresh lease");
+            assert_eq!(
+                store.update_command_lease(refreshed.clone()).unwrap(),
+                refreshed
+            );
+            assert_eq!(
+                store
+                    .get_latest_command_lease(tenant.id, command.id)
+                    .unwrap()
+                    .unwrap(),
+                refreshed
+            );
+
+            let mut released = refreshed.clone();
+            released.mark_released(now + chrono::Duration::seconds(20));
+            assert_eq!(
+                store.update_command_lease(released.clone()).unwrap(),
+                released
+            );
+            assert!(store
+                .get_active_command_lease(tenant.id, command.id)
+                .unwrap()
+                .is_none());
+            assert!(store
+                .list_active_command_leases(tenant.id)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                store
+                    .get_latest_command_lease(tenant.id, command.id)
+                    .unwrap()
+                    .unwrap(),
+                released
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_parity_rules() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let target = build_entity(tenant.id, &format!("{suffix}-target"), "aion:Pump");
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+        for store in [&in_memory as &dyn EntityStore, &pg as &dyn EntityStore] {
+            store.create_entity(target.clone()).expect("create target");
+        }
+
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let mut observation_rule = Rule::new(
+            tenant.id,
+            "Low water",
+            Some("trigger irrigation".to_string()),
+            true,
+            RuleTriggerType::ObservationCreated,
+            Some(target.id),
+            Some("WaterTankLevel".to_string()),
+            None,
+            aion_rule::RuleCondition {
+                comparison: aion_rule::RuleComparison::LessThan,
+                value: json!(20),
+            },
+            aion_rule::RuleAction::CreateCommand {
+                target_entity_id: target.id,
+                command_type: "StartPump".to_string(),
+                payload: json!({"target_state": "on"}),
+                requested_by: Some("rule-engine".to_string()),
+                reason: Some("water level low".to_string()),
+                metadata: Some(json!({"suite": "postgres"})),
+            },
+            Some(json!({"source": "postgres"})),
+            now,
+        )
+        .expect("valid observation rule");
+        let mut event_rule = Rule::new(
+            tenant.id,
+            "Pump fault",
+            None,
+            true,
+            RuleTriggerType::EventCreated,
+            Some(target.id),
+            None,
+            Some("aion:PumpFault".to_string()),
+            aion_rule::RuleCondition {
+                comparison: aion_rule::RuleComparison::Equals,
+                value: json!("critical"),
+            },
+            aion_rule::RuleAction::CreateEvent {
+                event_type: "aion:PumpInspectionRequested".to_string(),
+                severity: EventSeverity::Warning,
+                source_entity_id: Some(target.id),
+                target_entity_id: Some(target.id),
+                message: Some("inspect pump".to_string()),
+                metadata: Some(json!({"suite": "postgres"})),
+            },
+            Some(json!({"source": "postgres"})),
+            now + chrono::Duration::seconds(1),
+        )
+        .expect("valid event rule");
+        observation_rule.created_at = now;
+        observation_rule.updated_at = now;
+        event_rule.created_at = now + chrono::Duration::seconds(1);
+        event_rule.updated_at = now + chrono::Duration::seconds(1);
+
+        for store in [&in_memory as &dyn RuleStore, &pg as &dyn RuleStore] {
+            assert_eq!(
+                store.store_rule(observation_rule.clone()).unwrap(),
+                observation_rule
+            );
+            assert_eq!(store.store_rule(event_rule.clone()).unwrap(), event_rule);
+            assert_eq!(
+                store
+                    .get_rule(tenant.id, observation_rule.id)
+                    .unwrap()
+                    .unwrap(),
+                observation_rule
+            );
+            assert_eq!(
+                store.get_rule(tenant.id, event_rule.id).unwrap().unwrap(),
+                event_rule
+            );
+
+            let listed = store.list_rules(tenant.id).unwrap();
+            assert_eq!(
+                listed.iter().map(|rule| rule.id).collect::<Vec<_>>(),
+                vec![observation_rule.id, event_rule.id]
+            );
+
+            let mut disabled = observation_rule.clone();
+            disabled.set_enabled(false, now + chrono::Duration::seconds(5));
+            assert_eq!(store.update_rule(disabled.clone()).unwrap(), disabled);
+            assert!(
+                !store
+                    .get_rule(tenant.id, observation_rule.id)
+                    .unwrap()
+                    .unwrap()
+                    .enabled
+            );
         }
     }
 }

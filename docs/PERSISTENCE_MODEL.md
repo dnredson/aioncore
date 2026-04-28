@@ -104,6 +104,11 @@ The PostgreSQL adapter currently covers the control-plane subset needed for pari
 - `executor_agents`
 - `executor_capabilities`
 - `executor_scopes`
+- `commands`
+- `actions`
+- `action_results`
+- `command_leases`
+- `rules`
 
 The PostgreSQL adapter now also covers the telemetry-oriented core tables:
 
@@ -133,11 +138,7 @@ The migration set still covers the current in-memory domain models:
 
 Remaining adapter areas are planned for later milestones:
 
-- `commands`
-- `actions`
-- `action_results`
-- `command_leases`
-- `rules`
+- none for the current command and rule lifecycle scope
 
 ## JSONB Fields
 
@@ -194,6 +195,8 @@ Run them with:
 $env:AIONCORE_TEST_DATABASE_URL = "postgres://user:password@localhost:5432/aioncore"
 cargo test -p aion-storage postgres_
 ```
+
+Lifecycle parity coverage includes command create/query/update behavior, action and action result storage, command lease persistence, and rule create/list/enable/disable behavior.
 
 The tests apply the embedded migrations before exercising the adapter. The database must have access to the required PostgreSQL and TimescaleDB extensions.
 
