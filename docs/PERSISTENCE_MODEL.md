@@ -9,6 +9,78 @@ AionCore currently runs on the in-memory storage implementation. The PostgreSQL 
 - No SQLx adapter, connection pool, runtime database selection, or production persistence wiring is implemented in this milestone.
 - Docker or a running PostgreSQL instance is not required for the Rust test suite.
 
+## Pluggable Storage Strategy
+
+AionCore storage must remain backend-pluggable. Core API handlers and domain crates should depend on repository traits and logical storage boundaries, not directly on a database driver, SQL dialect, or NoSQL client.
+
+The intended deployment profiles are:
+
+- Lightweight/local deployments: in-memory or a single general-purpose durable backend.
+- Research and lab deployments: simple all-in-one runtime with deterministic behavior and inspectable data.
+- Production deployments: PostgreSQL/TimescaleDB as the default durable reference backend.
+- High-throughput horizontally scalable deployments: split telemetry/event-heavy storage to an optional backend such as Cassandra while keeping control-plane state in a strongly consistent store.
+
+Backend selection is future work. The current code keeps `InMemoryStorage` as the runtime implementation and test reference.
+
+## Logical Store Boundaries
+
+The Rust storage crate exposes model-specific traits and lightweight aggregate boundaries:
+
+- `ControlPlaneStore`
+- `TelemetryStore`
+- `RawMessageStore`
+- `EventStore`
+- `CommandStore`
+- `RuleStore`
+- `ExecutorStore`
+- `PolicyStore`
+- `AiContextStore`
+
+`ControlPlaneStore` groups state that benefits from strong consistency, relational constraints, and clear tenant scoping. `TelemetryStore` groups append-heavy time-series, raw ingestion, and event streams. `AiContextStore` represents the read model needed to assemble semantic context from entities, relationships, observations, events, commands, actions, and action results.
+
+These boundaries are intentionally logical. A single backend can implement all of them, or different backends can implement different boundaries later.
+
+## Data Orientation
+
+Control-plane oriented data:
+
+- Tenants
+- Entities
+- Relationships
+- Payload profiles
+- Capabilities
+- Policies
+- Commands
+- Actions
+- Action results
+- Rules
+- Executor agents
+- Executor capabilities
+- Executor scopes
+- Command leases
+
+Telemetry/event oriented data:
+
+- Observations
+- Raw messages
+- Events
+- High-frequency operational metrics
+- Future SmartSentinel snapshots or derived metrics
+
+Some data can appear in both views. For example, events are telemetry/event oriented because they are append-heavy, but they also feed AI context and audit workflows. Commands are control-plane oriented because they need lifecycle constraints, approval gates, executor leases, and policy behavior.
+
+## Backend Roles
+
+Recommended backend roles:
+
+- `InMemoryStorage`: development, unit tests, integration tests, examples, and reference behavior.
+- PostgreSQL/TimescaleDB: first durable reference backend and default for general-purpose deployments.
+- Cassandra or another wide-column NoSQL backend: optional future backend for high-throughput observations, raw messages, events, and telemetry-heavy workloads.
+- Object storage such as S3 or MinIO: optional future backend for large raw payloads, binary attachments, or long-retention archives.
+- Search/index backend such as OpenSearch: optional future backend for text search, log search, and operational investigation.
+
+PostgreSQL/TimescaleDB remains the first durable target because it can cover both control-plane and time-series needs in one operationally simple backend. Cassandra should not be introduced as a hard dependency; it should be an optional adapter for deployments whose write volume or retention model justifies it.
+
 ## Database Platform
 
 The durable target is PostgreSQL with TimescaleDB enabled. Migration `0001_create_tenants.sql` enables:

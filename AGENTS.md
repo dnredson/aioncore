@@ -14,6 +14,10 @@ AionCore is an open-source, AI-native IoT platform that combines JSON-LD domain 
 - The platform must support multiple payload decoders, including SenML JSON, UltraLight, JSON mapping, and future formats.
 - The architecture should support both all-in-one deployment and distributed microservices.
 - The platform must be ready for MCP/LLM integration, but LLMs must not directly execute critical actions by default.
+- Storage backends must remain pluggable; core APIs and domain crates must not depend directly on a specific database.
+- InMemoryStorage remains the reference behavior for tests and local development.
+- PostgreSQL/TimescaleDB is the first durable reference backend.
+- Cassandra or another wide-column backend is a future optional adapter for high-throughput telemetry and event workloads.
 
 ## Initial modules
 - context: JSON-LD entities and relationships.

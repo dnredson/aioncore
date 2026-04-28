@@ -329,6 +329,64 @@ pub trait RuleStore {
     fn list_rules(&self, tenant_id: Uuid) -> StorageResult<Vec<Rule>>;
 }
 
+pub trait ControlPlaneStore:
+    TenantStore
+    + EntityStore
+    + RelationshipStore
+    + PayloadProfileStore
+    + CapabilityStore
+    + PolicyStore
+    + CommandStore
+    + CommandLeaseStore
+    + ActionStore
+    + ActionResultStore
+    + RuleStore
+    + ExecutorStore
+{
+}
+
+impl<T> ControlPlaneStore for T where
+    T: TenantStore
+        + EntityStore
+        + RelationshipStore
+        + PayloadProfileStore
+        + CapabilityStore
+        + PolicyStore
+        + CommandStore
+        + CommandLeaseStore
+        + ActionStore
+        + ActionResultStore
+        + RuleStore
+        + ExecutorStore
+{
+}
+
+pub trait TelemetryStore: ObservationStore + RawMessageStore + EventStore {}
+
+impl<T> TelemetryStore for T where T: ObservationStore + RawMessageStore + EventStore {}
+
+pub trait AiContextStore:
+    EntityStore
+    + RelationshipStore
+    + ObservationStore
+    + EventStore
+    + CommandStore
+    + ActionStore
+    + ActionResultStore
+{
+}
+
+impl<T> AiContextStore for T where
+    T: EntityStore
+        + RelationshipStore
+        + ObservationStore
+        + EventStore
+        + CommandStore
+        + ActionStore
+        + ActionResultStore
+{
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStorage {
     inner: Arc<RwLock<InMemoryState>>,
@@ -1357,6 +1415,17 @@ mod tests {
                 "migration does not end with semicolon: {name}"
             );
         }
+    }
+
+    #[test]
+    fn in_memory_storage_satisfies_logical_store_boundaries() {
+        fn assert_control_plane<T: ControlPlaneStore>() {}
+        fn assert_telemetry<T: TelemetryStore>() {}
+        fn assert_ai_context<T: AiContextStore>() {}
+
+        assert_control_plane::<InMemoryStorage>();
+        assert_telemetry::<InMemoryStorage>();
+        assert_ai_context::<InMemoryStorage>();
     }
 
     #[test]
