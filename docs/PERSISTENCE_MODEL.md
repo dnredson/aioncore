@@ -5,9 +5,10 @@ AionCore currently runs on the in-memory storage implementation. The PostgreSQL 
 ## Current Runtime Boundary
 
 - `InMemoryStorage` remains the reference behavior for the local API.
-- `PostgresStorage` is introduced as an opt-in adapter skeleton, but it is not the default runtime backend.
+- Runtime storage backend selection is available.
+- `InMemoryStorage` remains the default runtime backend and the reference behavior for the local API.
+- `PostgresStorage` is introduced as an opt-in backend, but it is not the default runtime backend.
 - Migrations define the durable schema contract only.
-- No runtime backend selection, connection pool wiring into the API, or production persistence switching is implemented in this milestone.
 - Docker or a running PostgreSQL instance is not required for the Rust test suite.
 
 ## Pluggable Storage Strategy

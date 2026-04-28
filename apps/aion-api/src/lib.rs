@@ -14,9 +14,8 @@ use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_rule::{Rule, RuleAction, RuleCondition, RuleEvaluationResult, RuleTriggerType};
 use aion_storage::{
-    ActionResultStore, ActionStore, CapabilityStore, CommandLeaseStore, CommandStore, EntityStore,
-    EventFilter, EventStore, ExecutorStore, InMemoryStorage, ObservationStore, PayloadProfile,
-    PayloadProfileStore, PolicyStore, RawMessageStore, RelationshipStore, RuleStore, StorageError,
+    EventFilter, InMemoryStorage, PayloadProfile, PostgresStorage, PostgresStorageConfig,
+    StorageBackend, StorageError,
 };
 use axum::{
     body::Bytes,
@@ -29,25 +28,163 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::str::FromStr;
+use std::{env, str::FromStr, sync::Arc};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageBackendName {
+    Memory,
+    Postgres,
+}
+
+impl StorageBackendName {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageBackendConfig {
+    Memory,
+    Postgres { database_url: String },
+}
+
+impl StorageBackendConfig {
+    pub fn from_env() -> Result<Self, StartupError> {
+        Self::from_env_vars(
+            env::var("AIONCORE_STORAGE_BACKEND").ok(),
+            env::var("AIONCORE_DATABASE_URL").ok(),
+        )
+    }
+
+    pub fn from_env_vars(
+        backend: Option<String>,
+        database_url: Option<String>,
+    ) -> Result<Self, StartupError> {
+        match backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            None => Ok(Self::Memory),
+            Some("memory") => Ok(Self::Memory),
+            Some("postgres") => {
+                let database_url = database_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(StartupError::missing_database_url)?;
+                Ok(Self::Postgres { database_url })
+            }
+            Some(other) => Err(StartupError::unknown_backend(other.to_string())),
+        }
+    }
+
+    pub fn backend_name(&self) -> StorageBackendName {
+        match self {
+            Self::Memory => StorageBackendName::Memory,
+            Self::Postgres { .. } => StorageBackendName::Postgres,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupError {
+    message: String,
+}
+
+impl StartupError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    fn unknown_backend(value: String) -> Self {
+        Self::new(format!(
+            "unknown AIONCORE_STORAGE_BACKEND value '{value}'; expected memory or postgres"
+        ))
+    }
+
+    fn missing_database_url() -> Self {
+        Self::new("AIONCORE_DATABASE_URL is required when AIONCORE_STORAGE_BACKEND=postgres")
+    }
+
+    fn backend_initialization(message: impl Into<String>) -> Self {
+        Self::new(message)
+    }
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StartupError {}
 
 #[derive(Debug, Clone)]
 pub struct AppState {
-    storage: InMemoryStorage,
+    storage: Arc<dyn StorageBackend>,
+    storage_backend: StorageBackendName,
     tenant_id: Uuid,
 }
 
 impl AppState {
     pub fn local() -> Self {
-        Self {
-            storage: InMemoryStorage::new(),
-            tenant_id: Uuid::nil(),
-        }
+        Self::with_backend_storage(
+            Arc::new(InMemoryStorage::new()),
+            StorageBackendName::Memory,
+            Uuid::nil(),
+        )
     }
 
     pub fn with_storage(storage: InMemoryStorage, tenant_id: Uuid) -> Self {
-        Self { storage, tenant_id }
+        Self::with_backend_storage(Arc::new(storage), StorageBackendName::Memory, tenant_id)
+    }
+
+    pub fn with_backend_storage(
+        storage: Arc<dyn StorageBackend>,
+        storage_backend: StorageBackendName,
+        tenant_id: Uuid,
+    ) -> Self {
+        Self {
+            storage,
+            storage_backend,
+            tenant_id,
+        }
+    }
+
+    pub fn from_config(config: StorageBackendConfig) -> Result<Self, StartupError> {
+        match config {
+            StorageBackendConfig::Memory => Ok(Self::local()),
+            StorageBackendConfig::Postgres { database_url } => {
+                let storage = PostgresStorage::connect(PostgresStorageConfig::new(database_url))
+                    .map_err(|err| {
+                        StartupError::backend_initialization(format!(
+                            "failed to initialize postgres storage: {err}"
+                        ))
+                    })?;
+                storage.run_embedded_migrations().map_err(|err| {
+                    StartupError::backend_initialization(format!(
+                        "failed to initialize postgres storage: {err}"
+                    ))
+                })?;
+                Ok(Self::with_backend_storage(
+                    Arc::new(storage),
+                    StorageBackendName::Postgres,
+                    Uuid::nil(),
+                ))
+            }
+        }
+    }
+
+    pub fn from_env() -> Result<Self, StartupError> {
+        Self::from_config(StorageBackendConfig::from_env()?)
     }
 }
 
@@ -432,6 +569,10 @@ pub fn app() -> Router {
     app_with_state(AppState::local())
 }
 
+pub fn app_from_env() -> Result<Router, StartupError> {
+    Ok(app_with_state(AppState::from_env()?))
+}
+
 pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -530,11 +671,11 @@ pub fn app_with_state(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "aion-api",
-        storage: "memory",
+        storage: state.storage_backend.as_str(),
     })
 }
 
@@ -3890,6 +4031,67 @@ mod tests {
         let body = to_json(response).await;
         assert_eq!(body["status"], "ok");
         assert_eq!(body["storage"], "memory");
+    }
+
+    #[test]
+    fn storage_backend_config_defaults_to_memory() {
+        assert_eq!(
+            StorageBackendConfig::from_env_vars(None, None).unwrap(),
+            StorageBackendConfig::Memory
+        );
+    }
+
+    #[test]
+    fn storage_backend_config_accepts_explicit_memory() {
+        assert_eq!(
+            StorageBackendConfig::from_env_vars(Some("memory".to_string()), None).unwrap(),
+            StorageBackendConfig::Memory
+        );
+    }
+
+    #[test]
+    fn storage_backend_config_requires_database_url_for_postgres() {
+        let error = StorageBackendConfig::from_env_vars(Some("postgres".to_string()), None)
+            .expect_err("postgres should require a database URL");
+        assert!(error.to_string().contains("AIONCORE_DATABASE_URL"));
+    }
+
+    #[test]
+    fn storage_backend_config_rejects_unknown_backend() {
+        let error = StorageBackendConfig::from_env_vars(Some("sqlite".to_string()), None)
+            .expect_err("unknown backend should fail");
+        assert!(error
+            .to_string()
+            .contains("unknown AIONCORE_STORAGE_BACKEND"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_runtime_backend_reports_postgres_storage_when_configured() {
+        let Some(database_url) = std::env::var("AIONCORE_TEST_DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+
+        let state = AppState::from_config(StorageBackendConfig::Postgres { database_url })
+            .expect("postgres state should initialize");
+        let app = app_with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body["storage"], "postgres");
     }
 
     #[tokio::test]

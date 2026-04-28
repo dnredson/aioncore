@@ -398,6 +398,16 @@ impl<T> AiContextStore for T where
 {
 }
 
+pub trait StorageBackend:
+    ControlPlaneStore + TelemetryStore + AiContextStore + fmt::Debug + Send + Sync
+{
+}
+
+impl<T> StorageBackend for T where
+    T: ControlPlaneStore + TelemetryStore + AiContextStore + fmt::Debug + Send + Sync
+{
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStorage {
     inner: Arc<RwLock<InMemoryState>>,
