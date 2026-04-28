@@ -28,6 +28,8 @@ pub const MIGRATION_0004_CREATE_RAW_MESSAGES: &str =
     include_str!("../../../migrations/0004_create_raw_messages.sql");
 pub const MIGRATION_0005_CREATE_OBSERVATIONS: &str =
     include_str!("../../../migrations/0005_create_observations.sql");
+pub const MIGRATION_0006_CREATE_RUNTIME_PERSISTENCE_TABLES: &str =
+    include_str!("../../../migrations/0006_create_runtime_persistence_tables.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -43,6 +45,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0005_create_observations.sql",
         MIGRATION_0005_CREATE_OBSERVATIONS,
+    ),
+    (
+        "0006_create_runtime_persistence_tables.sql",
+        MIGRATION_0006_CREATE_RUNTIME_PERSISTENCE_TABLES,
     ),
 ];
 
@@ -1214,9 +1220,13 @@ mod tests {
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 5);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 6);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
+        assert_eq!(
+            ORDERED_MIGRATIONS[5].0,
+            "0006_create_runtime_persistence_tables.sql"
+        );
     }
 
     #[test]
@@ -1233,6 +1243,18 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS entity_relationships",
             "CREATE TABLE IF NOT EXISTS raw_messages",
             "CREATE TABLE IF NOT EXISTS observations",
+            "CREATE TABLE IF NOT EXISTS payload_profiles",
+            "CREATE TABLE IF NOT EXISTS capabilities",
+            "CREATE TABLE IF NOT EXISTS policies",
+            "CREATE TABLE IF NOT EXISTS commands",
+            "CREATE TABLE IF NOT EXISTS actions",
+            "CREATE TABLE IF NOT EXISTS action_results",
+            "CREATE TABLE IF NOT EXISTS events",
+            "CREATE TABLE IF NOT EXISTS executor_agents",
+            "CREATE TABLE IF NOT EXISTS executor_capabilities",
+            "CREATE TABLE IF NOT EXISTS executor_scopes",
+            "CREATE TABLE IF NOT EXISTS command_leases",
+            "CREATE TABLE IF NOT EXISTS rules",
         ] {
             assert!(
                 combined.contains(table),
@@ -1270,6 +1292,71 @@ mod tests {
         assert!(MIGRATION_0002_CREATE_ENTITIES.contains("jsonld jsonb NOT NULL"));
         assert!(MIGRATION_0004_CREATE_RAW_MESSAGES.contains("payload bytea NOT NULL"));
         assert!(MIGRATION_0005_CREATE_OBSERVATIONS.contains("create_hypertable"));
+    }
+
+    #[test]
+    fn runtime_persistence_migration_uses_jsonb_for_structured_fields() {
+        for field in [
+            "payload jsonb NOT NULL",
+            "metadata jsonb",
+            "policy_decision jsonb",
+            "result_payload jsonb NOT NULL",
+            "condition jsonb NOT NULL",
+            "action jsonb NOT NULL",
+            "attribute_mapping jsonb",
+        ] {
+            assert!(
+                MIGRATION_0006_CREATE_RUNTIME_PERSISTENCE_TABLES.contains(field),
+                "missing JSONB field: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_persistence_migration_defines_common_query_indexes() {
+        for index in [
+            "entities_tenant_type_idx",
+            "entity_relationships_source_idx",
+            "entity_relationships_target_idx",
+            "observations_tenant_feature_time_idx",
+            "observations_tenant_producer_time_idx",
+            "raw_messages_producer_received_at_idx",
+            "raw_messages_feature_received_at_idx",
+            "raw_messages_payload_format_received_at_idx",
+            "commands_target_status_idx",
+            "commands_approval_status_idx",
+            "events_target_idx",
+            "events_source_idx",
+            "events_type_idx",
+            "events_severity_idx",
+            "events_command_idx",
+            "events_raw_message_idx",
+            "events_correlation_idx",
+            "executor_agents_agent_key_idx",
+            "executor_agents_status_idx",
+            "command_leases_command_idx",
+            "command_leases_executor_idx",
+            "command_leases_status_expires_idx",
+            "rules_enabled_trigger_idx",
+            "rules_observed_property_idx",
+            "rules_event_type_idx",
+        ] {
+            let defined = ORDERED_MIGRATIONS
+                .iter()
+                .any(|(_, sql)| sql.contains(index));
+            assert!(defined, "missing index: {index}");
+        }
+    }
+
+    #[test]
+    fn embedded_migration_files_have_statement_terminators() {
+        for (name, sql) in ORDERED_MIGRATIONS {
+            assert!(!sql.trim().is_empty(), "migration is empty: {name}");
+            assert!(
+                sql.trim_end().ends_with(';'),
+                "migration does not end with semicolon: {name}"
+            );
+        }
     }
 
     #[test]

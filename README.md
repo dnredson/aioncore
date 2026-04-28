@@ -39,6 +39,7 @@ The architecture should later support distributed deployment, where HTTP ingesti
 - [Domain Model](docs/DOMAIN_MODEL.md)
 - [Observation Model](docs/OBSERVATION_MODEL.md)
 - [Ingestion Model](docs/INGESTION_MODEL.md)
+- [Persistence Model](docs/PERSISTENCE_MODEL.md)
 - [AI and MCP Model](docs/AI_MCP_MODEL.md)
 - [Architecture Decision Records](docs/ADR)
 
@@ -63,6 +64,8 @@ The architecture should later support distributed deployment, where HTTP ingesti
 ## Project Status
 
 AionCore currently has a minimal Rust workspace, core domain models, SQL migrations, and a local in-memory API runtime for early testing.
+
+The PostgreSQL and TimescaleDB migration foundation now covers the current in-memory models, including commands, actions, events, executor agents, command leases, and rules. Runtime persistence is not wired yet; the local API still uses in-memory storage.
 
 ## Run Locally Without Docker
 
