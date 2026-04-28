@@ -11,10 +11,11 @@ use aion_payload::{
 };
 use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
+use aion_rule::{Rule, RuleAction, RuleCondition, RuleEvaluationResult, RuleTriggerType};
 use aion_storage::{
     ActionResultStore, ActionStore, CapabilityStore, CommandStore, EntityStore, EventFilter,
     EventStore, InMemoryStorage, ObservationStore, PayloadProfile, PayloadProfileStore,
-    PolicyStore, RawMessageStore, RelationshipStore, StorageError,
+    PolicyStore, RawMessageStore, RelationshipStore, RuleStore, StorageError,
 };
 use axum::{
     body::Bytes,
@@ -224,6 +225,34 @@ pub struct CreateEventRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CreateRuleRequest {
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub trigger_type: RuleTriggerType,
+    pub target_entity_id: Option<Uuid>,
+    pub observed_property: Option<String>,
+    pub event_type: Option<String>,
+    pub condition: RuleCondition,
+    pub action: RuleAction,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManualRuleEvaluationRequest {
+    pub observation_id: Option<Uuid>,
+    pub event_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuleEvaluationResponse {
+    pub results: Vec<RuleEvaluationResult>,
+    pub generated_commands: Vec<Command>,
+    pub generated_events: Vec<Event>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EventQuery {
     pub source_entity_id: Option<Uuid>,
     pub target_entity_id: Option<Uuid>,
@@ -339,6 +368,11 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/relationships", post(create_relationship))
         .route("/policies", put(put_policies).get(query_policies))
+        .route("/rules", post(create_rule).get(list_rules))
+        .route("/rules/evaluate", post(evaluate_rules_manually))
+        .route("/rules/:rule_id", get(get_rule))
+        .route("/rules/:rule_id/enable", put(enable_rule))
+        .route("/rules/:rule_id/disable", put(disable_rule))
         .route("/commands", post(create_command).get(query_commands))
         .route("/commands/:command_id/claim", post(claim_command))
         .route("/commands/:command_id/release", post(release_command))
@@ -1450,6 +1484,101 @@ async fn query_policies(
     )?))
 }
 
+async fn create_rule(
+    State(state): State<AppState>,
+    Json(request): Json<CreateRuleRequest>,
+) -> Result<(StatusCode, Json<Rule>), ApiError> {
+    if let Some(target_entity_id) = request.target_entity_id {
+        ensure_entity_exists(&state, target_entity_id)?;
+    }
+    ensure_rule_action_targets_exist(&state, &request.action)?;
+
+    let rule = Rule::new(
+        state.tenant_id,
+        request.name,
+        request.description,
+        request.enabled,
+        request.trigger_type,
+        request.target_entity_id,
+        request.observed_property,
+        request.event_type,
+        request.condition,
+        request.action,
+        request.metadata,
+        Utc::now(),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    Ok((StatusCode::CREATED, Json(state.storage.store_rule(rule)?)))
+}
+
+async fn list_rules(State(state): State<AppState>) -> Result<Json<Vec<Rule>>, ApiError> {
+    Ok(Json(state.storage.list_rules(state.tenant_id)?))
+}
+
+async fn get_rule(
+    State(state): State<AppState>,
+    Path(rule_id): Path<Uuid>,
+) -> Result<Json<Rule>, ApiError> {
+    Ok(Json(
+        state
+            .storage
+            .get_rule(state.tenant_id, rule_id)?
+            .ok_or_else(ApiError::not_found)?,
+    ))
+}
+
+async fn enable_rule(
+    State(state): State<AppState>,
+    Path(rule_id): Path<Uuid>,
+) -> Result<Json<Rule>, ApiError> {
+    set_rule_enabled(state, rule_id, true)
+}
+
+async fn disable_rule(
+    State(state): State<AppState>,
+    Path(rule_id): Path<Uuid>,
+) -> Result<Json<Rule>, ApiError> {
+    set_rule_enabled(state, rule_id, false)
+}
+
+fn set_rule_enabled(state: AppState, rule_id: Uuid, enabled: bool) -> Result<Json<Rule>, ApiError> {
+    let mut rule = state
+        .storage
+        .get_rule(state.tenant_id, rule_id)?
+        .ok_or_else(ApiError::not_found)?;
+    rule.set_enabled(enabled, Utc::now());
+    Ok(Json(state.storage.update_rule(rule)?))
+}
+
+async fn evaluate_rules_manually(
+    State(state): State<AppState>,
+    Json(request): Json<ManualRuleEvaluationRequest>,
+) -> Result<Json<RuleEvaluationResponse>, ApiError> {
+    let has_observation = request.observation_id.is_some();
+    let has_event = request.event_id.is_some();
+    if has_observation == has_event {
+        return Err(ApiError::bad_request(
+            "exactly one of observation_id or event_id is required",
+        ));
+    }
+
+    if let Some(observation_id) = request.observation_id {
+        let observation = state
+            .storage
+            .get_observation(state.tenant_id, observation_id)?
+            .ok_or_else(ApiError::not_found)?;
+        return evaluate_rules_for_observation(&state, &observation, false).map(Json);
+    }
+
+    let event_id = request.event_id.expect("event_id presence checked above");
+    let event = state
+        .storage
+        .get_event(state.tenant_id, event_id)?
+        .ok_or_else(ApiError::not_found)?;
+    evaluate_rules_for_event(&state, &event, false).map(Json)
+}
+
 async fn create_command(
     State(state): State<AppState>,
     Json(request): Json<CreateCommandRequest>,
@@ -1731,6 +1860,7 @@ async fn create_event(
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let event = state.storage.store_event(event)?;
+    evaluate_rules_for_event(&state, &event, true)?;
     Ok((StatusCode::CREATED, Json(event)))
 }
 
@@ -1789,6 +1919,7 @@ async fn create_observation(
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let observation = state.storage.store_observation(observation)?;
+    evaluate_rules_for_observation(&state, &observation, true)?;
     Ok((StatusCode::CREATED, Json(observation)))
 }
 
@@ -2016,7 +2147,9 @@ async fn ingest_http(
             measurement.metadata,
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        observations.push(state.storage.store_observation(observation)?);
+        let observation = state.storage.store_observation(observation)?;
+        evaluate_rules_for_observation(&state, &observation, true)?;
+        observations.push(observation);
     }
 
     state
@@ -2295,6 +2428,408 @@ fn mutate_command(
     Ok(Json(command))
 }
 
+fn ensure_rule_action_targets_exist(state: &AppState, action: &RuleAction) -> Result<(), ApiError> {
+    match action {
+        RuleAction::CreateEvent {
+            source_entity_id,
+            target_entity_id,
+            ..
+        } => {
+            if let Some(source_entity_id) = source_entity_id {
+                ensure_entity_exists(state, *source_entity_id)?;
+            }
+            if let Some(target_entity_id) = target_entity_id {
+                ensure_entity_exists(state, *target_entity_id)?;
+            }
+        }
+        RuleAction::CreateCommand {
+            target_entity_id, ..
+        } => ensure_entity_exists(state, *target_entity_id)?,
+    }
+
+    Ok(())
+}
+
+fn evaluate_rules_for_observation(
+    state: &AppState,
+    observation: &Observation,
+    automatic_only: bool,
+) -> Result<RuleEvaluationResponse, ApiError> {
+    let rules = state.storage.list_rules(state.tenant_id)?;
+    let mut response = RuleEvaluationResponse {
+        results: Vec::new(),
+        generated_commands: Vec::new(),
+        generated_events: Vec::new(),
+    };
+
+    for rule in rules.into_iter().filter(|rule| {
+        rule.enabled
+            && rule.trigger_type == RuleTriggerType::ObservationCreated
+            && rule
+                .target_entity_id
+                .map(|id| id == observation.feature_of_interest_id)
+                .unwrap_or(true)
+            && rule
+                .observed_property
+                .as_deref()
+                .map(|property| property == observation.observed_property)
+                .unwrap_or(true)
+    }) {
+        let actual = observation_value_to_json(&observation.value);
+        let matched = rule
+            .condition
+            .matches(&actual)
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+        if !matched {
+            if !automatic_only {
+                response.results.push(RuleEvaluationResult::skipped(
+                    rule.id,
+                    "condition did not match",
+                ));
+            }
+            continue;
+        }
+
+        let result = apply_rule_action(
+            state,
+            &rule,
+            Some(observation),
+            None,
+            &mut response.generated_commands,
+            &mut response.generated_events,
+        )?;
+        response.results.push(result);
+    }
+
+    Ok(response)
+}
+
+fn evaluate_rules_for_event(
+    state: &AppState,
+    event: &Event,
+    automatic_only: bool,
+) -> Result<RuleEvaluationResponse, ApiError> {
+    if automatic_only && is_rule_generated_event(event) {
+        return Ok(RuleEvaluationResponse {
+            results: Vec::new(),
+            generated_commands: Vec::new(),
+            generated_events: Vec::new(),
+        });
+    }
+
+    let rules = state.storage.list_rules(state.tenant_id)?;
+    let mut response = RuleEvaluationResponse {
+        results: Vec::new(),
+        generated_commands: Vec::new(),
+        generated_events: Vec::new(),
+    };
+
+    for rule in rules.into_iter().filter(|rule| {
+        rule.enabled
+            && rule.trigger_type == RuleTriggerType::EventCreated
+            && rule
+                .target_entity_id
+                .map(|id| event.target_entity_id == Some(id))
+                .unwrap_or(true)
+            && rule
+                .event_type
+                .as_deref()
+                .map(|event_type| event.event_type == event_type)
+                .unwrap_or(true)
+    }) {
+        let actual = event_condition_value(event);
+        let matched = rule
+            .condition
+            .matches(&actual)
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+        if !matched {
+            if !automatic_only {
+                response.results.push(RuleEvaluationResult::skipped(
+                    rule.id,
+                    "condition did not match",
+                ));
+            }
+            continue;
+        }
+
+        let result = apply_rule_action(
+            state,
+            &rule,
+            None,
+            Some(event),
+            &mut response.generated_commands,
+            &mut response.generated_events,
+        )?;
+        response.results.push(result);
+    }
+
+    Ok(response)
+}
+
+fn apply_rule_action(
+    state: &AppState,
+    rule: &Rule,
+    observation: Option<&Observation>,
+    event: Option<&Event>,
+    generated_commands: &mut Vec<Command>,
+    generated_events: &mut Vec<Event>,
+) -> Result<RuleEvaluationResult, ApiError> {
+    let mut result = RuleEvaluationResult {
+        rule_id: rule.id,
+        matched: true,
+        generated_command_ids: Vec::new(),
+        generated_event_ids: Vec::new(),
+        reason: None,
+    };
+
+    match &rule.action {
+        RuleAction::CreateCommand {
+            target_entity_id,
+            command_type,
+            payload,
+            requested_by,
+            reason,
+            metadata,
+        } => {
+            let command = create_rule_command(
+                state,
+                rule,
+                *target_entity_id,
+                command_type,
+                enrich_rule_payload(payload.clone(), rule, observation, event, metadata),
+                requested_by.clone(),
+                reason.clone(),
+            )?;
+            result.generated_command_ids.push(command.id);
+            generated_commands.push(command);
+        }
+        RuleAction::CreateEvent {
+            event_type,
+            severity,
+            source_entity_id,
+            target_entity_id,
+            message,
+            metadata,
+        } => {
+            let event = create_rule_event(
+                state,
+                rule,
+                event_type,
+                severity.clone(),
+                *source_entity_id,
+                *target_entity_id,
+                message.clone(),
+                observation,
+                event,
+                metadata.clone(),
+            )?;
+            result.generated_event_ids.push(event.id);
+            generated_events.push(event);
+        }
+    }
+
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_rule_command(
+    state: &AppState,
+    rule: &Rule,
+    target_entity_id: Uuid,
+    command_type: &str,
+    payload: Value,
+    requested_by: Option<String>,
+    reason: Option<String>,
+) -> Result<Command, ApiError> {
+    ensure_entity_exists(state, target_entity_id)?;
+    let (approval_status, mut policy_decision) =
+        command_policy_decision(state, target_entity_id, command_type)?;
+    if let Some(object) = policy_decision.as_object_mut() {
+        object.insert("source".to_string(), json!("rule_engine"));
+        object.insert("rule_id".to_string(), json!(rule.id));
+    }
+
+    let command = Command::new(
+        state.tenant_id,
+        target_entity_id,
+        command_type,
+        payload,
+        requested_by.or_else(|| Some("aion-rule-engine".to_string())),
+        reason.or_else(|| Some(format!("generated by rule '{}'", rule.name))),
+        Some(approval_status),
+        Some(policy_decision),
+        Utc::now(),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let command = state.storage.store_command(command)?;
+    record_command_event(
+        state,
+        "aion:CommandCreated",
+        EventSeverity::Info,
+        &command,
+        Some(format!("generated by rule '{}'", rule.name)),
+    )?;
+    Ok(command)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_rule_event(
+    state: &AppState,
+    rule: &Rule,
+    event_type: &str,
+    severity: EventSeverity,
+    source_entity_id: Option<Uuid>,
+    target_entity_id: Option<Uuid>,
+    message: Option<String>,
+    observation: Option<&Observation>,
+    source_event: Option<&Event>,
+    metadata: Option<Value>,
+) -> Result<Event, ApiError> {
+    if let Some(source_entity_id) = source_entity_id {
+        ensure_entity_exists(state, source_entity_id)?;
+    }
+    if let Some(target_entity_id) = target_entity_id {
+        ensure_entity_exists(state, target_entity_id)?;
+    }
+
+    let event = Event::new(
+        state.tenant_id,
+        event_type,
+        severity,
+        source_entity_id.or_else(|| observation.map(|observation| observation.producer_entity_id)),
+        target_entity_id.or_else(|| {
+            observation
+                .map(|observation| observation.feature_of_interest_id)
+                .or_else(|| source_event.and_then(|event| event.target_entity_id))
+        }),
+        message,
+        Utc::now(),
+        observation.map(|observation| observation.observed_at),
+        None,
+        observation.and_then(|observation| observation.raw_message_id),
+        observation.map(|observation| observation.id),
+        None,
+        None,
+        None,
+        Some(rule_event_metadata(
+            rule,
+            metadata,
+            observation,
+            source_event,
+        )),
+        Utc::now(),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    Ok(state.storage.store_event(event)?)
+}
+
+fn enrich_rule_payload(
+    mut payload: Value,
+    rule: &Rule,
+    observation: Option<&Observation>,
+    event: Option<&Event>,
+    action_metadata: &Option<Value>,
+) -> Value {
+    if !payload.is_object() {
+        payload = json!({ "value": payload });
+    }
+
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("rule_id".to_string(), json!(rule.id));
+        object.insert("rule_name".to_string(), json!(rule.name));
+        if let Some(observation) = observation {
+            object.insert("observation_id".to_string(), json!(observation.id));
+            object.insert(
+                "observed_property".to_string(),
+                json!(observation.observed_property),
+            );
+            object.insert(
+                "observed_value".to_string(),
+                observation_value_to_json(&observation.value),
+            );
+        }
+        if let Some(event) = event {
+            object.insert("event_id".to_string(), json!(event.id));
+            object.insert("event_type".to_string(), json!(event.event_type));
+        }
+        if let Some(action_metadata) = action_metadata {
+            object.insert("rule_action_metadata".to_string(), action_metadata.clone());
+        }
+    }
+
+    payload
+}
+
+fn rule_event_metadata(
+    rule: &Rule,
+    metadata: Option<Value>,
+    observation: Option<&Observation>,
+    source_event: Option<&Event>,
+) -> Value {
+    let mut enriched = json!({
+        "source": "rule_engine",
+        "rule_id": rule.id,
+        "rule_name": rule.name,
+        "rule_generated": true
+    });
+
+    if let Some(object) = enriched.as_object_mut() {
+        if let Some(metadata) = metadata {
+            object.insert("rule_action_metadata".to_string(), metadata);
+        }
+        if let Some(observation) = observation {
+            object.insert("observation_id".to_string(), json!(observation.id));
+            object.insert(
+                "observed_property".to_string(),
+                json!(observation.observed_property),
+            );
+            object.insert(
+                "observed_value".to_string(),
+                observation_value_to_json(&observation.value),
+            );
+        }
+        if let Some(source_event) = source_event {
+            object.insert("source_event_id".to_string(), json!(source_event.id));
+            object.insert(
+                "source_event_type".to_string(),
+                json!(source_event.event_type),
+            );
+        }
+    }
+
+    enriched
+}
+
+fn observation_value_to_json(value: &ObservationValue) -> Value {
+    match value {
+        ObservationValue::Number { value } => json!(value),
+        ObservationValue::Text { value } => json!(value),
+        ObservationValue::Bool { value } => json!(value),
+        ObservationValue::Json { value } => value.clone(),
+    }
+}
+
+fn event_condition_value(event: &Event) -> Value {
+    event
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("value"))
+        .cloned()
+        .unwrap_or_else(|| json!(event.event_type))
+}
+
+fn is_rule_generated_event(event: &Event) -> bool {
+    event.metadata.as_ref().is_some_and(|metadata| {
+        metadata
+            .get("rule_generated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
 fn command_policy_decision(
     state: &AppState,
     target_entity_id: Uuid,
@@ -2345,6 +2880,10 @@ fn command_policy_decision(
 
 fn empty_object() -> Value {
     json!({})
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug)]
@@ -4006,6 +4545,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_and_retrieves_rule() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "rule-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&app, "rule-pump-01", "aion:Pump").await;
+
+        let rule = create_low_water_command_rule(&app, &tank_id, &pump_id, true, 20.0).await;
+        let rule_id = rule["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rules/{rule_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let fetched = to_json(response).await;
+        assert_eq!(fetched["id"], rule_id);
+        assert_eq!(fetched["trigger_type"], "observation_created");
+        assert_eq!(fetched["action"]["type"], "create_command");
+    }
+
+    #[tokio::test]
+    async fn disabled_rule_does_not_run() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "rule-disabled-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&app, "rule-disabled-pump-01", "aion:Pump").await;
+        create_low_water_command_rule(&app, &tank_id, &pump_id, false, 20.0).await;
+
+        create_water_level_observation(&app, &tank_id, 12.0).await;
+
+        let commands = query_pending_commands(&app, &pump_id).await;
+        assert!(commands.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn observation_rule_with_less_than_condition_matches() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "rule-match-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&app, "rule-match-pump-01", "aion:Pump").await;
+        create_low_water_command_rule(&app, &tank_id, &pump_id, true, 20.0).await;
+
+        create_water_level_observation(&app, &tank_id, 12.0).await;
+
+        let commands = query_pending_commands(&app, &pump_id).await;
+        assert_eq!(commands.as_array().unwrap().len(), 1);
+        assert_eq!(commands[0]["command_type"], "StartPump");
+    }
+
+    #[tokio::test]
+    async fn observation_rule_with_less_than_condition_does_not_match() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "rule-no-match-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&app, "rule-no-match-pump-01", "aion:Pump").await;
+        create_low_water_command_rule(&app, &tank_id, &pump_id, true, 20.0).await;
+
+        create_water_level_observation(&app, &tank_id, 42.0).await;
+
+        let commands = query_pending_commands(&app, &pump_id).await;
+        assert!(commands.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn matched_observation_rule_creates_command() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "rule-command-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&app, "rule-command-pump-01", "aion:Pump").await;
+        let rule = create_low_water_command_rule(&app, &tank_id, &pump_id, true, 20.0).await;
+
+        let observation = create_water_level_observation(&app, &tank_id, 12.0).await;
+
+        let commands = query_pending_commands(&app, &pump_id).await;
+        assert_eq!(commands.as_array().unwrap().len(), 1);
+        assert_eq!(commands[0]["payload"]["rule_id"], rule["id"]);
+        assert_eq!(commands[0]["payload"]["observation_id"], observation["id"]);
+    }
+
+    #[tokio::test]
+    async fn matched_observation_rule_creates_event() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "rule-event-tank-01", "aion:WaterTank").await;
+        let rule = create_low_water_event_rule(&app, &tank_id, true, 20.0).await;
+
+        create_water_level_observation(&app, &tank_id, 12.0).await;
+
+        let events = query_events_by_type(&app, "aion:LowWaterLevel").await;
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["target_entity_id"], tank_id);
+        assert_eq!(events[0]["metadata"]["rule_id"], rule["id"]);
+    }
+
+    #[tokio::test]
+    async fn event_triggered_rule_creates_command() {
+        let app = app();
+        let tank_id =
+            create_test_entity(&app, "rule-event-command-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&app, "rule-event-command-pump-01", "aion:Pump").await;
+        create_event_command_rule(&app, &tank_id, &pump_id).await;
+
+        create_test_event(&app, "aion:LowWaterLevel", Some(&tank_id), json!({})).await;
+
+        let commands = query_pending_commands(&app, &pump_id).await;
+        assert_eq!(commands.as_array().unwrap().len(), 1);
+        assert_eq!(commands[0]["command_type"], "StartPump");
+    }
+
+    #[tokio::test]
+    async fn generated_commands_preserve_policy_behavior() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "rule-policy-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&app, "rule-policy-pump-01", "aion:Pump").await;
+        put_start_pump_policy(&app, &pump_id, true).await;
+        create_low_water_command_rule(&app, &tank_id, &pump_id, true, 20.0).await;
+
+        create_water_level_observation(&app, &tank_id, 12.0).await;
+
+        let commands = query_pending_commands(&app, &pump_id).await;
+        let command_id = commands[0]["id"].as_str().unwrap();
+        assert_eq!(commands[0]["approval_status"], "required");
+        assert_eq!(commands[0]["policy_decision"]["requires_approval"], true);
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/commands/{command_id}/claim"),
+                json!({"claimed_by": "executor-01"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/commands/{command_id}/approve"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let claimed = claim_test_command(&app, command_id, "executor-01").await;
+        assert_eq!(claimed["status"], "claimed");
+    }
+
+    #[tokio::test]
+    async fn rule_generated_events_include_rule_id_metadata() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "rule-meta-tank-01", "aion:WaterTank").await;
+        let rule = create_low_water_event_rule(&app, &tank_id, true, 20.0).await;
+
+        create_water_level_observation(&app, &tank_id, 12.0).await;
+
+        let events = query_events_by_type(&app, "aion:LowWaterLevel").await;
+        assert_eq!(events[0]["metadata"]["source"], "rule_engine");
+        assert_eq!(events[0]["metadata"]["rule_generated"], true);
+        assert_eq!(events[0]["metadata"]["rule_id"], rule["id"]);
+    }
+
+    #[tokio::test]
+    async fn no_recursive_event_loop_occurs() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "rule-loop-tank-01", "aion:WaterTank").await;
+        create_loop_event_rule(&app, &tank_id).await;
+
+        create_test_event(&app, "aion:Loop", Some(&tank_id), json!({})).await;
+
+        let events = query_events_by_type(&app, "aion:Loop").await;
+        assert_eq!(events.as_array().unwrap().len(), 2);
+        assert_eq!(
+            events
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["metadata"]["rule_generated"] == true)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn ingests_senml_json_payload() {
         let app = app();
         let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
@@ -4459,6 +5186,271 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_low_water_command_rule(
+        app: &Router,
+        tank_id: &str,
+        pump_id: &str,
+        enabled: bool,
+        threshold: f64,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/rules",
+                json!({
+                    "name": "Start pump when level is low",
+                    "description": "Generic observation threshold rule",
+                    "enabled": enabled,
+                    "trigger_type": "observation_created",
+                    "target_entity_id": tank_id,
+                    "observed_property": "WaterTankLevel",
+                    "condition": {
+                        "comparison": "less_than",
+                        "value": threshold
+                    },
+                    "action": {
+                        "type": "create_command",
+                        "target_entity_id": pump_id,
+                        "command_type": "StartPump",
+                        "payload": {
+                            "target_state": "running"
+                        },
+                        "requested_by": "aion-rule-engine",
+                        "reason": "Water tank level is below threshold"
+                    },
+                    "metadata": {
+                        "test": true
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_low_water_event_rule(
+        app: &Router,
+        tank_id: &str,
+        enabled: bool,
+        threshold: f64,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/rules",
+                json!({
+                    "name": "Create low-water event",
+                    "enabled": enabled,
+                    "trigger_type": "observation_created",
+                    "target_entity_id": tank_id,
+                    "observed_property": "WaterTankLevel",
+                    "condition": {
+                        "comparison": "less_than",
+                        "value": threshold
+                    },
+                    "action": {
+                        "type": "create_event",
+                        "event_type": "aion:LowWaterLevel",
+                        "severity": "warning",
+                        "target_entity_id": tank_id,
+                        "message": "Water tank level is below threshold"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_event_command_rule(app: &Router, tank_id: &str, pump_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/rules",
+                json!({
+                    "name": "Start pump after low-water event",
+                    "enabled": true,
+                    "trigger_type": "event_created",
+                    "target_entity_id": tank_id,
+                    "event_type": "aion:LowWaterLevel",
+                    "condition": {
+                        "comparison": "equals",
+                        "value": "aion:LowWaterLevel"
+                    },
+                    "action": {
+                        "type": "create_command",
+                        "target_entity_id": pump_id,
+                        "command_type": "StartPump",
+                        "payload": {
+                            "target_state": "running"
+                        },
+                        "requested_by": "aion-rule-engine",
+                        "reason": "Low-water event detected"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_loop_event_rule(app: &Router, tank_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/rules",
+                json!({
+                    "name": "Loop event rule",
+                    "enabled": true,
+                    "trigger_type": "event_created",
+                    "target_entity_id": tank_id,
+                    "event_type": "aion:Loop",
+                    "condition": {
+                        "comparison": "equals",
+                        "value": "aion:Loop"
+                    },
+                    "action": {
+                        "type": "create_event",
+                        "event_type": "aion:Loop",
+                        "severity": "warning",
+                        "target_entity_id": tank_id,
+                        "message": "Loop event generated by rule"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_water_level_observation(app: &Router, tank_id: &str, value: f64) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/observations",
+                json!({
+                    "producer_entity_id": tank_id,
+                    "feature_of_interest_id": tank_id,
+                    "observed_property": "WaterTankLevel",
+                    "value": {
+                        "type": "number",
+                        "value": value
+                    },
+                    "unit": "%",
+                    "observed_at": "2026-04-28T12:00:00Z",
+                    "received_at": "2026-04-28T12:00:01Z",
+                    "protocol": "http",
+                    "payload_format": "json_mapping",
+                    "quality": {},
+                    "metadata": {}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_test_event(
+        app: &Router,
+        event_type: &str,
+        target_entity_id: Option<&str>,
+        metadata: Value,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/events",
+                json!({
+                    "event_type": event_type,
+                    "severity": "warning",
+                    "target_entity_id": target_entity_id,
+                    "message": "test event",
+                    "occurred_at": "2026-04-28T12:00:00Z",
+                    "metadata": metadata
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn query_pending_commands(app: &Router, target_entity_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/commands?target_entity_id={target_entity_id}&status=pending"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn query_events_by_type(app: &Router, event_type: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/events?event_type={event_type}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn put_start_pump_policy(app: &Router, pump_id: &str, requires_approval: bool) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                "/policies",
+                json!([
+                    {
+                        "target_entity_id": pump_id,
+                        "command_type": "StartPump",
+                        "requires_approval": requires_approval,
+                        "auto_execute_allowed": false,
+                        "metadata": {
+                            "source": "test"
+                        }
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
         to_json(response).await
     }
 

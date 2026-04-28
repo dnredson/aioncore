@@ -4,6 +4,7 @@ use aion_event::{Event, EventSeverity};
 use aion_observation::Observation;
 use aion_raw_message::RawMessage;
 use aion_relationship::Relationship;
+use aion_rule::Rule;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -159,6 +160,11 @@ pub trait RawMessageStore {
 
 pub trait ObservationStore {
     fn store_observation(&self, observation: Observation) -> StorageResult<Observation>;
+    fn get_observation(
+        &self,
+        tenant_id: Uuid,
+        observation_id: Uuid,
+    ) -> StorageResult<Option<Observation>>;
     fn query_observations(
         &self,
         tenant_id: Uuid,
@@ -253,6 +259,13 @@ pub trait EventStore {
     fn query_events(&self, tenant_id: Uuid, filter: EventFilter) -> StorageResult<Vec<Event>>;
 }
 
+pub trait RuleStore {
+    fn store_rule(&self, rule: Rule) -> StorageResult<Rule>;
+    fn update_rule(&self, rule: Rule) -> StorageResult<Rule>;
+    fn get_rule(&self, tenant_id: Uuid, rule_id: Uuid) -> StorageResult<Option<Rule>>;
+    fn list_rules(&self, tenant_id: Uuid) -> StorageResult<Vec<Rule>>;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStorage {
     inner: Arc<RwLock<InMemoryState>>,
@@ -274,6 +287,7 @@ struct InMemoryState {
     actions: HashMap<Uuid, Action>,
     action_results: HashMap<Uuid, ActionResult>,
     events: HashMap<Uuid, Event>,
+    rules: HashMap<Uuid, Rule>,
 }
 
 impl InMemoryStorage {
@@ -506,6 +520,19 @@ impl ObservationStore for InMemoryStorage {
             .observations
             .insert(observation.id, observation.clone());
         Ok(observation)
+    }
+
+    fn get_observation(
+        &self,
+        tenant_id: Uuid,
+        observation_id: Uuid,
+    ) -> StorageResult<Option<Observation>> {
+        Ok(self
+            .read_state()?
+            .observations
+            .get(&observation_id)
+            .filter(|observation| observation.tenant_id == tenant_id)
+            .cloned())
     }
 
     fn query_observations(
@@ -865,6 +892,52 @@ impl EventStore for InMemoryStorage {
 
         events.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
         Ok(events)
+    }
+}
+
+impl RuleStore for InMemoryStorage {
+    fn store_rule(&self, rule: Rule) -> StorageResult<Rule> {
+        let mut state = self.write_state()?;
+        if state.rules.contains_key(&rule.id) {
+            return Err(StorageError::Conflict);
+        }
+
+        state.rules.insert(rule.id, rule.clone());
+        Ok(rule)
+    }
+
+    fn update_rule(&self, rule: Rule) -> StorageResult<Rule> {
+        let mut state = self.write_state()?;
+        let stored = state
+            .rules
+            .get_mut(&rule.id)
+            .filter(|stored| stored.tenant_id == rule.tenant_id)
+            .ok_or(StorageError::NotFound)?;
+
+        *stored = rule.clone();
+        Ok(rule)
+    }
+
+    fn get_rule(&self, tenant_id: Uuid, rule_id: Uuid) -> StorageResult<Option<Rule>> {
+        Ok(self
+            .read_state()?
+            .rules
+            .get(&rule_id)
+            .filter(|rule| rule.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn list_rules(&self, tenant_id: Uuid) -> StorageResult<Vec<Rule>> {
+        let mut rules = self
+            .read_state()?
+            .rules
+            .values()
+            .filter(|rule| rule.tenant_id == tenant_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        rules.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        Ok(rules)
     }
 }
 

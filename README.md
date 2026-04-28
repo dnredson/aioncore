@@ -656,6 +656,156 @@ Query command lifecycle events:
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?command_id=$($claimed.id)"
 ```
 
+Create a local in-memory rule for a smart-building closed-loop scenario:
+
+```powershell
+$ruleTank = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "rule-water-tank-01"
+    entity_type = "aion:WaterTank"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:rule-water-tank:01"
+      "@type" = "aion:WaterTank"
+      name = "Rule Water Tank 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$rulePump = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "rule-pump-01"
+    entity_type = "aion:Pump"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:rule-pump:01"
+      "@type" = "aion:Pump"
+      name = "Rule Pump 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$rulePumpCapability = @{
+  capability_name = "Start pump"
+  command_type = "StartPump"
+  protocol = "local"
+  metadata = @{ safety = "requires_approval" }
+}
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/entities/$($rulePump.id)/capabilities" `
+  -ContentType "application/json" `
+  -Body (ConvertTo-Json -InputObject (, $rulePumpCapability) -Depth 10)
+
+$rulePumpPolicy = @{
+  target_entity_id = $rulePump.id
+  command_type = "StartPump"
+  requires_approval = $true
+  auto_execute_allowed = $false
+  metadata = @{ reason = "physical actuation requires approval" }
+}
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/policies" `
+  -ContentType "application/json" `
+  -Body (ConvertTo-Json -InputObject (, $rulePumpPolicy) -Depth 10)
+
+$lowWaterRule = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/rules" `
+  -ContentType "application/json" `
+  -Body (@{
+    name = "Start pump when water level is low"
+    description = "If WaterTankLevel is below 20, create a StartPump command."
+    enabled = $true
+    trigger_type = "observation_created"
+    target_entity_id = $ruleTank.id
+    observed_property = "WaterTankLevel"
+    condition = @{
+      comparison = "less_than"
+      value = 20
+    }
+    action = @{
+      type = "create_command"
+      target_entity_id = $rulePump.id
+      command_type = "StartPump"
+      payload = @{ target_state = "running" }
+      requested_by = "aion-rule-engine"
+      reason = "Water tank level is below threshold"
+    }
+    metadata = @{ scenario = "smart_building" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/observations" `
+  -ContentType "application/json" `
+  -Body (@{
+    producer_entity_id = $ruleTank.id
+    feature_of_interest_id = $ruleTank.id
+    observed_property = "WaterTankLevel"
+    value = @{ type = "number"; value = 12 }
+    unit = "%"
+    observed_at = "2026-04-28T12:00:00Z"
+    received_at = "2026-04-28T12:00:01Z"
+    protocol = "http"
+    payload_format = "json_mapping"
+    quality = @{}
+    metadata = @{}
+  } | ConvertTo-Json -Depth 10)
+
+$ruleCommands = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/commands?target_entity_id=$($rulePump.id)&status=pending"
+
+$ruleCommand = $ruleCommands[0]
+$ruleCommand.approval_status
+$ruleCommand.policy_decision
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($ruleCommand.id)/approve"
+
+$ruleClaimed = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands/$($ruleCommand.id)/claim" `
+  -ContentType "application/json" `
+  -Body (@{ claimed_by = "edge-agent-01" } | ConvertTo-Json)
+
+$ruleAction = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/actions" `
+  -ContentType "application/json" `
+  -Body (@{
+    command_id = $ruleClaimed.id
+    executor_entity_id = $rulePump.id
+    action_type = "StartPump"
+    status = "started"
+    started_at = "2026-04-28T12:01:00Z"
+    metadata = @{ source = "manual-local-test" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($ruleClaimed.id)/mark-executed"
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/action-results" `
+  -ContentType "application/json" `
+  -Body (@{
+    command_id = $ruleClaimed.id
+    action_id = $ruleAction.id
+    status = "succeeded"
+    verified = $true
+    result_payload = @{ pump_state = "running" }
+    observed_at = "2026-04-28T12:01:30Z"
+    metadata = @{ verification_source = "manual-local-test" }
+  } | ConvertTo-Json -Depth 10)
+```
+
 Build AI context for a smart-building water tank and pump:
 
 ```powershell

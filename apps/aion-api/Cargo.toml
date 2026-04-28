@@ -14,6 +14,7 @@ aion-observation.workspace = true
 aion-payload.workspace = true
 aion-raw-message.workspace = true
 aion-relationship.workspace = true
+aion-rule.workspace = true
 aion-storage.workspace = true
 axum.workspace = true
 chrono.workspace = true

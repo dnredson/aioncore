@@ -24,6 +24,7 @@ dependencies = [
  "aion-payload",
  "aion-raw-message",
  "aion-relationship",
+ "aion-rule",
  "aion-storage",
  "axum",
  "chrono",
@@ -104,6 +105,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aion-rule"
+version = "0.1.0"
+dependencies = [
+ "aion-event",
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "aion-storage"
 version = "0.1.0"
 dependencies = [
@@ -113,6 +125,7 @@ dependencies = [
  "aion-observation",
  "aion-raw-message",
  "aion-relationship",
+ "aion-rule",
  "chrono",
  "serde",
  "serde_json",
