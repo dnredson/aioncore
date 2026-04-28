@@ -3,6 +3,7 @@ use aion_action::{
 };
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
+use aion_mcp::{ToolDefinition, ToolRequest, ToolResponse};
 use aion_observation::{Observation, ObservationValue};
 use aion_payload::{
     CanonicalJsonDecoder, DecodeInput, PayloadDecoder, PayloadFormat, SenMlJsonDecoder,
@@ -255,6 +256,24 @@ pub struct AiContextQuery {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct McpRecentObservationsArgs {
+    pub feature_of_interest_id: Option<Uuid>,
+    pub producer_entity_id: Option<Uuid>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct McpEventsArgs {
+    pub entity_id: Option<Uuid>,
+    pub event_type: Option<String>,
+    pub severity: Option<EventSeverity>,
+    pub command_id: Option<Uuid>,
+    pub raw_message_id: Option<Uuid>,
+    pub correlation_id: Option<String>,
+    pub limit: Option<u32>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RawMessageResponse {
     pub id: Uuid,
@@ -343,6 +362,8 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/events", post(create_event).get(query_events))
         .route("/events/:event_id", get(get_event))
         .route("/ai/context/entity/:entity_id", get(get_ai_entity_context))
+        .route("/mcp/tools", get(list_mcp_tools))
+        .route("/mcp/tools/:tool_name", post(invoke_mcp_tool))
         .route("/ingest/http", post(ingest_http))
         .route("/raw-messages", get(query_raw_messages))
         .route("/raw-messages/:raw_message_id", get(get_raw_message))
@@ -572,6 +593,14 @@ async fn get_ai_entity_context(
     Path(entity_id): Path<Uuid>,
     Query(query): Query<AiContextQuery>,
 ) -> Result<Json<AiEntityContextResponse>, ApiError> {
+    Ok(Json(build_ai_entity_context(&state, entity_id, query)?))
+}
+
+fn build_ai_entity_context(
+    state: &AppState,
+    entity_id: Uuid,
+    query: AiContextQuery,
+) -> Result<AiEntityContextResponse, ApiError> {
     let target_entity = state
         .storage
         .get_entity(state.tenant_id, entity_id)?
@@ -667,7 +696,7 @@ async fn get_ai_entity_context(
         }
     }
 
-    Ok(Json(AiEntityContextResponse {
+    Ok(AiEntityContextResponse {
         target_entity,
         outgoing_relationships,
         incoming_relationships,
@@ -687,7 +716,7 @@ async fn get_ai_entity_context(
             "include_commands": include_commands,
             "limit": limit
         }),
-    }))
+    })
 }
 
 fn query_events_for_entity(
@@ -723,6 +752,420 @@ fn query_events_for_entity(
     });
     events.truncate(limit as usize);
     Ok(events)
+}
+
+async fn list_mcp_tools() -> Json<Vec<ToolDefinition>> {
+    Json(mcp_tool_definitions())
+}
+
+async fn invoke_mcp_tool(
+    State(state): State<AppState>,
+    Path(tool_name): Path<String>,
+    Json(request): Json<ToolRequest>,
+) -> (StatusCode, Json<ToolResponse>) {
+    match invoke_local_mcp_tool(&state, &tool_name, request.arguments) {
+        Ok(content) => (
+            StatusCode::OK,
+            Json(ToolResponse::success(tool_name, content)),
+        ),
+        Err(error) => (
+            error.status,
+            Json(ToolResponse::error(tool_name, error.code, error.message)),
+        ),
+    }
+}
+
+fn mcp_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_entities".to_string(),
+            description: "List known entities with compact identity metadata.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "get_entity".to_string(),
+            description: "Get one entity by entity_id.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["entity_id"],
+                "properties": {
+                    "entity_id": {"type": "string", "format": "uuid"}
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "get_entity_context".to_string(),
+            description: "Get one entity with incoming and outgoing relationships.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["entity_id"],
+                "properties": {
+                    "entity_id": {"type": "string", "format": "uuid"}
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "get_recent_observations".to_string(),
+            description: "Get recent observations by feature_of_interest_id or producer_entity_id."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "feature_of_interest_id": {"type": "string", "format": "uuid"},
+                    "producer_entity_id": {"type": "string", "format": "uuid"},
+                    "limit": {"type": "integer", "minimum": 1}
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "get_events".to_string(),
+            description: "Get events by entity or optional event filters.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "string", "format": "uuid"},
+                    "event_type": {"type": "string"},
+                    "severity": {"type": "string"},
+                    "command_id": {"type": "string", "format": "uuid"},
+                    "raw_message_id": {"type": "string", "format": "uuid"},
+                    "correlation_id": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1}
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "get_pending_commands".to_string(),
+            description: "Get pending commands, optionally scoped to a target entity.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_entity_id": {"type": "string", "format": "uuid"}
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "build_ai_context".to_string(),
+            description: "Build the AI context package for an entity.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["entity_id"],
+                "properties": {
+                    "entity_id": {"type": "string", "format": "uuid"},
+                    "include_observations": {"type": "boolean"},
+                    "include_events": {"type": "boolean"},
+                    "include_commands": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1}
+                }
+            }),
+        },
+    ]
+}
+
+fn invoke_local_mcp_tool(
+    state: &AppState,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<Value, McpToolFailure> {
+    match tool_name {
+        "list_entities" => mcp_list_entities(state),
+        "get_entity" => mcp_get_entity(state, &arguments),
+        "get_entity_context" => mcp_get_entity_context(state, &arguments),
+        "get_recent_observations" => mcp_get_recent_observations(state, arguments),
+        "get_events" => mcp_get_events(state, arguments),
+        "get_pending_commands" => mcp_get_pending_commands(state, &arguments),
+        "build_ai_context" => mcp_build_ai_context(state, arguments),
+        _ => Err(McpToolFailure::not_found(format!(
+            "unknown MCP tool '{tool_name}'"
+        ))),
+    }
+}
+
+fn mcp_list_entities(state: &AppState) -> Result<Value, McpToolFailure> {
+    let entities = state
+        .storage
+        .list_entities(state.tenant_id)
+        .map_err(McpToolFailure::from_storage)?
+        .into_iter()
+        .map(|entity| {
+            json!({
+                "id": entity.id,
+                "entity_key": entity.entity_key,
+                "entity_type": entity.entity_type,
+                "jsonld_id": entity.jsonld.get("@id").and_then(Value::as_str)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({ "entities": entities }))
+}
+
+fn mcp_get_entity(state: &AppState, arguments: &Value) -> Result<Value, McpToolFailure> {
+    let entity_id = required_uuid(arguments, "entity_id")?;
+    let entity = state
+        .storage
+        .get_entity(state.tenant_id, entity_id)
+        .map_err(McpToolFailure::from_storage)?
+        .ok_or_else(|| McpToolFailure::not_found("entity was not found"))?;
+
+    Ok(json!({ "entity": entity }))
+}
+
+fn mcp_get_entity_context(state: &AppState, arguments: &Value) -> Result<Value, McpToolFailure> {
+    let entity_id = required_uuid(arguments, "entity_id")?;
+    let entity = state
+        .storage
+        .get_entity(state.tenant_id, entity_id)
+        .map_err(McpToolFailure::from_storage)?
+        .ok_or_else(|| McpToolFailure::not_found("entity was not found"))?;
+    let outgoing_relationships = state
+        .storage
+        .list_relationships(state.tenant_id, Some(entity_id), None)
+        .map_err(McpToolFailure::from_storage)?;
+    let incoming_relationships = state
+        .storage
+        .list_relationships(state.tenant_id, None, Some(entity_id))
+        .map_err(McpToolFailure::from_storage)?;
+
+    Ok(json!({
+        "entity": entity,
+        "outgoing_relationships": outgoing_relationships,
+        "incoming_relationships": incoming_relationships
+    }))
+}
+
+fn mcp_get_recent_observations(
+    state: &AppState,
+    arguments: Value,
+) -> Result<Value, McpToolFailure> {
+    let args: McpRecentObservationsArgs = parse_tool_args(arguments)?;
+    let limit = args.limit.unwrap_or(10);
+    if args.feature_of_interest_id.is_none() && args.producer_entity_id.is_none() {
+        return Err(McpToolFailure::bad_request(
+            "missing_argument",
+            "feature_of_interest_id or producer_entity_id is required",
+        ));
+    }
+
+    let query_limit = if args.producer_entity_id.is_some() {
+        u32::MAX
+    } else {
+        limit
+    };
+    let mut observations = state
+        .storage
+        .query_observations(
+            state.tenant_id,
+            args.feature_of_interest_id,
+            None,
+            None,
+            None,
+            query_limit,
+        )
+        .map_err(McpToolFailure::from_storage)?;
+
+    if let Some(producer_entity_id) = args.producer_entity_id {
+        observations.retain(|observation| observation.producer_entity_id == producer_entity_id);
+        observations.truncate(limit as usize);
+    }
+
+    Ok(json!({ "observations": observations }))
+}
+
+fn mcp_get_events(state: &AppState, arguments: Value) -> Result<Value, McpToolFailure> {
+    let args: McpEventsArgs = parse_tool_args(arguments)?;
+    let limit = args.limit.unwrap_or(10);
+    let filter = EventFilter {
+        event_type: args.event_type,
+        severity: args.severity,
+        command_id: args.command_id,
+        raw_message_id: args.raw_message_id,
+        correlation_id: args.correlation_id,
+        ..Default::default()
+    };
+
+    let mut events = if let Some(entity_id) = args.entity_id {
+        let mut target_filter = filter.clone();
+        target_filter.target_entity_id = Some(entity_id);
+        let mut events = state
+            .storage
+            .query_events(state.tenant_id, target_filter)
+            .map_err(McpToolFailure::from_storage)?;
+
+        let mut source_filter = filter;
+        source_filter.source_entity_id = Some(entity_id);
+        for event in state
+            .storage
+            .query_events(state.tenant_id, source_filter)
+            .map_err(McpToolFailure::from_storage)?
+        {
+            if !events.iter().any(|existing| existing.id == event.id) {
+                events.push(event);
+            }
+        }
+        events.sort_by(|left, right| {
+            right
+                .occurred_at
+                .cmp(&left.occurred_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        events
+    } else {
+        state
+            .storage
+            .query_events(state.tenant_id, filter)
+            .map_err(McpToolFailure::from_storage)?
+    };
+
+    events.truncate(limit as usize);
+    Ok(json!({ "events": events }))
+}
+
+fn mcp_get_pending_commands(state: &AppState, arguments: &Value) -> Result<Value, McpToolFailure> {
+    let target_entity_id = optional_uuid(arguments, "target_entity_id")?;
+    let commands = state
+        .storage
+        .query_commands(
+            state.tenant_id,
+            target_entity_id,
+            Some(CommandStatus::Pending),
+        )
+        .map_err(McpToolFailure::from_storage)?;
+
+    Ok(json!({ "commands": commands }))
+}
+
+fn mcp_build_ai_context(state: &AppState, arguments: Value) -> Result<Value, McpToolFailure> {
+    let entity_id = required_uuid(&arguments, "entity_id")?;
+    let query = AiContextQuery {
+        include_observations: optional_bool(&arguments, "include_observations")?,
+        include_events: optional_bool(&arguments, "include_events")?,
+        include_commands: optional_bool(&arguments, "include_commands")?,
+        limit: optional_u32(&arguments, "limit")?,
+    };
+    let context =
+        build_ai_entity_context(state, entity_id, query).map_err(McpToolFailure::from_api)?;
+
+    Ok(json!({ "context": context }))
+}
+
+fn parse_tool_args<T>(arguments: Value) -> Result<T, McpToolFailure>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(arguments).map_err(|err| {
+        McpToolFailure::bad_request("invalid_arguments", format!("invalid arguments: {err}"))
+    })
+}
+
+fn required_uuid(arguments: &Value, field: &str) -> Result<Uuid, McpToolFailure> {
+    optional_uuid(arguments, field)?.ok_or_else(|| {
+        McpToolFailure::bad_request("missing_argument", format!("{field} is required"))
+    })
+}
+
+fn optional_uuid(arguments: &Value, field: &str) -> Result<Option<Uuid>, McpToolFailure> {
+    match arguments.get(field) {
+        Some(Value::String(value)) => Uuid::parse_str(value).map(Some).map_err(|err| {
+            McpToolFailure::bad_request(
+                "invalid_argument",
+                format!("{field} must be a UUID: {err}"),
+            )
+        }),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(McpToolFailure::bad_request(
+            "invalid_argument",
+            format!("{field} must be a UUID string"),
+        )),
+    }
+}
+
+fn optional_bool(arguments: &Value, field: &str) -> Result<Option<bool>, McpToolFailure> {
+    match arguments.get(field) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(McpToolFailure::bad_request(
+            "invalid_argument",
+            format!("{field} must be a boolean"),
+        )),
+    }
+}
+
+fn optional_u32(arguments: &Value, field: &str) -> Result<Option<u32>, McpToolFailure> {
+    match arguments.get(field) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                McpToolFailure::bad_request(
+                    "invalid_argument",
+                    format!("{field} must be a non-negative integer within u32 range"),
+                )
+            }),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(McpToolFailure::bad_request(
+            "invalid_argument",
+            format!("{field} must be an integer"),
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct McpToolFailure {
+    status: StatusCode,
+    code: String,
+    message: String,
+}
+
+impl McpToolFailure {
+    fn bad_request(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found".to_string(),
+            message: message.into(),
+        }
+    }
+
+    fn from_storage(error: StorageError) -> Self {
+        match error {
+            StorageError::NotFound => Self::not_found("record was not found"),
+            StorageError::InvalidInput(message) => Self::bad_request("invalid_input", message),
+            StorageError::Conflict => Self {
+                status: StatusCode::CONFLICT,
+                code: "conflict".to_string(),
+                message: "record conflicts with existing data".to_string(),
+            },
+            StorageError::Backend(message) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "backend_error".to_string(),
+                message,
+            },
+        }
+    }
+
+    fn from_api(error: ApiError) -> Self {
+        Self {
+            status: error.status,
+            code: match error.status {
+                StatusCode::NOT_FOUND => "not_found",
+                StatusCode::BAD_REQUEST => "invalid_arguments",
+                _ => "tool_error",
+            }
+            .to_string(),
+            message: error.message,
+        }
+    }
 }
 
 async fn put_capabilities(
@@ -2964,6 +3407,187 @@ mod tests {
         let observations = context["recent_observations"].as_array().unwrap();
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0]["value"]["value"], 39.5);
+    }
+
+    #[tokio::test]
+    async fn lists_mcp_tool_definitions() {
+        let app = app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mcp/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let tools = to_json(response).await;
+        let tool_names = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(tool_names.contains(&"list_entities"));
+        assert!(tool_names.contains(&"get_entity"));
+        assert!(tool_names.contains(&"build_ai_context"));
+    }
+
+    #[tokio::test]
+    async fn invokes_mcp_list_entities() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "mcp-tank-01", "aion:WaterTank").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp/tools/list_entities",
+                json!({
+                    "arguments": {}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let tool_response = to_json(response).await;
+        assert!(tool_response["error"].is_null());
+        assert!(tool_response["result"]["content"]["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entity| entity["id"] == tank_id
+                && entity["entity_key"] == "mcp-tank-01"
+                && entity["entity_type"] == "aion:WaterTank"));
+    }
+
+    #[tokio::test]
+    async fn invokes_mcp_get_entity() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "mcp-pump-01", "aion:Pump").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp/tools/get_entity",
+                json!({
+                    "arguments": {
+                        "entity_id": pump_id
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let tool_response = to_json(response).await;
+        assert_eq!(tool_response["result"]["content"]["entity"]["id"], pump_id);
+        assert_eq!(
+            tool_response["result"]["content"]["entity"]["entity_type"],
+            "aion:Pump"
+        );
+    }
+
+    #[tokio::test]
+    async fn invokes_mcp_build_ai_context() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "mcp-context-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&app, "mcp-context-pump-01", "aion:Pump").await;
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/relationships",
+                json!({
+                    "source_entity_id": pump_id,
+                    "relationship_type": "aion:fills",
+                    "target_entity_id": tank_id,
+                    "jsonld": {
+                        "@type": "aion:Relationship"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp/tools/build_ai_context",
+                json!({
+                    "arguments": {
+                        "entity_id": tank_id,
+                        "include_observations": false,
+                        "include_events": false,
+                        "include_commands": false,
+                        "limit": 5
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let tool_response = to_json(response).await;
+        let context = &tool_response["result"]["content"]["context"];
+        assert_eq!(context["target_entity"]["id"], tank_id);
+        assert_eq!(
+            context["incoming_relationships"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(context["metadata"]["llm_invoked"], false);
+    }
+
+    #[tokio::test]
+    async fn mcp_invalid_tool_name_returns_clear_error() {
+        let app = app();
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp/tools/no_such_tool",
+                json!({
+                    "arguments": {}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let tool_response = to_json(response).await;
+        assert!(tool_response["result"].is_null());
+        assert_eq!(tool_response["error"]["code"], "not_found");
+        assert!(tool_response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown MCP tool"));
+    }
+
+    #[tokio::test]
+    async fn mcp_missing_required_tool_argument_returns_clear_error() {
+        let app = app();
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp/tools/get_entity",
+                json!({
+                    "arguments": {}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let tool_response = to_json(response).await;
+        assert!(tool_response["result"].is_null());
+        assert_eq!(tool_response["error"]["code"], "missing_argument");
+        assert_eq!(tool_response["error"]["message"], "entity_id is required");
     }
 
     #[tokio::test]

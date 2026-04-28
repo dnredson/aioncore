@@ -27,6 +27,27 @@ query_relationships
 query_observations
 ```
 
+The local in-memory runtime also exposes a minimal MCP-ready HTTP tool layer for development and integration testing:
+
+```text
+GET  /mcp/tools
+POST /mcp/tools/{tool_name}
+```
+
+Initial local tool names:
+
+```text
+list_entities
+get_entity
+get_entity_context
+get_recent_observations
+get_events
+get_pending_commands
+build_ai_context
+```
+
+This is not a standalone MCP server yet. It is an internal MCP-style tool abstraction using structured tool definitions, requests, responses, results, and errors. A future MCP server can wrap the same tool layer without changing AionCore's domain model.
+
 ### query_entities
 
 Inputs:

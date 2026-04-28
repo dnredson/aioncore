@@ -19,6 +19,7 @@ dependencies = [
  "aion-action",
  "aion-entity",
  "aion-event",
+ "aion-mcp",
  "aion-observation",
  "aion-payload",
  "aion-raw-message",
@@ -51,6 +52,14 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "aion-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

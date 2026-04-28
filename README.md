@@ -784,4 +784,107 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ai/context/entity/$($c
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ai/context/entity/$($contextPump.id)?limit=10"
 ```
 
+List and invoke local MCP-ready tools:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/mcp/tools"
+
+$mcpTank = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "mcp-water-tank-01"
+    entity_type = "aion:WaterTank"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:mcp-water-tank:01"
+      "@type" = "aion:WaterTank"
+      name = "MCP Water Tank 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$mcpPump = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "mcp-pump-01"
+    entity_type = "aion:Pump"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:mcp-pump:01"
+      "@type" = "aion:Pump"
+      name = "MCP Pump 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/observations" `
+  -ContentType "application/json" `
+  -Body (@{
+    producer_entity_id = $mcpPump.id
+    feature_of_interest_id = $mcpTank.id
+    observed_property = "water_level"
+    value = @{ type = "number"; value = 22.0 }
+    unit = "%"
+    observed_at = "2026-04-27T13:05:00Z"
+    received_at = "2026-04-27T13:05:01Z"
+    protocol = "http"
+    payload_format = "json_mapping"
+    quality = @{}
+    metadata = @{}
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/events" `
+  -ContentType "application/json" `
+  -Body (@{
+    event_type = "aion:LowWaterLevel"
+    severity = "warning"
+    target_entity_id = $mcpTank.id
+    message = "Water level is low"
+    occurred_at = "2026-04-27T13:05:05Z"
+    metadata = @{ threshold = 30 }
+  } | ConvertTo-Json -Depth 10)
+
+$mcpCommand = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands" `
+  -ContentType "application/json" `
+  -Body (@{
+    target_entity_id = $mcpPump.id
+    command_type = "StartPump"
+    payload = @{ target_state = "running" }
+    requested_by = "operator@example.com"
+    reason = "Water tank level is low"
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/mcp/tools/build_ai_context" `
+  -ContentType "application/json" `
+  -Body (@{
+    arguments = @{
+      entity_id = $mcpTank.id
+      include_observations = $true
+      include_events = $true
+      include_commands = $true
+      limit = 10
+    }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/mcp/tools/get_pending_commands" `
+  -ContentType "application/json" `
+  -Body (@{
+    arguments = @{
+      target_entity_id = $mcpPump.id
+    }
+  } | ConvertTo-Json -Depth 10)
+```
+
 In-memory data is lost when the process exits.
