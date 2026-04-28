@@ -18,6 +18,8 @@ POST /ingest/http
 
 HTTP ingestion accepts a producer entity, a feature of interest, a payload format, and the payload itself. The current runtime stores the raw message, selects the decoder, produces canonical observations, and then updates raw-message status.
 
+The legacy endpoint remains available and does not require a registered connector. This is the default ingestion mode for simple local deployments.
+
 HTTP payload formats supported by the local runtime:
 
 - `senml-json`
@@ -38,6 +40,48 @@ Receive request
   -> update raw message status
   -> emit ingestion events
 ```
+
+## Ingestion Connector Registry
+
+AionCore now has an in-memory `IngestionConnector` registry. An ingestion connector describes where data comes from; a connector profile describes how to interpret source-specific semantics.
+
+Connector fields include:
+
+- `connector_key`
+- `connector_type`: `http`, `mqtt`, or `future`
+- `connector_profile`: `generic-aion-mqtt`, `generic-mqtt`, `ttn-v3`, or `custom`
+- runtime defaults such as `protocol`, `endpoint`, `broker_url`, `client_id`, `topic_filter`, `http_path`, `payload_format`, `content_type`, default producer entity, and default feature of interest
+- `enabled`
+- metadata and timestamps
+
+Connector registry endpoints:
+
+```text
+POST /ingestion/connectors
+GET /ingestion/connectors
+GET /ingestion/connectors/{connector_id}
+PUT /ingestion/connectors/{connector_id}/enable
+PUT /ingestion/connectors/{connector_id}/disable
+GET /ingestion/connectors/{connector_id}/status
+```
+
+Connector-aware HTTP ingestion:
+
+```text
+POST /ingestion/connectors/{connector_id}/ingest
+```
+
+When this endpoint is used, missing request values can be resolved from connector defaults, including payload format, content type, protocol, producer entity, and feature of interest. Existing `POST /ingest/http` continues to work without a connector.
+
+Raw messages and ingestion events created through connector-aware ingestion include connector metadata such as connector ID, connector key, connector profile, source endpoint, and topic/path. The current persisted raw-message schema stores this metadata in raw-message headers.
+
+Connector status is currently derived from registry state:
+
+- disabled connectors report `disabled`
+- enabled HTTP connectors report `ready`
+- enabled MQTT/future connectors report `degraded` because dynamic workers per connector are future work
+
+The existing environment-variable MQTT configuration acts as the default runtime MQTT connector for now. It is not yet created dynamically from the registry.
 
 ## MQTT Ingestion
 
@@ -109,8 +153,32 @@ Broker receives message
   -> worker emits ingestion events
 ```
 
+Future MQTT work should support one worker per enabled MQTT connector so multiple controlled or external brokers can run side by side. That future model should support generic AionCore topics, user-defined generic MQTT mappings, and provider-specific profiles.
+
+## The Things Stack Profile
+
+`connector_profile = "ttn-v3"` is accepted as a connector profile for The Things Network / The Things Stack MQTT uplinks.
+
+Example TTN connector semantics:
+
+- `broker_url`: `mqtt://eu1.cloud.thethings.network:1883` or another regional/tenant endpoint
+- `topic_filter`: `v3/{application_id}/devices/+/up`
+- `payload_format`: `ttn-uplink-json`
+
+Full TTN uplink decoding is not implemented yet. Future TTN adapter behavior should:
+
+- map TTN `device_id` to producer entities;
+- map `decoded_payload` fields to canonical observations;
+- preserve uplink metadata such as RSSI, SNR, gateway IDs, frame counters, and timestamps;
+- support topic differences across tenant, application, and regional endpoint conventions.
+
 ## Limitations
 
+- Connector registry persistence is in-memory only in this milestone.
+- Dynamic MQTT workers per connector are not implemented yet.
+- TTN/The Things Stack live connectivity and full uplink decoding are not implemented yet.
+- Secrets storage is not implemented yet.
+- Connector authentication is not implemented yet.
 - MQTT broker username/password authentication is supported for the worker only.
 - Per-device MQTT authorization is not implemented yet.
 - TLS/mTLS is not implemented yet.

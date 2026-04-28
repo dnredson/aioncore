@@ -164,6 +164,88 @@ mosquitto_pub.exe `
 
 Supported payload formats in this milestone are `senml-json`, `ultralight`, and `canonical-json`. SenML can decode without a mapping. UltraLight ingestion requires a stored producer payload profile mapping. MQTT worker broker authentication is supported, but per-device MQTT authorization, TLS/mTLS, and command publishing are future work.
 
+Ingestion connector registry examples:
+
+```powershell
+$genericMqttConnector = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors" `
+  -ContentType "application/json" `
+  -Body (@{
+    connector_key = "farm-mqtt"
+    connector_type = "mqtt"
+    connector_profile = "generic-aion-mqtt"
+    enabled = $false
+    broker_url = "mqtt://127.0.0.1:1883"
+    client_id = "aioncore-farm-mqtt"
+    topic_filter = "aioncore/+/+/data"
+    payload_format = "senml-json"
+  } | ConvertTo-Json -Depth 8)
+```
+
+```powershell
+$ttnConnector = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors" `
+  -ContentType "application/json" `
+  -Body (@{
+    connector_key = "ttn-demo"
+    connector_type = "mqtt"
+    connector_profile = "ttn-v3"
+    enabled = $false
+    broker_url = "mqtt://eu1.cloud.thethings.network:1883"
+    topic_filter = "v3/demo-application/devices/+/up"
+    payload_format = "ttn-uplink-json"
+  } | ConvertTo-Json -Depth 8)
+```
+
+```powershell
+$httpConnector = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors" `
+  -ContentType "application/json" `
+  -Body (@{
+    connector_key = "farm-http"
+    connector_type = "http"
+    connector_profile = "custom"
+    enabled = $true
+    protocol = "http"
+    http_path = "/ingestion/connectors/{connector_id}/ingest"
+    payload_format = "senml-json"
+    content_type = "application/senml+json"
+    default_producer_entity_id = "11111111-1111-1111-1111-111111111111"
+    default_feature_of_interest_id = "22222222-2222-2222-2222-222222222222"
+  } | ConvertTo-Json -Depth 8)
+```
+
+Connector-aware HTTP ingestion can use connector defaults:
+
+```powershell
+$ingest = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors/$($httpConnector.id)/ingest" `
+  -ContentType "application/json" `
+  -Body (@{
+    payload = @(
+      @{
+        n = "soil_moisture"
+        u = "%"
+        v = 18.5
+      }
+    )
+  } | ConvertTo-Json -Depth 8)
+
+$raw = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/raw-messages/$($ingest.raw_message_id)"
+
+$raw.connector_id
+$raw.connector_key
+$raw.connector_profile
+```
+
+The connector registry is in-memory in this milestone. Existing env-var MQTT config remains the default runtime MQTT connector behavior; dynamic MQTT workers per connector and TTN uplink decoding are future work.
+
 Runtime validation scripts:
 
 ```powershell

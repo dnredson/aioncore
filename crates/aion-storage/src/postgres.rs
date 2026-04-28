@@ -2004,6 +2004,45 @@ impl PayloadProfileStore for PostgresStorage {
     }
 }
 
+impl IngestionConnectorStore for PostgresStorage {
+    fn create_ingestion_connector(
+        &self,
+        _connector: IngestionConnector,
+    ) -> StorageResult<IngestionConnector> {
+        Err(StorageError::Backend(
+            "postgres ingestion connector registry is not implemented yet".to_string(),
+        ))
+    }
+
+    fn get_ingestion_connector(
+        &self,
+        _tenant_id: Uuid,
+        _connector_id: Uuid,
+    ) -> StorageResult<Option<IngestionConnector>> {
+        Err(StorageError::Backend(
+            "postgres ingestion connector registry is not implemented yet".to_string(),
+        ))
+    }
+
+    fn list_ingestion_connectors(
+        &self,
+        _tenant_id: Uuid,
+    ) -> StorageResult<Vec<IngestionConnector>> {
+        Err(StorageError::Backend(
+            "postgres ingestion connector registry is not implemented yet".to_string(),
+        ))
+    }
+
+    fn update_ingestion_connector(
+        &self,
+        _connector: IngestionConnector,
+    ) -> StorageResult<IngestionConnector> {
+        Err(StorageError::Backend(
+            "postgres ingestion connector registry is not implemented yet".to_string(),
+        ))
+    }
+}
+
 impl CapabilityStore for PostgresStorage {
     fn put_capabilities(
         &self,

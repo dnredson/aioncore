@@ -14,8 +14,8 @@ use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_rule::{Rule, RuleAction, RuleCondition, RuleEvaluationResult, RuleTriggerType};
 use aion_storage::{
-    EventFilter, InMemoryStorage, PayloadProfile, PostgresStorage, PostgresStorageConfig,
-    StorageBackend, StorageError,
+    ConnectorProfile, EventFilter, InMemoryStorage, IngestionConnector, IngestionConnectorType,
+    PayloadProfile, PostgresStorage, PostgresStorageConfig, StorageBackend, StorageError,
 };
 use axum::{
     body::Bytes,
@@ -298,10 +298,57 @@ pub struct HttpIngestRequest {
     pub mapping: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ConnectorHttpIngestRequest {
+    pub producer_entity_id: Option<Uuid>,
+    pub feature_of_interest_id: Option<Uuid>,
+    pub payload_format: Option<String>,
+    pub protocol: Option<String>,
+    pub content_type: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub payload: Value,
+    pub mapping: Option<Value>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HttpIngestResponse {
     pub raw_message_id: Uuid,
     pub observations: Vec<Observation>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateIngestionConnectorRequest {
+    pub connector_key: String,
+    pub connector_type: IngestionConnectorType,
+    pub connector_profile: ConnectorProfile,
+    #[serde(default)]
+    pub enabled: bool,
+    pub display_name: Option<String>,
+    pub protocol: Option<String>,
+    pub endpoint: Option<String>,
+    pub broker_url: Option<String>,
+    pub client_id: Option<String>,
+    pub topic_filter: Option<String>,
+    pub http_path: Option<String>,
+    pub payload_format: Option<String>,
+    pub content_type: Option<String>,
+    pub default_producer_entity_id: Option<Uuid>,
+    pub default_feature_of_interest_id: Option<Uuid>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestionConnectorStatusResponse {
+    pub connector_id: Uuid,
+    pub connector_key: String,
+    pub connector_type: IngestionConnectorType,
+    pub connector_profile: ConnectorProfile,
+    pub enabled: bool,
+    pub status: &'static str,
+    pub last_error: Option<String>,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub last_successful_ingest_at: Option<DateTime<Utc>>,
+    pub last_failed_ingest_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -577,6 +624,11 @@ pub struct RawMessageResponse {
     pub protocol: Option<String>,
     pub content_type: Option<String>,
     pub payload_format: Option<String>,
+    pub connector_id: Option<Uuid>,
+    pub connector_key: Option<String>,
+    pub connector_profile: Option<String>,
+    pub source_endpoint: Option<String>,
+    pub topic_or_path: Option<String>,
     pub producer_entity_id: Option<Uuid>,
     pub feature_of_interest_id: Option<Uuid>,
     pub received_at: DateTime<Utc>,
@@ -721,6 +773,30 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/mcp", post(handle_mcp_json_rpc))
         .route("/mcp/tools", get(list_mcp_tools))
         .route("/mcp/tools/:tool_name", post(invoke_mcp_tool))
+        .route(
+            "/ingestion/connectors",
+            post(create_ingestion_connector).get(list_ingestion_connectors),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id",
+            get(get_ingestion_connector),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/enable",
+            put(enable_ingestion_connector),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/disable",
+            put(disable_ingestion_connector),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/status",
+            get(get_ingestion_connector_status),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/ingest",
+            post(ingest_http_for_connector),
+        )
         .route("/ingest/http", post(ingest_http))
         .route("/raw-messages", get(query_raw_messages))
         .route("/raw-messages/:raw_message_id", get(get_raw_message))
@@ -2793,9 +2869,150 @@ async fn query_raw_messages(
     Ok(Json(raw_messages))
 }
 
+async fn create_ingestion_connector(
+    State(state): State<AppState>,
+    Json(request): Json<CreateIngestionConnectorRequest>,
+) -> Result<(StatusCode, Json<IngestionConnector>), ApiError> {
+    let connector = IngestionConnector::new(
+        state.tenant_id,
+        request.connector_key,
+        request.connector_type,
+        request.connector_profile,
+        request.enabled,
+        request.display_name,
+        request.protocol,
+        request.endpoint,
+        request.broker_url,
+        request.client_id,
+        request.topic_filter,
+        request.http_path,
+        request.payload_format,
+        request.content_type,
+        request.default_producer_entity_id,
+        request.default_feature_of_interest_id,
+        request.metadata,
+        Utc::now(),
+    )?;
+    let connector = state.storage.create_ingestion_connector(connector)?;
+    record_connector_event(
+        &state,
+        "aion:IngestionConnectorCreated",
+        &connector,
+        Some("Ingestion connector created".to_string()),
+    )?;
+    Ok((StatusCode::CREATED, Json(connector)))
+}
+
+async fn list_ingestion_connectors(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<IngestionConnector>>, ApiError> {
+    Ok(Json(
+        state.storage.list_ingestion_connectors(state.tenant_id)?,
+    ))
+}
+
+async fn get_ingestion_connector(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+) -> Result<Json<IngestionConnector>, ApiError> {
+    Ok(Json(get_connector(&state, connector_id)?))
+}
+
+async fn enable_ingestion_connector(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+) -> Result<Json<IngestionConnector>, ApiError> {
+    let mut connector = get_connector(&state, connector_id)?;
+    connector.set_enabled(true, Utc::now());
+    let connector = state.storage.update_ingestion_connector(connector)?;
+    record_connector_event(
+        &state,
+        "aion:IngestionConnectorEnabled",
+        &connector,
+        Some("Ingestion connector enabled".to_string()),
+    )?;
+    Ok(Json(connector))
+}
+
+async fn disable_ingestion_connector(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+) -> Result<Json<IngestionConnector>, ApiError> {
+    let mut connector = get_connector(&state, connector_id)?;
+    connector.set_enabled(false, Utc::now());
+    let connector = state.storage.update_ingestion_connector(connector)?;
+    record_connector_event(
+        &state,
+        "aion:IngestionConnectorDisabled",
+        &connector,
+        Some("Ingestion connector disabled".to_string()),
+    )?;
+    Ok(Json(connector))
+}
+
+async fn get_ingestion_connector_status(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+) -> Result<Json<IngestionConnectorStatusResponse>, ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    Ok(Json(connector_status(&connector)))
+}
+
+async fn ingest_http_for_connector(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+    Json(request): Json<ConnectorHttpIngestRequest>,
+) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    if !connector.enabled {
+        return Err(ApiError::bad_request("ingestion connector is disabled"));
+    }
+
+    let producer_entity_id = request
+        .producer_entity_id
+        .or(connector.default_producer_entity_id)
+        .ok_or_else(|| ApiError::bad_request("producer_entity_id is required"))?;
+    let feature_of_interest_id = request
+        .feature_of_interest_id
+        .or(connector.default_feature_of_interest_id)
+        .ok_or_else(|| ApiError::bad_request("feature_of_interest_id is required"))?;
+    let payload_format = request
+        .payload_format
+        .or_else(|| connector.payload_format.clone())
+        .ok_or_else(|| ApiError::bad_request("payload_format is required"))?;
+    let protocol = request
+        .protocol
+        .or_else(|| connector.protocol.clone())
+        .unwrap_or_else(|| "http".to_string());
+    let content_type = request
+        .content_type
+        .or_else(|| connector.content_type.clone());
+
+    let request = HttpIngestRequest {
+        producer_entity_id,
+        feature_of_interest_id,
+        payload_format,
+        protocol,
+        content_type,
+        observed_at: request.observed_at,
+        payload: request.payload,
+        mapping: request.mapping,
+    };
+
+    ingest_http_resolved(&state, request, Some(connector)).await
+}
+
 async fn ingest_http(
     State(state): State<AppState>,
     Json(request): Json<HttpIngestRequest>,
+) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
+    ingest_http_resolved(&state, request, None).await
+}
+
+async fn ingest_http_resolved(
+    state: &AppState,
+    request: HttpIngestRequest,
+    connector: Option<IngestionConnector>,
 ) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
     ensure_entity_exists(&state, request.producer_entity_id)?;
     ensure_entity_exists(&state, request.feature_of_interest_id)?;
@@ -2816,26 +3033,50 @@ async fn ingest_http(
     } else {
         "none"
     };
+    let connector_metadata = connector.as_ref().map(connector_event_metadata);
+    let source_ref = connector
+        .as_ref()
+        .and_then(|connector| connector.http_path.clone())
+        .unwrap_or_else(|| "/ingest/http".to_string());
+    let mut headers = json!({
+        "protocol": request.protocol,
+        "payload_format": request.payload_format,
+        "producer_entity_id": request.producer_entity_id,
+        "feature_of_interest_id": request.feature_of_interest_id,
+        "source_endpoint": connector
+            .as_ref()
+            .and_then(|connector| connector.endpoint.clone())
+            .or_else(|| Some(source_ref.clone())),
+        "topic_or_path": source_ref,
+        "decoder_metadata": {
+            "decoder": request.payload_format,
+            "mapping_source": mapping_source
+        }
+    });
+    if let (Some(object), Some(metadata)) = (headers.as_object_mut(), connector_metadata.clone()) {
+        object.insert("connector".to_string(), metadata.clone());
+        object.insert("connector_id".to_string(), metadata["connector_id"].clone());
+        object.insert(
+            "connector_key".to_string(),
+            metadata["connector_key"].clone(),
+        );
+        object.insert(
+            "connector_profile".to_string(),
+            metadata["connector_profile"].clone(),
+        );
+    }
+
     let mut raw_message = RawMessage::new(
         state.tenant_id,
         RawMessageSource::Http,
-        Some("/ingest/http".to_string()),
+        Some(source_ref),
         Some(request.producer_entity_id.to_string()),
         Some(request.payload_format.clone()),
         request.content_type.clone(),
         Some(request.producer_entity_id),
         Some(request.feature_of_interest_id),
         Some(request.payload_format.clone()),
-        json!({
-            "protocol": request.protocol,
-            "payload_format": request.payload_format,
-            "producer_entity_id": request.producer_entity_id,
-            "feature_of_interest_id": request.feature_of_interest_id,
-            "decoder_metadata": {
-                "decoder": request.payload_format,
-                "mapping_source": mapping_source
-            }
-        }),
+        headers,
         payload_bytes.clone(),
         received_at,
     )
@@ -2862,10 +3103,13 @@ async fn ingest_http(
             request.feature_of_interest_id,
             raw_message.id,
             Some(message.clone()),
-            json!({
-                "payload_format": request.payload_format,
-                "reason": "missing_mapping"
-            }),
+            metadata_with_connector(
+                json!({
+                    "payload_format": request.payload_format,
+                    "reason": "missing_mapping"
+                }),
+                connector_metadata.clone(),
+            ),
         )?;
         return Err(ApiError::bad_request(message));
     }
@@ -2884,10 +3128,13 @@ async fn ingest_http(
                 request.feature_of_interest_id,
                 raw_message.id,
                 Some(err.message.clone()),
-                json!({
-                    "payload_format": request.payload_format,
-                    "reason": "unsupported_payload_format"
-                }),
+                metadata_with_connector(
+                    json!({
+                        "payload_format": request.payload_format,
+                        "reason": "unsupported_payload_format"
+                    }),
+                    connector_metadata.clone(),
+                ),
             )?;
             return Err(err);
         }
@@ -2918,10 +3165,13 @@ async fn ingest_http(
                 request.feature_of_interest_id,
                 raw_message.id,
                 Some(err.message().to_string()),
-                json!({
-                    "payload_format": request.payload_format,
-                    "reason": "decoder_error"
-                }),
+                metadata_with_connector(
+                    json!({
+                        "payload_format": request.payload_format,
+                        "reason": "decoder_error"
+                    }),
+                    connector_metadata.clone(),
+                ),
             )?;
             return Err(ApiError::bad_request(err.to_string()));
         }
@@ -2941,7 +3191,7 @@ async fn ingest_http(
             request.protocol.clone(),
             request.payload_format.clone(),
             Some(raw_message.id),
-            json!({}),
+            connector_metadata.clone().unwrap_or_else(|| json!({})),
             measurement.metadata,
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -2961,10 +3211,13 @@ async fn ingest_http(
         request.feature_of_interest_id,
         raw_message.id,
         Some("Payload ingested and normalized".to_string()),
-        json!({
-            "payload_format": request.payload_format,
-            "observation_count": observations.len()
-        }),
+        metadata_with_connector(
+            json!({
+                "payload_format": request.payload_format,
+                "observation_count": observations.len()
+            }),
+            connector_metadata,
+        ),
     )?;
 
     Ok((
@@ -3012,6 +3265,12 @@ fn raw_message_response(raw_message: RawMessage) -> RawMessageResponse {
         .or(raw_message.decoder_hint.clone());
     let producer_entity_id = raw_message_uuid_header(&raw_message, "producer_entity_id");
     let feature_of_interest_id = raw_message_uuid_header(&raw_message, "feature_of_interest_id");
+    let connector_id = raw_message_uuid_header(&raw_message, "connector_id");
+    let connector_key = raw_message_string_header(&raw_message, "connector_key");
+    let connector_profile = raw_message_string_header(&raw_message, "connector_profile");
+    let source_endpoint = raw_message_string_header(&raw_message, "source_endpoint");
+    let topic_or_path = raw_message_string_header(&raw_message, "topic_or_path")
+        .or_else(|| raw_message.source_ref.clone());
     let decoder_metadata = raw_message
         .headers
         .get("decoder_metadata")
@@ -3026,6 +3285,11 @@ fn raw_message_response(raw_message: RawMessage) -> RawMessageResponse {
         protocol,
         content_type: raw_message.content_type,
         payload_format,
+        connector_id,
+        connector_key,
+        connector_profile,
+        source_endpoint,
+        topic_or_path,
         producer_entity_id,
         feature_of_interest_id,
         received_at: raw_message.received_at,
@@ -3066,6 +3330,71 @@ fn ensure_entity_exists(state: &AppState, entity_id: Uuid) -> Result<(), ApiErro
         .get_entity(state.tenant_id, entity_id)?
         .map(|_| ())
         .ok_or_else(ApiError::not_found)
+}
+
+fn get_connector(state: &AppState, connector_id: Uuid) -> Result<IngestionConnector, ApiError> {
+    state
+        .storage
+        .get_ingestion_connector(state.tenant_id, connector_id)?
+        .ok_or_else(ApiError::not_found)
+}
+
+fn connector_status(connector: &IngestionConnector) -> IngestionConnectorStatusResponse {
+    let (status, last_error) = if !connector.enabled {
+        ("disabled", None)
+    } else {
+        match connector.connector_type {
+            IngestionConnectorType::Http => ("ready", None),
+            IngestionConnectorType::Mqtt => (
+                "degraded",
+                Some("dynamic MQTT workers per connector are not implemented yet".to_string()),
+            ),
+            IngestionConnectorType::Future => (
+                "degraded",
+                Some("future connector runtime is not implemented yet".to_string()),
+            ),
+        }
+    };
+
+    IngestionConnectorStatusResponse {
+        connector_id: connector.id,
+        connector_key: connector.connector_key.clone(),
+        connector_type: connector.connector_type.clone(),
+        connector_profile: connector.connector_profile.clone(),
+        enabled: connector.enabled,
+        status,
+        last_error,
+        last_message_at: None,
+        last_successful_ingest_at: None,
+        last_failed_ingest_at: None,
+    }
+}
+
+fn connector_event_metadata(connector: &IngestionConnector) -> Value {
+    json!({
+        "connector_id": connector.id,
+        "connector_key": connector.connector_key,
+        "connector_type": connector.connector_type,
+        "connector_profile": connector.connector_profile,
+        "enabled": connector.enabled
+    })
+}
+
+fn metadata_with_connector(mut metadata: Value, connector_metadata: Option<Value>) -> Value {
+    let Some(connector_metadata) = connector_metadata else {
+        return metadata;
+    };
+
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("connector".to_string(), connector_metadata.clone());
+        for key in ["connector_id", "connector_key", "connector_profile"] {
+            if let Some(value) = connector_metadata.get(key) {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    metadata
 }
 
 fn ensure_command_exists(state: &AppState, command_id: Uuid) -> Result<(), ApiError> {
@@ -3493,6 +3822,33 @@ fn record_command_event(
                 "approval_status": command.approval_status,
                 "claimed_by": command.claimed_by
             })),
+        },
+    )
+}
+
+fn record_connector_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    connector: &IngestionConnector,
+    message: Option<String>,
+) -> Result<Event, ApiError> {
+    record_event(
+        state,
+        EventDraft {
+            event_type: event_type.into(),
+            severity: EventSeverity::Info,
+            source_entity_id: None,
+            target_entity_id: None,
+            message,
+            occurred_at: Utc::now(),
+            observed_at: None,
+            correlation_id: None,
+            raw_message_id: None,
+            observation_id: None,
+            command_id: None,
+            action_id: None,
+            action_result_id: None,
+            metadata: Some(connector_event_metadata(connector)),
         },
     )
 }
@@ -6553,6 +6909,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_lists_and_gets_ingestion_connector() {
+        let app = app();
+        let connector = create_http_connector(&app, "http-connector-01", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ingestion/connectors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let connectors = to_json(list_response).await;
+        assert_eq!(connectors.as_array().unwrap().len(), 1);
+        assert_eq!(connectors[0]["connector_key"], "http-connector-01");
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ingestion/connectors/{connector_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let fetched = to_json(get_response).await;
+        assert_eq!(fetched["id"], connector_id);
+        assert_eq!(fetched["connector_profile"], "custom");
+    }
+
+    #[tokio::test]
+    async fn enables_and_disables_ingestion_connector() {
+        let app = app();
+        let connector = create_http_connector(&app, "http-connector-toggle", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let enabled = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/ingestion/connectors/{connector_id}/enable"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(enabled.status(), StatusCode::OK);
+        assert_eq!(to_json(enabled).await["enabled"], true);
+
+        let disabled = app
+            .oneshot(json_request(
+                "PUT",
+                &format!("/ingestion/connectors/{connector_id}/disable"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+        assert_eq!(to_json(disabled).await["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn disabled_connector_status_includes_profile() {
+        let app = app();
+        let connector = create_http_connector(&app, "http-connector-status", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        let disabled = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/ingestion/connectors/{connector_id}/disable"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ingestion/connectors/{connector_id}/status"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = to_json(response).await;
+        assert_eq!(status["status"], "disabled");
+        assert_eq!(status["connector_profile"], "custom");
+    }
+
+    #[tokio::test]
+    async fn connector_http_ingestion_uses_payload_format_default_and_stores_metadata() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "connector-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "connector-plot-01", "aion:Plot").await;
+        let connector = create_http_connector(
+            &app,
+            "http-connector-ingest",
+            Some(&sensor_id),
+            Some(&plot_id),
+        )
+        .await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": [
+                        {"n": "soil_moisture", "u": "%", "v": 22.0}
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+
+        let raw_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/raw-messages/{raw_message_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_response.status(), StatusCode::OK);
+        let raw_message = to_json(raw_response).await;
+        assert_eq!(raw_message["payload_format"], "senml-json");
+        assert_eq!(raw_message["connector_id"], connector_id);
+        assert_eq!(raw_message["connector_key"], "http-connector-ingest");
+        assert_eq!(raw_message["connector_profile"], "custom");
+
+        let event_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/events?raw_message_id={raw_message_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(event_response.status(), StatusCode::OK);
+        let events = to_json(event_response).await;
+        let ingested = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "aion:PayloadIngested")
+            .expect("payload ingested event should exist");
+        assert_eq!(ingested["metadata"]["connector_id"], connector_id);
+        assert_eq!(
+            ingested["metadata"]["connector_key"],
+            "http-connector-ingest"
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_ttn_v3_connector() {
+        let app = app();
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": "ttn-v3-demo",
+                    "connector_type": "mqtt",
+                    "connector_profile": "ttn-v3",
+                    "enabled": false,
+                    "broker_url": "mqtt://eu1.cloud.thethings.network:1883",
+                    "topic_filter": "v3/demo-app/devices/+/up",
+                    "payload_format": "ttn-uplink-json"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let connector = to_json(response).await;
+        assert_eq!(connector["connector_profile"], "ttn-v3");
+        assert_eq!(connector["payload_format"], "ttn-uplink-json");
+    }
+
+    #[tokio::test]
+    async fn existing_http_ingestion_without_connector_still_works() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "no-connector-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "no-connector-plot-01", "aion:Plot").await;
+
+        let ingest = ingest_test_senml(&app, &sensor_id, &plot_id).await;
+        assert!(ingest["raw_message_id"].as_str().is_some());
+        assert_eq!(ingest["observations"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn queries_raw_message_by_id() {
         let app = app();
         let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
@@ -7566,6 +8130,38 @@ mod tests {
                             "v": 24.1
                         }
                     ]
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_http_connector(
+        app: &Router,
+        connector_key: &str,
+        producer_entity_id: Option<&str>,
+        feature_of_interest_id: Option<&str>,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": connector_key,
+                    "connector_type": "http",
+                    "connector_profile": "custom",
+                    "enabled": true,
+                    "protocol": "http",
+                    "endpoint": "/ingestion/connectors/{connector_id}/ingest",
+                    "http_path": "/ingestion/connectors/{connector_id}/ingest",
+                    "payload_format": "senml-json",
+                    "content_type": "application/senml+json",
+                    "default_producer_entity_id": producer_entity_id,
+                    "default_feature_of_interest_id": feature_of_interest_id
                 }),
             ))
             .await

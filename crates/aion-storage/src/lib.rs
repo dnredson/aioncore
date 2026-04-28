@@ -76,6 +76,106 @@ pub struct PayloadProfile {
     pub metadata: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IngestionConnectorType {
+    Http,
+    Mqtt,
+    Future,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConnectorProfile {
+    GenericAionMqtt,
+    GenericMqtt,
+    TtnV3,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestionConnector {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub connector_key: String,
+    pub connector_type: IngestionConnectorType,
+    pub connector_profile: ConnectorProfile,
+    pub enabled: bool,
+    pub display_name: Option<String>,
+    pub protocol: Option<String>,
+    pub endpoint: Option<String>,
+    pub broker_url: Option<String>,
+    pub client_id: Option<String>,
+    pub topic_filter: Option<String>,
+    pub http_path: Option<String>,
+    pub payload_format: Option<String>,
+    pub content_type: Option<String>,
+    pub default_producer_entity_id: Option<Uuid>,
+    pub default_feature_of_interest_id: Option<Uuid>,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl IngestionConnector {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tenant_id: Uuid,
+        connector_key: impl Into<String>,
+        connector_type: IngestionConnectorType,
+        connector_profile: ConnectorProfile,
+        enabled: bool,
+        display_name: Option<String>,
+        protocol: Option<String>,
+        endpoint: Option<String>,
+        broker_url: Option<String>,
+        client_id: Option<String>,
+        topic_filter: Option<String>,
+        http_path: Option<String>,
+        payload_format: Option<String>,
+        content_type: Option<String>,
+        default_producer_entity_id: Option<Uuid>,
+        default_feature_of_interest_id: Option<Uuid>,
+        metadata: Option<Value>,
+        now: DateTime<Utc>,
+    ) -> StorageResult<Self> {
+        let connector_key = connector_key.into();
+        if connector_key.trim().is_empty() {
+            return Err(StorageError::InvalidInput(
+                "connector_key must not be empty".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            tenant_id,
+            connector_key,
+            connector_type,
+            connector_profile,
+            enabled,
+            display_name,
+            protocol,
+            endpoint,
+            broker_url,
+            client_id,
+            topic_filter,
+            http_path,
+            payload_format,
+            content_type,
+            default_producer_entity_id,
+            default_feature_of_interest_id,
+            metadata,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool, now: DateTime<Utc>) {
+        self.enabled = enabled;
+        self.updated_at = now;
+    }
+}
+
 impl PayloadProfile {
     pub fn new(
         entity_id: Uuid,
@@ -207,6 +307,23 @@ pub trait PayloadProfileStore {
         tenant_id: Uuid,
         entity_id: Uuid,
     ) -> StorageResult<Option<PayloadProfile>>;
+}
+
+pub trait IngestionConnectorStore {
+    fn create_ingestion_connector(
+        &self,
+        connector: IngestionConnector,
+    ) -> StorageResult<IngestionConnector>;
+    fn get_ingestion_connector(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+    ) -> StorageResult<Option<IngestionConnector>>;
+    fn list_ingestion_connectors(&self, tenant_id: Uuid) -> StorageResult<Vec<IngestionConnector>>;
+    fn update_ingestion_connector(
+        &self,
+        connector: IngestionConnector,
+    ) -> StorageResult<IngestionConnector>;
 }
 
 pub trait CapabilityStore {
@@ -345,6 +462,7 @@ pub trait ControlPlaneStore:
     + EntityStore
     + RelationshipStore
     + PayloadProfileStore
+    + IngestionConnectorStore
     + CapabilityStore
     + PolicyStore
     + CommandStore
@@ -361,6 +479,7 @@ impl<T> ControlPlaneStore for T where
         + EntityStore
         + RelationshipStore
         + PayloadProfileStore
+        + IngestionConnectorStore
         + CapabilityStore
         + PolicyStore
         + CommandStore
@@ -425,6 +544,8 @@ struct InMemoryState {
     raw_messages: HashMap<Uuid, RawMessage>,
     observations: HashMap<Uuid, Observation>,
     payload_profiles: HashMap<(Uuid, Uuid), PayloadProfile>,
+    ingestion_connectors: HashMap<Uuid, IngestionConnector>,
+    ingestion_connector_key_index: HashMap<(Uuid, String), Uuid>,
     capabilities: HashMap<(Uuid, Uuid), Vec<Capability>>,
     executors: HashMap<Uuid, ExecutorAgent>,
     executor_key_index: HashMap<(Uuid, String), Uuid>,
@@ -779,6 +900,70 @@ impl PayloadProfileStore for InMemoryStorage {
             .payload_profiles
             .get(&(tenant_id, entity_id))
             .cloned())
+    }
+}
+
+impl IngestionConnectorStore for InMemoryStorage {
+    fn create_ingestion_connector(
+        &self,
+        connector: IngestionConnector,
+    ) -> StorageResult<IngestionConnector> {
+        let mut state = self.write_state()?;
+        let index_key = (connector.tenant_id, connector.connector_key.clone());
+        if state.ingestion_connectors.contains_key(&connector.id)
+            || state.ingestion_connector_key_index.contains_key(&index_key)
+        {
+            return Err(StorageError::Conflict);
+        }
+
+        state
+            .ingestion_connector_key_index
+            .insert(index_key, connector.id);
+        state
+            .ingestion_connectors
+            .insert(connector.id, connector.clone());
+        Ok(connector)
+    }
+
+    fn get_ingestion_connector(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+    ) -> StorageResult<Option<IngestionConnector>> {
+        Ok(self
+            .read_state()?
+            .ingestion_connectors
+            .get(&connector_id)
+            .filter(|connector| connector.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn list_ingestion_connectors(&self, tenant_id: Uuid) -> StorageResult<Vec<IngestionConnector>> {
+        let mut connectors = self
+            .read_state()?
+            .ingestion_connectors
+            .values()
+            .filter(|connector| connector.tenant_id == tenant_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        connectors.sort_by(|left, right| left.connector_key.cmp(&right.connector_key));
+        Ok(connectors)
+    }
+
+    fn update_ingestion_connector(
+        &self,
+        connector: IngestionConnector,
+    ) -> StorageResult<IngestionConnector> {
+        let mut state = self.write_state()?;
+        let stored = state
+            .ingestion_connectors
+            .get_mut(&connector.id)
+            .filter(|stored| stored.tenant_id == connector.tenant_id)
+            .ok_or(StorageError::NotFound)?;
+
+        *stored = connector.clone();
+        Ok(connector)
     }
 }
 
@@ -1596,6 +1781,52 @@ mod tests {
                 .unwrap(),
             profile
         );
+    }
+
+    #[test]
+    fn in_memory_storage_creates_and_lists_ingestion_connectors() {
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let connector = IngestionConnector::new(
+            tenant_id,
+            "default-http",
+            IngestionConnectorType::Http,
+            ConnectorProfile::Custom,
+            false,
+            Some("Default HTTP".to_string()),
+            Some("http".to_string()),
+            Some("/ingestion/connectors/default-http/ingest".to_string()),
+            None,
+            None,
+            None,
+            Some("/ingestion/connectors/default-http/ingest".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/senml+json".to_string()),
+            None,
+            None,
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+
+        let connector = storage.create_ingestion_connector(connector).unwrap();
+        assert_eq!(
+            storage
+                .get_ingestion_connector(tenant_id, connector.id)
+                .unwrap()
+                .unwrap()
+                .connector_key,
+            "default-http"
+        );
+        assert_eq!(
+            storage.list_ingestion_connectors(tenant_id).unwrap().len(),
+            1
+        );
+
+        let mut enabled = connector.clone();
+        enabled.set_enabled(true, Utc::now());
+        let enabled = storage.update_ingestion_connector(enabled).unwrap();
+        assert!(enabled.enabled);
     }
 
     #[test]
