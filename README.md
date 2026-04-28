@@ -101,6 +101,20 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
 
 `/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` is the storage readiness check. In memory mode it returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable.
 
+Runtime validation scripts:
+
+```powershell
+.\scripts\validate-memory-runtime.ps1
+.\scripts\validate-memory-runtime.ps1 -BaseUrl "http://127.0.0.1:8081"
+```
+
+```powershell
+$env:AIONCORE_DATABASE_URL = "postgres://user:password@localhost:5432/aioncore"
+.\scripts\validate-postgres-runtime.ps1
+```
+
+The scripts are PowerShell-first and work with Windows PowerShell and PowerShell 7.
+
 ## Optional PostgreSQL Adapter Tests
 
 Set `AIONCORE_TEST_DATABASE_URL` to a PostgreSQL database that has the required extensions available, then run the storage crate tests that target the adapter:
@@ -125,6 +139,13 @@ Troubleshooting:
 - If startup exits with `AIONCORE_DATABASE_URL is required when AIONCORE_STORAGE_BACKEND=postgres`, set the database URL before starting the API.
 - If `/ready` returns not ready in postgres mode, check database connectivity and confirm the migrations can run against the target database.
 - If an unknown backend value is set, the API fails fast instead of silently changing modes.
+
+For convenience, the startup wrappers are:
+
+```powershell
+.\scripts\start-memory-runtime.ps1
+.\scripts\start-postgres-runtime.ps1 -DatabaseUrl "postgres://user:password@localhost:5432/aioncore"
+```
 
 Telemetry parity tests cover raw message filtering, canonical observation storage, and event storage/query behavior:
 
