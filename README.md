@@ -568,4 +568,92 @@ Invoke-RestMethod `
   } | ConvertTo-Json -Depth 10)
 ```
 
+Create and query audit events:
+
+```powershell
+$manualEvent = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/events" `
+  -ContentType "application/json" `
+  -Body (@{
+    event_type = "aion:ManualAuditEvent"
+    severity = "info"
+    target_entity_id = $pump.id
+    message = "Manual event for audit testing"
+    occurred_at = "2026-04-27T13:01:00Z"
+    correlation_id = "manual-audit-001"
+    command_id = $claimed.id
+    metadata = @{ source = "operator" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events/$($manualEvent.id)"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?target_entity_id=$($pump.id)"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?event_type=aion:ManualAuditEvent"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?severity=info"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?correlation_id=manual-audit-001"
+```
+
+Query events created by ingestion:
+
+```powershell
+$sensor = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "event-soil-sensor-01"
+    entity_type = "aion:Sensor"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:farm:event-soil-sensor:01"
+      "@type" = "aion:Sensor"
+      name = "Event Soil Sensor 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$plot = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "event-plot-01"
+    entity_type = "aion:Plot"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:farm:event-plot:01"
+      "@type" = "aion:Plot"
+      name = "Event Plot 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$ingest = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingest/http" `
+  -ContentType "application/json" `
+  -Body (@{
+    producer_entity_id = $sensor.id
+    feature_of_interest_id = $plot.id
+    payload_format = "senml-json"
+    protocol = "http"
+    content_type = "application/senml+json"
+    payload = @(
+      @{
+        bn = "urn:aion:farm:event-soil-sensor:01:"
+        bt = 1777294800
+        n = "soil_moisture"
+        u = "%"
+        v = 18.5
+      }
+    )
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?raw_message_id=$($ingest.raw_message_id)"
+```
+
+Query command lifecycle events:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?command_id=$($claimed.id)"
+```
+
 In-memory data is lost when the process exits.

@@ -1,5 +1,6 @@
 use aion_action::{Action, ActionResult, Capability, Command, CommandStatus, Policy};
 use aion_entity::Entity;
+use aion_event::{Event, EventSeverity};
 use aion_observation::Observation;
 use aion_raw_message::RawMessage;
 use aion_relationship::Relationship;
@@ -235,6 +236,23 @@ pub trait ActionResultStore {
     ) -> StorageResult<Vec<ActionResult>>;
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventFilter {
+    pub source_entity_id: Option<Uuid>,
+    pub target_entity_id: Option<Uuid>,
+    pub event_type: Option<String>,
+    pub severity: Option<EventSeverity>,
+    pub command_id: Option<Uuid>,
+    pub raw_message_id: Option<Uuid>,
+    pub correlation_id: Option<String>,
+}
+
+pub trait EventStore {
+    fn store_event(&self, event: Event) -> StorageResult<Event>;
+    fn get_event(&self, tenant_id: Uuid, event_id: Uuid) -> StorageResult<Option<Event>>;
+    fn query_events(&self, tenant_id: Uuid, filter: EventFilter) -> StorageResult<Vec<Event>>;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStorage {
     inner: Arc<RwLock<InMemoryState>>,
@@ -255,6 +273,7 @@ struct InMemoryState {
     policies: HashMap<Uuid, Policy>,
     actions: HashMap<Uuid, Action>,
     action_results: HashMap<Uuid, ActionResult>,
+    events: HashMap<Uuid, Event>,
 }
 
 impl InMemoryStorage {
@@ -770,6 +789,85 @@ impl ActionResultStore for InMemoryStorage {
     }
 }
 
+impl EventStore for InMemoryStorage {
+    fn store_event(&self, event: Event) -> StorageResult<Event> {
+        let mut state = self.write_state()?;
+        if state.events.contains_key(&event.id) {
+            return Err(StorageError::Conflict);
+        }
+
+        state.events.insert(event.id, event.clone());
+        Ok(event)
+    }
+
+    fn get_event(&self, tenant_id: Uuid, event_id: Uuid) -> StorageResult<Option<Event>> {
+        Ok(self
+            .read_state()?
+            .events
+            .get(&event_id)
+            .filter(|event| event.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn query_events(&self, tenant_id: Uuid, filter: EventFilter) -> StorageResult<Vec<Event>> {
+        let mut events = self
+            .read_state()?
+            .events
+            .values()
+            .filter(|event| event.tenant_id == tenant_id)
+            .filter(|event| {
+                filter
+                    .source_entity_id
+                    .map(|id| event.source_entity_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .target_entity_id
+                    .map(|id| event.target_entity_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .event_type
+                    .as_deref()
+                    .map(|event_type| event.event_type == event_type)
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .severity
+                    .as_ref()
+                    .map(|severity| event.severity == *severity)
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .command_id
+                    .map(|id| event.command_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .raw_message_id
+                    .map(|id| event.raw_message_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .correlation_id
+                    .as_deref()
+                    .map(|correlation_id| event.correlation_id.as_deref() == Some(correlation_id))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        events.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
+        Ok(events)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,5 +1157,54 @@ mod tests {
                 .unwrap(),
             vec![result]
         );
+    }
+
+    #[test]
+    fn in_memory_storage_filters_events() {
+        use aion_event::{Event, EventSeverity};
+        use chrono::TimeZone;
+        use serde_json::json;
+
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let target_entity_id = Uuid::new_v4();
+        let command_id = Uuid::new_v4();
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let event = Event::new(
+            tenant_id,
+            "aion:CommandCreated",
+            EventSeverity::Info,
+            None,
+            Some(target_entity_id),
+            Some("Command created".to_string()),
+            now,
+            None,
+            Some("corr-001".to_string()),
+            None,
+            None,
+            Some(command_id),
+            None,
+            None,
+            Some(json!({"source": "test"})),
+            now,
+        )
+        .unwrap();
+
+        storage.store_event(event.clone()).unwrap();
+        let events = storage
+            .query_events(
+                tenant_id,
+                EventFilter {
+                    target_entity_id: Some(target_entity_id),
+                    event_type: Some("aion:CommandCreated".to_string()),
+                    severity: Some(EventSeverity::Info),
+                    command_id: Some(command_id),
+                    correlation_id: Some("corr-001".to_string()),
+                    ..EventFilter::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(events, vec![event]);
     }
 }

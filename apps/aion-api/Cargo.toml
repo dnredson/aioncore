@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 aion-action.workspace = true
 aion-entity.workspace = true
+aion-event.workspace = true
 aion-observation.workspace = true
 aion-payload.workspace = true
 aion-raw-message.workspace = true

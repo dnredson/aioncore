@@ -2,6 +2,7 @@ use aion_action::{
     Action, ActionResult, ApprovalStatus, Capability, Command, CommandStatus, Policy,
 };
 use aion_entity::Entity;
+use aion_event::{Event, EventSeverity};
 use aion_observation::{Observation, ObservationValue};
 use aion_payload::{
     CanonicalJsonDecoder, DecodeInput, PayloadDecoder, PayloadFormat, SenMlJsonDecoder,
@@ -10,9 +11,9 @@ use aion_payload::{
 use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_storage::{
-    ActionResultStore, ActionStore, CapabilityStore, CommandStore, EntityStore, InMemoryStorage,
-    ObservationStore, PayloadProfile, PayloadProfileStore, PolicyStore, RawMessageStore,
-    RelationshipStore, StorageError,
+    ActionResultStore, ActionStore, CapabilityStore, CommandStore, EntityStore, EventFilter,
+    EventStore, InMemoryStorage, ObservationStore, PayloadProfile, PayloadProfileStore,
+    PolicyStore, RawMessageStore, RelationshipStore, StorageError,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -203,6 +204,35 @@ pub struct ActionResultQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CreateEventRequest {
+    pub event_type: String,
+    pub severity: EventSeverity,
+    pub source_entity_id: Option<Uuid>,
+    pub target_entity_id: Option<Uuid>,
+    pub message: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub correlation_id: Option<String>,
+    pub raw_message_id: Option<Uuid>,
+    pub observation_id: Option<Uuid>,
+    pub command_id: Option<Uuid>,
+    pub action_id: Option<Uuid>,
+    pub action_result_id: Option<Uuid>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventQuery {
+    pub source_entity_id: Option<Uuid>,
+    pub target_entity_id: Option<Uuid>,
+    pub event_type: Option<String>,
+    pub severity: Option<EventSeverity>,
+    pub command_id: Option<Uuid>,
+    pub raw_message_id: Option<Uuid>,
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ObservationQuery {
     pub feature_of_interest_id: Option<Uuid>,
     pub observed_property: Option<String>,
@@ -287,6 +317,8 @@ pub fn app_with_state(state: AppState) -> Router {
             "/action-results",
             post(create_action_result).get(query_action_results),
         )
+        .route("/events", post(create_event).get(query_events))
+        .route("/events/:event_id", get(get_event))
         .route("/ingest/http", post(ingest_http))
         .route("/raw-messages", get(query_raw_messages))
         .route("/raw-messages/:raw_message_id", get(get_raw_message))
@@ -610,6 +642,13 @@ async fn create_command(
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let command = state.storage.store_command(command)?;
+    record_command_event(
+        &state,
+        "aion:CommandCreated",
+        EventSeverity::Info,
+        &command,
+        None,
+    )?;
     Ok((StatusCode::CREATED, Json(command)))
 }
 
@@ -618,25 +657,39 @@ async fn claim_command(
     Path(command_id): Path<Uuid>,
     Json(request): Json<ClaimCommandRequest>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(&state, command_id, |command, now| {
-        command.claim(request.claimed_by, now)
-    })
+    mutate_command(
+        &state,
+        command_id,
+        "aion:CommandClaimed",
+        EventSeverity::Info,
+        |command, now| command.claim(request.claimed_by, now),
+    )
 }
 
 async fn release_command(
     State(state): State<AppState>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(&state, command_id, |command, now| command.release(now))
+    mutate_command(
+        &state,
+        command_id,
+        "aion:CommandReleased",
+        EventSeverity::Info,
+        |command, now| command.release(now),
+    )
 }
 
 async fn mark_command_executed(
     State(state): State<AppState>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(&state, command_id, |command, now| {
-        command.mark_executed(now)
-    })
+    mutate_command(
+        &state,
+        command_id,
+        "aion:CommandExecuted",
+        EventSeverity::Info,
+        |command, now| command.mark_executed(now),
+    )
 }
 
 async fn mark_command_failed(
@@ -644,30 +697,52 @@ async fn mark_command_failed(
     Path(command_id): Path<Uuid>,
     Json(request): Json<MarkFailedCommandRequest>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(&state, command_id, |command, now| {
-        command.mark_failed(request.failure_reason, now)
-    })
+    mutate_command(
+        &state,
+        command_id,
+        "aion:CommandFailed",
+        EventSeverity::Error,
+        |command, now| command.mark_failed(request.failure_reason, now),
+    )
 }
 
 async fn cancel_command(
     State(state): State<AppState>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(&state, command_id, |command, now| command.cancel(now))
+    mutate_command(
+        &state,
+        command_id,
+        "aion:CommandCancelled",
+        EventSeverity::Warning,
+        |command, now| command.cancel(now),
+    )
 }
 
 async fn approve_command(
     State(state): State<AppState>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(&state, command_id, |command, now| command.approve(now))
+    mutate_command(
+        &state,
+        command_id,
+        "aion:CommandApproved",
+        EventSeverity::Info,
+        |command, now| command.approve(now),
+    )
 }
 
 async fn reject_command(
     State(state): State<AppState>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(&state, command_id, |command, now| command.reject(now))
+    mutate_command(
+        &state,
+        command_id,
+        "aion:CommandRejected",
+        EventSeverity::Warning,
+        |command, now| command.reject(now),
+    )
 }
 
 async fn get_command(
@@ -780,6 +855,83 @@ async fn query_action_results(
         state.tenant_id,
         query.action_id,
         query.command_id,
+    )?))
+}
+
+async fn create_event(
+    State(state): State<AppState>,
+    Json(request): Json<CreateEventRequest>,
+) -> Result<(StatusCode, Json<Event>), ApiError> {
+    if let Some(source_entity_id) = request.source_entity_id {
+        ensure_entity_exists(&state, source_entity_id)?;
+    }
+    if let Some(target_entity_id) = request.target_entity_id {
+        ensure_entity_exists(&state, target_entity_id)?;
+    }
+    if let Some(command_id) = request.command_id {
+        ensure_command_exists(&state, command_id)?;
+    }
+    if let Some(action_id) = request.action_id {
+        ensure_action_exists(&state, action_id)?;
+    }
+    if let Some(action_result_id) = request.action_result_id {
+        ensure_action_result_exists(&state, action_result_id)?;
+    }
+    if let Some(raw_message_id) = request.raw_message_id {
+        ensure_raw_message_exists(&state, raw_message_id)?;
+    }
+
+    let event = Event::new(
+        state.tenant_id,
+        request.event_type,
+        request.severity,
+        request.source_entity_id,
+        request.target_entity_id,
+        request.message,
+        request.occurred_at,
+        request.observed_at,
+        request.correlation_id,
+        request.raw_message_id,
+        request.observation_id,
+        request.command_id,
+        request.action_id,
+        request.action_result_id,
+        request.metadata,
+        Utc::now(),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    let event = state.storage.store_event(event)?;
+    Ok((StatusCode::CREATED, Json(event)))
+}
+
+async fn get_event(
+    State(state): State<AppState>,
+    Path(event_id): Path<Uuid>,
+) -> Result<Json<Event>, ApiError> {
+    let event = state
+        .storage
+        .get_event(state.tenant_id, event_id)?
+        .ok_or_else(ApiError::not_found)?;
+
+    Ok(Json(event))
+}
+
+async fn query_events(
+    State(state): State<AppState>,
+    Query(query): Query<EventQuery>,
+) -> Result<Json<Vec<Event>>, ApiError> {
+    Ok(Json(state.storage.query_events(
+        state.tenant_id,
+        EventFilter {
+            source_entity_id: query.source_entity_id,
+            target_entity_id: query.target_entity_id,
+            event_type: query.event_type,
+            severity: query.severity,
+            command_id: query.command_id,
+            raw_message_id: query.raw_message_id,
+            correlation_id: query.correlation_id,
+        },
     )?))
 }
 
@@ -944,10 +1096,44 @@ async fn ingest_http(
         state
             .storage
             .mark_raw_message_failed(state.tenant_id, raw_message.id, &message)?;
+        record_ingest_event(
+            &state,
+            "aion:PayloadIngestionFailed",
+            EventSeverity::Error,
+            request.producer_entity_id,
+            request.feature_of_interest_id,
+            raw_message.id,
+            Some(message.clone()),
+            json!({
+                "payload_format": request.payload_format,
+                "reason": "missing_mapping"
+            }),
+        )?;
         return Err(ApiError::bad_request(message));
     }
 
-    let decoder = decoder_for_format(&request.payload_format)?;
+    let decoder = match decoder_for_format(&request.payload_format) {
+        Ok(decoder) => decoder,
+        Err(err) => {
+            state
+                .storage
+                .mark_raw_message_failed(state.tenant_id, raw_message.id, &err.message)?;
+            record_ingest_event(
+                &state,
+                "aion:PayloadIngestionFailed",
+                EventSeverity::Error,
+                request.producer_entity_id,
+                request.feature_of_interest_id,
+                raw_message.id,
+                Some(err.message.clone()),
+                json!({
+                    "payload_format": request.payload_format,
+                    "reason": "unsupported_payload_format"
+                }),
+            )?;
+            return Err(err);
+        }
+    };
     let decode_result = decoder.decode(DecodeInput {
         tenant_id: state.tenant_id,
         device_key: Some(request.producer_entity_id.to_string()),
@@ -965,6 +1151,19 @@ async fn ingest_http(
                 state.tenant_id,
                 raw_message.id,
                 err.message(),
+            )?;
+            record_ingest_event(
+                &state,
+                "aion:PayloadIngestionFailed",
+                EventSeverity::Error,
+                request.producer_entity_id,
+                request.feature_of_interest_id,
+                raw_message.id,
+                Some(err.message().to_string()),
+                json!({
+                    "payload_format": request.payload_format,
+                    "reason": "decoder_error"
+                }),
             )?;
             return Err(ApiError::bad_request(err.to_string()));
         }
@@ -994,6 +1193,19 @@ async fn ingest_http(
     state
         .storage
         .mark_raw_message_normalized(state.tenant_id, raw_message.id)?;
+    record_ingest_event(
+        &state,
+        "aion:PayloadIngested",
+        EventSeverity::Info,
+        request.producer_entity_id,
+        request.feature_of_interest_id,
+        raw_message.id,
+        Some("Payload ingested and normalized".to_string()),
+        json!({
+            "payload_format": request.payload_format,
+            "observation_count": observations.len()
+        }),
+    )?;
 
     Ok((
         StatusCode::CREATED,
@@ -1104,9 +1316,144 @@ fn ensure_command_exists(state: &AppState, command_id: Uuid) -> Result<(), ApiEr
         .ok_or_else(ApiError::not_found)
 }
 
+fn ensure_action_exists(state: &AppState, action_id: Uuid) -> Result<(), ApiError> {
+    state
+        .storage
+        .get_action(state.tenant_id, action_id)?
+        .map(|_| ())
+        .ok_or_else(ApiError::not_found)
+}
+
+fn ensure_action_result_exists(state: &AppState, action_result_id: Uuid) -> Result<(), ApiError> {
+    state
+        .storage
+        .query_action_results(state.tenant_id, None, None)?
+        .into_iter()
+        .find(|result| result.id == action_result_id)
+        .map(|_| ())
+        .ok_or_else(ApiError::not_found)
+}
+
+fn ensure_raw_message_exists(state: &AppState, raw_message_id: Uuid) -> Result<(), ApiError> {
+    state
+        .storage
+        .get_raw_message(state.tenant_id, raw_message_id)?
+        .map(|_| ())
+        .ok_or_else(ApiError::not_found)
+}
+
+fn record_command_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    severity: EventSeverity,
+    command: &Command,
+    message: Option<String>,
+) -> Result<Event, ApiError> {
+    record_event(
+        state,
+        EventDraft {
+            event_type: event_type.into(),
+            severity,
+            source_entity_id: None,
+            target_entity_id: Some(command.target_entity_id),
+            message,
+            occurred_at: Utc::now(),
+            observed_at: None,
+            correlation_id: None,
+            raw_message_id: None,
+            observation_id: None,
+            command_id: Some(command.id),
+            action_id: None,
+            action_result_id: None,
+            metadata: Some(json!({
+                "command_type": command.command_type,
+                "status": command.status,
+                "approval_status": command.approval_status,
+                "claimed_by": command.claimed_by
+            })),
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_ingest_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    severity: EventSeverity,
+    source_entity_id: Uuid,
+    target_entity_id: Uuid,
+    raw_message_id: Uuid,
+    message: Option<String>,
+    metadata: Value,
+) -> Result<Event, ApiError> {
+    record_event(
+        state,
+        EventDraft {
+            event_type: event_type.into(),
+            severity,
+            source_entity_id: Some(source_entity_id),
+            target_entity_id: Some(target_entity_id),
+            message,
+            occurred_at: Utc::now(),
+            observed_at: None,
+            correlation_id: None,
+            raw_message_id: Some(raw_message_id),
+            observation_id: None,
+            command_id: None,
+            action_id: None,
+            action_result_id: None,
+            metadata: Some(metadata),
+        },
+    )
+}
+
+fn record_event(state: &AppState, draft: EventDraft) -> Result<Event, ApiError> {
+    let now = Utc::now();
+    let event = Event::new(
+        state.tenant_id,
+        draft.event_type,
+        draft.severity,
+        draft.source_entity_id,
+        draft.target_entity_id,
+        draft.message,
+        draft.occurred_at,
+        draft.observed_at,
+        draft.correlation_id,
+        draft.raw_message_id,
+        draft.observation_id,
+        draft.command_id,
+        draft.action_id,
+        draft.action_result_id,
+        draft.metadata,
+        now,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    Ok(state.storage.store_event(event)?)
+}
+
+struct EventDraft {
+    event_type: String,
+    severity: EventSeverity,
+    source_entity_id: Option<Uuid>,
+    target_entity_id: Option<Uuid>,
+    message: Option<String>,
+    occurred_at: DateTime<Utc>,
+    observed_at: Option<DateTime<Utc>>,
+    correlation_id: Option<String>,
+    raw_message_id: Option<Uuid>,
+    observation_id: Option<Uuid>,
+    command_id: Option<Uuid>,
+    action_id: Option<Uuid>,
+    action_result_id: Option<Uuid>,
+    metadata: Option<Value>,
+}
+
 fn mutate_command(
     state: &AppState,
     command_id: Uuid,
+    event_type: &'static str,
+    severity: EventSeverity,
     mutate: impl FnOnce(&mut Command, DateTime<Utc>) -> Result<(), aion_action::ActionModelError>,
 ) -> Result<Json<Command>, ApiError> {
     let mut command = state
@@ -1115,6 +1462,7 @@ fn mutate_command(
         .ok_or_else(ApiError::not_found)?;
     mutate(&mut command, Utc::now()).map_err(|err| ApiError::bad_request(err.to_string()))?;
     let command = state.storage.update_command(command)?;
+    record_command_event(state, event_type, severity, &command, None)?;
     Ok(Json(command))
 }
 
@@ -1987,6 +2335,165 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("rejected"));
+    }
+
+    #[tokio::test]
+    async fn creates_retrieves_and_filters_events() {
+        let app = app();
+        let source_id = create_test_entity(&app, "event-source-01", "aion:Sensor").await;
+        let target_id = create_test_entity(&app, "event-target-01", "aion:Pump").await;
+        let command = create_test_command(&app, &target_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/events",
+                json!({
+                    "event_type": "aion:ManualAuditEvent",
+                    "severity": "warning",
+                    "source_entity_id": source_id,
+                    "target_entity_id": target_id,
+                    "message": "Manual audit event",
+                    "occurred_at": "2026-04-27T13:00:00Z",
+                    "correlation_id": "manual-event-001",
+                    "command_id": command_id,
+                    "metadata": {
+                        "source": "test"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let event = to_json(response).await;
+        let event_id = event["id"].as_str().unwrap();
+        assert_eq!(event["event_type"], "aion:ManualAuditEvent");
+        assert_eq!(event["severity"], "warning");
+        assert_eq!(event["target_entity_id"], target_id);
+        assert_eq!(event["command_id"], command_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/events/{event_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_json(response).await["id"], event_id);
+
+        for uri in [
+            format!("/events?target_entity_id={target_id}"),
+            "/events?event_type=aion:ManualAuditEvent".to_string(),
+            "/events?severity=warning".to_string(),
+            format!("/events?command_id={command_id}"),
+            "/events?correlation_id=manual-event-001".to_string(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let events = to_json(response).await;
+            assert!(events
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["id"] == event_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn ingestion_success_creates_payload_ingested_event() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "event-soil-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "event-plot-01", "aion:Plot").await;
+        let ingest = ingest_test_senml(&app, &sensor_id, &plot_id).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/events?raw_message_id={raw_message_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = to_json(response).await;
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["event_type"], "aion:PayloadIngested");
+        assert_eq!(events[0]["severity"], "info");
+        assert_eq!(events[0]["raw_message_id"], raw_message_id);
+        assert_eq!(events[0]["source_entity_id"], sensor_id);
+        assert_eq!(events[0]["target_entity_id"], plot_id);
+    }
+
+    #[tokio::test]
+    async fn command_lifecycle_transitions_create_events() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "event-pump-01", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/commands/{command_id}/approve"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        claim_test_command(&app, command_id, "executor-01").await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/commands/{command_id}/mark-executed"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/events?command_id={command_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = to_json(response).await;
+        let event_types = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["event_type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(event_types.contains(&"aion:CommandCreated"));
+        assert!(event_types.contains(&"aion:CommandApproved"));
+        assert!(event_types.contains(&"aion:CommandClaimed"));
+        assert!(event_types.contains(&"aion:CommandExecuted"));
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ version = "0.1.0"
 dependencies = [
  "aion-action",
  "aion-entity",
+ "aion-event",
  "aion-observation",
  "aion-payload",
  "aion-raw-message",
@@ -34,6 +35,16 @@ dependencies = [
 
 [[package]]
 name = "aion-entity"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "aion-event"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -89,6 +100,7 @@ version = "0.1.0"
 dependencies = [
  "aion-action",
  "aion-entity",
+ "aion-event",
  "aion-observation",
  "aion-raw-message",
  "aion-relationship",
