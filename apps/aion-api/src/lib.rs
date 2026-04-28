@@ -241,8 +241,16 @@ struct ReadyResponse {
     service: &'static str,
     storage: &'static str,
     mqtt: mqtt_ingest::MqttReadiness,
+    worker_plan: ReadyWorkerPlanSummary,
     migrations_ready: Option<bool>,
     details: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadyWorkerPlanSummary {
+    planned_workers: usize,
+    invalid_workers: usize,
+    unsupported_workers: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,6 +357,57 @@ pub struct IngestionConnectorStatusResponse {
     pub last_message_at: Option<DateTime<Utc>>,
     pub last_successful_ingest_at: Option<DateTime<Utc>>,
     pub last_failed_ingest_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionWorkerKind {
+    HttpListener,
+    MqttSubscriber,
+    Unsupported,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionWorkerSpecStatus {
+    Planned,
+    Skipped,
+    Invalid,
+    Unsupported,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct IngestionWorkerValidationIssue {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestionWorkerSpec {
+    pub connector_id: Uuid,
+    pub connector_key: String,
+    pub connector_type: IngestionConnectorType,
+    pub connector_profile: ConnectorProfile,
+    pub enabled: bool,
+    pub worker_kind: IngestionWorkerKind,
+    pub broker_url: Option<String>,
+    pub client_id: Option<String>,
+    pub topic_filter: Option<String>,
+    pub http_path: Option<String>,
+    pub payload_format: Option<String>,
+    pub content_type: Option<String>,
+    pub status: IngestionWorkerSpecStatus,
+    pub validation_issues: Vec<IngestionWorkerValidationIssue>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestionWorkerPlan {
+    pub specs: Vec<IngestionWorkerSpec>,
+    pub planned_workers: usize,
+    pub skipped_workers: usize,
+    pub invalid_workers: usize,
+    pub unsupported_workers: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -797,6 +856,7 @@ pub fn app_with_state(state: AppState) -> Router {
             "/ingestion/connectors/:connector_id/ingest",
             post(ingest_http_for_connector),
         )
+        .route("/ingestion/workers/plan", get(get_ingestion_worker_plan))
         .route("/ingest/http", post(ingest_http))
         .route("/raw-messages", get(query_raw_messages))
         .route("/raw-messages/:raw_message_id", get(get_raw_message))
@@ -819,6 +879,7 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse
     let storage_readiness = state.storage.check_readiness();
     let storage_ready = storage_readiness.is_ok();
     let mqtt = mqtt_ingest::readiness(&state);
+    let worker_plan = worker_plan_summary(&state);
     let ready = storage_ready && mqtt.ready;
 
     let details = match (
@@ -847,6 +908,7 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse
             service: "aion-api",
             storage: state.storage_backend.as_str(),
             mqtt,
+            worker_plan,
             migrations_ready: match (state.storage_backend, storage_ready) {
                 (StorageBackendName::Memory, _) => None,
                 (StorageBackendName::Postgres, true) => Some(true),
@@ -2958,6 +3020,12 @@ async fn get_ingestion_connector_status(
     Ok(Json(connector_status(&connector)))
 }
 
+async fn get_ingestion_worker_plan(
+    State(state): State<AppState>,
+) -> Result<Json<IngestionWorkerPlan>, ApiError> {
+    Ok(Json(build_ingestion_worker_plan(&state)?))
+}
+
 async fn ingest_http_for_connector(
     State(state): State<AppState>,
     Path(connector_id): Path<Uuid>,
@@ -3368,6 +3436,173 @@ fn connector_status(connector: &IngestionConnector) -> IngestionConnectorStatusR
         last_successful_ingest_at: None,
         last_failed_ingest_at: None,
     }
+}
+
+fn worker_plan_summary(state: &AppState) -> ReadyWorkerPlanSummary {
+    build_ingestion_worker_plan(state)
+        .map(|plan| ReadyWorkerPlanSummary {
+            planned_workers: plan.planned_workers,
+            invalid_workers: plan.invalid_workers,
+            unsupported_workers: plan.unsupported_workers,
+        })
+        .unwrap_or(ReadyWorkerPlanSummary {
+            planned_workers: 0,
+            invalid_workers: 0,
+            unsupported_workers: 0,
+        })
+}
+
+fn build_ingestion_worker_plan(state: &AppState) -> Result<IngestionWorkerPlan, ApiError> {
+    let specs = state
+        .storage
+        .list_ingestion_connectors(state.tenant_id)?
+        .into_iter()
+        .map(connector_worker_spec)
+        .collect::<Vec<_>>();
+    let planned_workers = specs
+        .iter()
+        .filter(|spec| spec.status == IngestionWorkerSpecStatus::Planned)
+        .count();
+    let skipped_workers = specs
+        .iter()
+        .filter(|spec| spec.status == IngestionWorkerSpecStatus::Skipped)
+        .count();
+    let invalid_workers = specs
+        .iter()
+        .filter(|spec| spec.status == IngestionWorkerSpecStatus::Invalid)
+        .count();
+    let unsupported_workers = specs
+        .iter()
+        .filter(|spec| spec.status == IngestionWorkerSpecStatus::Unsupported)
+        .count();
+
+    Ok(IngestionWorkerPlan {
+        specs,
+        planned_workers,
+        skipped_workers,
+        invalid_workers,
+        unsupported_workers,
+    })
+}
+
+fn connector_worker_spec(connector: IngestionConnector) -> IngestionWorkerSpec {
+    let mut validation_issues = Vec::new();
+    let worker_kind = match &connector.connector_type {
+        IngestionConnectorType::Http => IngestionWorkerKind::HttpListener,
+        IngestionConnectorType::Mqtt => IngestionWorkerKind::MqttSubscriber,
+        IngestionConnectorType::Future => IngestionWorkerKind::Unsupported,
+    };
+
+    let status = if !connector.enabled {
+        IngestionWorkerSpecStatus::Skipped
+    } else {
+        match &connector.connector_type {
+            IngestionConnectorType::Http => {
+                if connector
+                    .http_path
+                    .as_deref()
+                    .or(connector.endpoint.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    validation_issues.push(worker_issue(
+                        "missing_http_path",
+                        "HTTP connectors require http_path or endpoint before a listener can be planned",
+                    ));
+                }
+                if validation_issues.is_empty() {
+                    IngestionWorkerSpecStatus::Planned
+                } else {
+                    IngestionWorkerSpecStatus::Invalid
+                }
+            }
+            IngestionConnectorType::Mqtt => {
+                if connector
+                    .broker_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    validation_issues.push(worker_issue(
+                        "missing_broker_url",
+                        "MQTT connectors require broker_url before a subscriber can be planned",
+                    ));
+                }
+                if connector
+                    .topic_filter
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    validation_issues.push(worker_issue(
+                        "missing_topic_filter",
+                        "MQTT connectors require topic_filter before a subscriber can be planned",
+                    ));
+                }
+                if connector.connector_profile == ConnectorProfile::TtnV3
+                    && !connector
+                        .payload_format
+                        .as_deref()
+                        .map(payload_format_is_supported)
+                        .unwrap_or(false)
+                {
+                    validation_issues.push(worker_issue(
+                        "ttn_decoding_not_implemented",
+                        "TTN v3 connector planning is supported, but ttn-uplink-json decoding is not implemented yet",
+                    ));
+                }
+                if validation_issues.iter().any(|issue| {
+                    issue.code == "missing_broker_url" || issue.code == "missing_topic_filter"
+                }) {
+                    IngestionWorkerSpecStatus::Invalid
+                } else {
+                    IngestionWorkerSpecStatus::Planned
+                }
+            }
+            IngestionConnectorType::Future => {
+                validation_issues.push(worker_issue(
+                    "unsupported_connector_type",
+                    "future connector types do not have runtime worker support yet",
+                ));
+                IngestionWorkerSpecStatus::Unsupported
+            }
+        }
+    };
+
+    IngestionWorkerSpec {
+        connector_id: connector.id,
+        connector_key: connector.connector_key,
+        connector_type: connector.connector_type,
+        connector_profile: connector.connector_profile,
+        enabled: connector.enabled,
+        worker_kind,
+        broker_url: connector.broker_url,
+        client_id: connector.client_id,
+        topic_filter: connector.topic_filter,
+        http_path: connector.http_path.or(connector.endpoint),
+        payload_format: connector.payload_format,
+        content_type: connector.content_type,
+        status,
+        validation_issues,
+        metadata: connector.metadata,
+    }
+}
+
+fn worker_issue(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> IngestionWorkerValidationIssue {
+    IngestionWorkerValidationIssue {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn payload_format_is_supported(payload_format: &str) -> bool {
+    decoder_for_format(payload_format).is_ok()
 }
 
 fn connector_event_metadata(connector: &IngestionConnector) -> Value {
@@ -7117,6 +7352,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_connector_list_returns_empty_worker_plan() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/ingestion/workers/plan")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let plan = to_json(response).await;
+        assert_eq!(plan["specs"].as_array().unwrap().len(), 0);
+        assert_eq!(plan["planned_workers"], 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_connector_is_marked_skipped_in_worker_plan() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "mqtt-disabled-plan",
+            "generic-mqtt",
+            false,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let plan = get_worker_plan(&app).await;
+        assert_eq!(plan["specs"][0]["connector_id"], connector["id"]);
+        assert_eq!(plan["specs"][0]["status"], "skipped");
+        assert_eq!(plan["skipped_workers"], 1);
+    }
+
+    #[tokio::test]
+    async fn valid_generic_mqtt_connector_produces_mqtt_subscriber_spec() {
+        let app = app();
+        create_mqtt_connector(
+            &app,
+            "mqtt-plan",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let plan = get_worker_plan(&app).await;
+        assert_eq!(plan["planned_workers"], 1);
+        assert_eq!(plan["specs"][0]["worker_kind"], "mqtt_subscriber");
+        assert_eq!(plan["specs"][0]["status"], "planned");
+        assert_eq!(plan["specs"][0]["broker_url"], "mqtt://127.0.0.1:1883");
+    }
+
+    #[tokio::test]
+    async fn valid_ttn_v3_connector_produces_mqtt_spec_with_limitation_note() {
+        let app = app();
+        create_mqtt_connector(
+            &app,
+            "ttn-plan",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let plan = get_worker_plan(&app).await;
+        assert_eq!(plan["planned_workers"], 1);
+        assert_eq!(plan["specs"][0]["worker_kind"], "mqtt_subscriber");
+        assert_eq!(plan["specs"][0]["status"], "planned");
+        assert_eq!(
+            plan["specs"][0]["validation_issues"][0]["code"],
+            "ttn_decoding_not_implemented"
+        );
+    }
+
+    #[tokio::test]
+    async fn mqtt_connector_missing_broker_url_is_invalid() {
+        let app = app();
+        create_mqtt_connector(
+            &app,
+            "mqtt-invalid-plan",
+            "generic-mqtt",
+            true,
+            None,
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let plan = get_worker_plan(&app).await;
+        assert_eq!(plan["invalid_workers"], 1);
+        assert_eq!(plan["specs"][0]["status"], "invalid");
+        assert_eq!(
+            plan["specs"][0]["validation_issues"][0]["code"],
+            "missing_broker_url"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_http_connector_produces_http_listener_spec() {
+        let app = app();
+        create_http_connector(&app, "http-plan", None, None).await;
+
+        let plan = get_worker_plan(&app).await;
+        assert_eq!(plan["planned_workers"], 1);
+        assert_eq!(plan["specs"][0]["worker_kind"], "http_listener");
+        assert_eq!(plan["specs"][0]["status"], "planned");
+        assert_eq!(
+            plan["specs"][0]["http_path"],
+            "/ingestion/connectors/{connector_id}/ingest"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_connector_type_produces_unsupported_spec() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": "future-plan",
+                    "connector_type": "future",
+                    "connector_profile": "custom",
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let plan = get_worker_plan(&app).await;
+        assert_eq!(plan["unsupported_workers"], 1);
+        assert_eq!(plan["specs"][0]["worker_kind"], "unsupported");
+        assert_eq!(plan["specs"][0]["status"], "unsupported");
+    }
+
+    #[tokio::test]
+    async fn worker_plan_does_not_start_mqtt_worker() {
+        let app = app();
+        create_mqtt_connector(
+            &app,
+            "mqtt-no-start-plan",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let plan = get_worker_plan(&app).await;
+        let ready_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_response.status(), StatusCode::OK);
+        let ready = to_json(ready_response).await;
+        assert_eq!(plan["planned_workers"], 1);
+        assert_eq!(ready["mqtt"]["enabled"], false);
+        assert_eq!(ready["mqtt"]["connected"], false);
+        assert_eq!(ready["worker_plan"]["planned_workers"], 1);
+    }
+
+    #[tokio::test]
     async fn queries_raw_message_by_id() {
         let app = app();
         let sensor_id = create_test_entity(&app, "soil-sensor-01", "aion:Sensor").await;
@@ -8168,6 +8581,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_mqtt_connector(
+        app: &Router,
+        connector_key: &str,
+        connector_profile: &str,
+        enabled: bool,
+        broker_url: Option<&str>,
+        topic_filter: Option<&str>,
+        payload_format: Option<&str>,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": connector_key,
+                    "connector_type": "mqtt",
+                    "connector_profile": connector_profile,
+                    "enabled": enabled,
+                    "broker_url": broker_url,
+                    "client_id": format!("{connector_key}-client"),
+                    "topic_filter": topic_filter,
+                    "payload_format": payload_format
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn get_worker_plan(app: &Router) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ingestion/workers/plan")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
         to_json(response).await
     }
 

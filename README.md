@@ -244,6 +244,31 @@ $raw.connector_key
 $raw.connector_profile
 ```
 
+Plan ingestion workers without starting them:
+
+```powershell
+$plan = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/workers/plan"
+
+$plan.planned_workers
+$plan.skipped_workers
+$plan.invalid_workers
+$plan.unsupported_workers
+$plan.specs | Select-Object connector_key, worker_kind, status, validation_issues
+```
+
+Planner behavior:
+
+- disabled connectors appear as `skipped`
+- valid HTTP connectors plan `http_listener`
+- valid MQTT connectors plan `mqtt_subscriber`
+- TTN v3 connectors plan `mqtt_subscriber` and note that TTN decoding is future work when `payload_format = "ttn-uplink-json"`
+- missing `broker_url` or `topic_filter` makes MQTT specs `invalid`
+- future connector types are `unsupported`
+
+`GET /ingestion/workers/plan` is read-only. It does not connect to brokers or start dynamic workers.
+
 The connector registry is available in memory and through the PostgreSQL backend. Existing env-var MQTT config remains the default runtime MQTT connector behavior; dynamic MQTT workers per connector and TTN uplink decoding are future work.
 
 With PostgreSQL selected as the storage backend, connector records are stored durably. Example connector payloads:

@@ -63,6 +63,7 @@ GET /ingestion/connectors/{connector_id}
 PUT /ingestion/connectors/{connector_id}/enable
 PUT /ingestion/connectors/{connector_id}/disable
 GET /ingestion/connectors/{connector_id}/status
+GET /ingestion/workers/plan
 ```
 
 Connector-aware HTTP ingestion:
@@ -84,6 +85,37 @@ Connector status is currently derived from registry state:
 The registry is supported by in-memory storage and PostgreSQL persistence. Durable connector configuration is needed before dynamic MQTT workers can be introduced, because future startup logic will need to reload enabled connectors and start the appropriate source-specific workers.
 
 The existing environment-variable MQTT configuration acts as the default runtime MQTT connector for now. It is not yet created dynamically from the registry.
+
+## Worker Planner
+
+The worker planner is a read-only inspection endpoint:
+
+```text
+GET /ingestion/workers/plan
+```
+
+It reads registered ingestion connectors and returns the worker specifications AionCore would intend to run in a future dynamic-worker runtime. It does not start workers, open network connections, subscribe to MQTT topics, or call external services.
+
+Planned worker specs include connector identity, connector type/profile, worker kind, source settings, payload defaults, status, validation issues, and connector metadata.
+
+Worker kinds:
+
+- `http_listener`
+- `mqtt_subscriber`
+- `unsupported`
+
+Spec status values:
+
+- `planned`: connector is enabled and has enough configuration for a future worker.
+- `skipped`: connector is disabled.
+- `invalid`: connector is enabled but missing required fields.
+- `unsupported`: connector type is not supported by the current runtime planner.
+
+Enabled HTTP connectors plan `http_listener` specs when they have `http_path` or `endpoint`. Enabled MQTT connectors plan `mqtt_subscriber` specs when they have `broker_url` and `topic_filter`. TTN v3 connectors also plan MQTT subscriber specs, but include a validation note when their payload format is not implemented by the current decoder path.
+
+`GET /ready` includes a cheap worker-plan summary with planned, invalid, and unsupported counts. Connector plan issues do not make readiness fail in this milestone because no dynamic workers are started yet.
+
+Dynamic workers are future work. The planner exists first so connector configuration can be validated and inspected safely before runtime worker orchestration is introduced.
 
 ## MQTT Ingestion
 
