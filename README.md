@@ -99,7 +99,7 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/health"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
 ```
 
-`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` is the storage readiness check. In memory mode it returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable.
+`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` checks storage and MQTT readiness. In memory mode storage returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable. When MQTT is disabled, `/ready` still succeeds and reports `mqtt.enabled = false`.
 
 MQTT ingestion is optional and remains disabled unless you enable it explicitly:
 
@@ -113,6 +113,24 @@ cargo run -p aion-api
 ```
 
 If `AIONCORE_MQTT_ENABLED` is unset or false, the API starts as before and does not attempt a broker connection.
+
+Broker username/password authentication is optional:
+
+```powershell
+$env:AIONCORE_MQTT_ENABLED = "true"
+$env:AIONCORE_MQTT_BROKER_URL = "mqtt://127.0.0.1:1883"
+$env:AIONCORE_MQTT_USERNAME = "aioncore-worker"
+$env:AIONCORE_MQTT_PASSWORD = "change-me"
+cargo run -p aion-api
+```
+
+The password is only used to authenticate the AionCore worker to the broker and is not logged by the runtime config debug output. This is not per-device authorization; device-level MQTT authorization is future work.
+
+With MQTT enabled, `/ready` reports the worker state:
+
+- ready when `mqtt.connected = true` and `mqtt.subscribed = true`
+- not ready when MQTT is enabled but the worker has not connected or subscribed
+- ready with `mqtt.enabled = false` when MQTT is disabled
 
 The topic convention for this MVP is:
 
@@ -131,7 +149,20 @@ mosquitto_pub.exe `
   -V mqttv5
 ```
 
-Supported payload formats in this milestone are `senml-json`, `ultralight`, and `canonical-json`. UltraLight ingestion uses the stored producer payload profile mapping when one exists. MQTT auth is still future work.
+For a broker that requires username/password:
+
+```powershell
+mosquitto_pub.exe `
+  -h 127.0.0.1 `
+  -p 1883 `
+  -u "aioncore-worker" `
+  -P "change-me" `
+  -t "aioncore/11111111-1111-1111-1111-111111111111/22222222-2222-2222-2222-222222222222/data" `
+  -m '{ "e": [ { "n": "water_level", "u": "%", "v": 12 } ] }' `
+  -V mqttv5
+```
+
+Supported payload formats in this milestone are `senml-json`, `ultralight`, and `canonical-json`. SenML can decode without a mapping. UltraLight ingestion requires a stored producer payload profile mapping. MQTT worker broker authentication is supported, but per-device MQTT authorization, TLS/mTLS, and command publishing are future work.
 
 Runtime validation scripts:
 

@@ -28,7 +28,11 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{env, str::FromStr, sync::Arc};
+use std::{
+    env,
+    str::FromStr,
+    sync::{Arc, RwLock},
+};
 use uuid::Uuid;
 
 mod mqtt_ingest;
@@ -134,6 +138,7 @@ pub struct AppState {
     storage: Arc<dyn StorageBackend>,
     storage_backend: StorageBackendName,
     tenant_id: Uuid,
+    mqtt_state: Arc<RwLock<mqtt_ingest::MqttWorkerState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +170,7 @@ impl AppState {
             storage,
             storage_backend,
             tenant_id,
+            mqtt_state: Arc::new(RwLock::new(mqtt_ingest::MqttWorkerState::default())),
         }
     }
 
@@ -234,6 +240,7 @@ struct ReadyResponse {
     status: &'static str,
     service: &'static str,
     storage: &'static str,
+    mqtt: mqtt_ingest::MqttReadiness,
     migrations_ready: Option<bool>,
     details: Option<String>,
 }
@@ -733,36 +740,45 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 }
 
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
-    match state.storage.check_readiness() {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(ReadyResponse {
-                ready: true,
-                status: "ready",
-                service: "aion-api",
-                storage: state.storage_backend.as_str(),
-                migrations_ready: match state.storage_backend {
-                    StorageBackendName::Memory => None,
-                    StorageBackendName::Postgres => Some(true),
-                },
-                details: None,
-            }),
-        ),
-        Err(err) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadyResponse {
-                ready: false,
-                status: "not_ready",
-                service: "aion-api",
-                storage: state.storage_backend.as_str(),
-                migrations_ready: match state.storage_backend {
-                    StorageBackendName::Memory => None,
-                    StorageBackendName::Postgres => Some(false),
-                },
-                details: Some(err.to_string()),
-            }),
-        ),
-    }
+    let storage_readiness = state.storage.check_readiness();
+    let storage_ready = storage_readiness.is_ok();
+    let mqtt = mqtt_ingest::readiness(&state);
+    let ready = storage_ready && mqtt.ready;
+
+    let details = match (
+        storage_readiness.err(),
+        mqtt.ready,
+        mqtt.last_error.as_deref(),
+    ) {
+        (Some(err), false, Some(mqtt_error)) => {
+            Some(format!("{err}; mqtt not ready: {mqtt_error}"))
+        }
+        (Some(err), _, _) => Some(err.to_string()),
+        (None, false, Some(mqtt_error)) => Some(format!("mqtt not ready: {mqtt_error}")),
+        (None, false, None) => Some("mqtt not ready".to_string()),
+        (None, true, _) => None,
+    };
+
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(ReadyResponse {
+            ready,
+            status: if ready { "ready" } else { "not_ready" },
+            service: "aion-api",
+            storage: state.storage_backend.as_str(),
+            mqtt,
+            migrations_ready: match (state.storage_backend, storage_ready) {
+                (StorageBackendName::Memory, _) => None,
+                (StorageBackendName::Postgres, true) => Some(true),
+                (StorageBackendName::Postgres, false) => Some(false),
+            },
+            details,
+        }),
+    )
 }
 
 async fn create_entity(
@@ -4159,6 +4175,7 @@ mod tests {
         let body = to_json(response).await;
         assert_eq!(body["ready"], true);
         assert_eq!(body["storage"], "memory");
+        assert_eq!(body["mqtt"]["enabled"], false);
         assert_eq!(body["migrations_ready"], Value::Null);
     }
 

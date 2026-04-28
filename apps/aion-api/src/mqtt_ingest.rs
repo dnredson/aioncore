@@ -1,20 +1,62 @@
 use super::*;
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+use rumqttc::{AsyncClient, Event as MqttEvent, Incoming, MqttOptions, QoS};
+use std::fmt;
 use std::time::Duration as StdDuration;
-use tokio::time::timeout;
 
 const DEFAULT_MQTT_BROKER_URL: &str = "mqtt://127.0.0.1:1883";
 const DEFAULT_MQTT_CLIENT_ID: &str = "aioncore-ingest";
 const DEFAULT_MQTT_TOPIC_FILTER: &str = "aioncore/+/+/data";
-const DEFAULT_MQTT_POLL_TIMEOUT_SECS: u64 = 10;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MqttIngestConfig {
     pub enabled: bool,
     pub broker_url: String,
     pub client_id: String,
     pub topic_filter: String,
     pub payload_format: Option<String>,
+    pub username: Option<String>,
+    password: Option<String>,
+}
+
+impl fmt::Debug for MqttIngestConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MqttIngestConfig")
+            .field("enabled", &self.enabled)
+            .field("broker_url", &self.broker_url)
+            .field("client_id", &self.client_id)
+            .field("topic_filter", &self.topic_filter)
+            .field("payload_format", &self.payload_format)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MqttReadiness {
+    pub ready: bool,
+    pub enabled: bool,
+    pub connected: bool,
+    pub subscribed: bool,
+    pub broker_url: Option<String>,
+    pub topic_filter: Option<String>,
+    pub last_error: Option<String>,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub last_successful_ingest_at: Option<DateTime<Utc>>,
+    pub last_failed_ingest_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MqttWorkerState {
+    pub enabled: bool,
+    pub connected: bool,
+    pub subscribed: bool,
+    pub broker_url: Option<String>,
+    pub topic_filter: Option<String>,
+    pub last_error: Option<String>,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub last_successful_ingest_at: Option<DateTime<Utc>>,
+    pub last_failed_ingest_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,37 +79,61 @@ pub struct MqttTopicParts {
 
 impl MqttIngestConfig {
     pub fn from_env() -> Result<Self, StartupError> {
-        let enabled = parse_bool_env(
-            std::env::var("AIONCORE_MQTT_ENABLED").ok().as_deref(),
-            false,
-        )?;
+        Self::from_env_values(MqttEnvValues {
+            enabled: std::env::var("AIONCORE_MQTT_ENABLED").ok(),
+            broker_url: std::env::var("AIONCORE_MQTT_BROKER_URL").ok(),
+            client_id: std::env::var("AIONCORE_MQTT_CLIENT_ID").ok(),
+            topic_filter: std::env::var("AIONCORE_MQTT_TOPIC_FILTER").ok(),
+            payload_format: std::env::var("AIONCORE_MQTT_PAYLOAD_FORMAT").ok(),
+            username: std::env::var("AIONCORE_MQTT_USERNAME").ok(),
+            password: std::env::var("AIONCORE_MQTT_PASSWORD").ok(),
+        })
+    }
+
+    pub fn from_env_values(values: MqttEnvValues) -> Result<Self, StartupError> {
+        let enabled = parse_bool_env(values.enabled.as_deref(), false)?;
 
         Ok(Self {
             enabled,
-            broker_url: std::env::var("AIONCORE_MQTT_BROKER_URL")
-                .ok()
+            broker_url: values
+                .broker_url
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_MQTT_BROKER_URL.to_string()),
-            client_id: std::env::var("AIONCORE_MQTT_CLIENT_ID")
-                .ok()
+            client_id: values
+                .client_id
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_MQTT_CLIENT_ID.to_string()),
-            topic_filter: std::env::var("AIONCORE_MQTT_TOPIC_FILTER")
-                .ok()
+            topic_filter: values
+                .topic_filter
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_MQTT_TOPIC_FILTER.to_string()),
-            payload_format: std::env::var("AIONCORE_MQTT_PAYLOAD_FORMAT")
-                .ok()
-                .and_then(|value| {
-                    let trimmed = value.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                }),
+            payload_format: optional_nonempty(values.payload_format),
+            username: optional_nonempty(values.username),
+            password: optional_nonempty(values.password),
         })
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MqttEnvValues {
+    pub enabled: Option<String>,
+    pub broker_url: Option<String>,
+    pub client_id: Option<String>,
+    pub topic_filter: Option<String>,
+    pub payload_format: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+fn optional_nonempty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn parse_bool_env(value: Option<&str>, default: bool) -> Result<bool, StartupError> {
@@ -87,6 +153,15 @@ pub async fn start_if_enabled(state: AppState) -> Result<(), StartupError> {
 }
 
 pub async fn start(state: AppState, config: MqttIngestConfig) -> Result<(), StartupError> {
+    update_worker_state(&state, |worker| {
+        worker.enabled = config.enabled;
+        worker.connected = false;
+        worker.subscribed = false;
+        worker.broker_url = Some(config.broker_url.clone());
+        worker.topic_filter = Some(config.topic_filter.clone());
+        worker.last_error = None;
+    });
+
     if !config.enabled {
         return Ok(());
     }
@@ -102,35 +177,116 @@ pub async fn start(state: AppState, config: MqttIngestConfig) -> Result<(), Star
     let (host, port) = parse_broker_url(&config.broker_url)?;
     let mut options = MqttOptions::new(config.client_id.clone(), host, port);
     options.set_keep_alive(StdDuration::from_secs(30));
+    if let Some(username) = config.username.as_deref() {
+        options.set_credentials(username, config.password.as_deref().unwrap_or_default());
+    }
 
     let (client, mut eventloop) = AsyncClient::new(options, 16);
-    wait_for_connection(&mut eventloop, &config).await?;
-    client
-        .subscribe(config.topic_filter.clone(), QoS::AtLeastOnce)
-        .await
-        .map_err(|err| {
-            StartupError::backend_initialization(format!(
-                "failed to subscribe to MQTT topic filter: {err}"
-            ))
-        })?;
-
-    eprintln!(
-        "mqtt startup subscribed broker_url={} topic_filter={}",
-        config.broker_url, config.topic_filter
-    );
 
     tokio::spawn(async move {
         let _client = client;
+        let _ = record_mqtt_worker_event(
+            &state,
+            "aion:MqttWorkerStarted",
+            EventSeverity::Info,
+            Some("MQTT worker started".to_string()),
+            json!({
+                "broker_url": config.broker_url,
+                "topic_filter": config.topic_filter,
+                "payload_format": config.payload_format.as_deref().unwrap_or("canonical-json"),
+                "credentials_configured": config.username.is_some()
+            }),
+        );
         loop {
             match eventloop.poll().await {
-                Ok(Event::Incoming(Incoming::Publish(publish))) => {
+                Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => {
+                    update_worker_state(&state, |worker| {
+                        worker.connected = true;
+                        worker.last_error = None;
+                    });
+                    let _ = record_mqtt_worker_event(
+                        &state,
+                        "aion:MqttWorkerConnected",
+                        EventSeverity::Info,
+                        Some("MQTT worker connected".to_string()),
+                        json!({
+                            "broker_url": config.broker_url,
+                            "topic_filter": config.topic_filter
+                        }),
+                    );
+                    match _client
+                        .subscribe(config.topic_filter.clone(), QoS::AtLeastOnce)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(err) => {
+                            let message =
+                                format!("failed to subscribe to MQTT topic filter: {err}");
+                            mark_worker_failure(&state, message.clone());
+                            let _ = record_mqtt_worker_event(
+                                &state,
+                                "aion:MqttWorkerConnectionFailed",
+                                EventSeverity::Error,
+                                Some(message.clone()),
+                                json!({
+                                    "broker_url": config.broker_url,
+                                    "topic_filter": config.topic_filter,
+                                    "reason": "subscribe_failed",
+                                    "error": message
+                                }),
+                            );
+                        }
+                    }
+                }
+                Ok(MqttEvent::Incoming(Incoming::SubAck(_))) => {
+                    update_worker_state(&state, |worker| {
+                        worker.subscribed = true;
+                        worker.last_error = None;
+                    });
+                    eprintln!(
+                        "mqtt startup subscribed broker_url={} topic_filter={}",
+                        config.broker_url, config.topic_filter
+                    );
+                    let _ = record_mqtt_worker_event(
+                        &state,
+                        "aion:MqttWorkerSubscribed",
+                        EventSeverity::Info,
+                        Some("MQTT worker subscribed".to_string()),
+                        json!({
+                            "broker_url": config.broker_url,
+                            "topic_filter": config.topic_filter
+                        }),
+                    );
+                }
+                Ok(MqttEvent::Incoming(Incoming::Publish(publish))) => {
+                    update_worker_state(&state, |worker| {
+                        worker.last_message_at = Some(Utc::now());
+                    });
                     if let Err(err) = handle_publish(&state, &config, publish).await {
                         eprintln!("mqtt ingest failed: {err:?}");
+                        mark_worker_ingest_failed(&state, err.message);
                     }
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    eprintln!("mqtt event loop stopped: {err}");
+                    let message = format!(
+                        "failed to connect to MQTT broker at {}: {err}",
+                        config.broker_url
+                    );
+                    eprintln!("mqtt event loop stopped: {message}");
+                    mark_worker_failure(&state, message.clone());
+                    let _ = record_mqtt_worker_event(
+                        &state,
+                        "aion:MqttWorkerConnectionFailed",
+                        EventSeverity::Error,
+                        Some(message.clone()),
+                        json!({
+                            "broker_url": config.broker_url,
+                            "topic_filter": config.topic_filter,
+                            "reason": "event_loop_error",
+                            "error": message
+                        }),
+                    );
                     break;
                 }
             }
@@ -138,6 +294,37 @@ pub async fn start(state: AppState, config: MqttIngestConfig) -> Result<(), Star
     });
 
     Ok(())
+}
+
+pub fn readiness(state: &AppState) -> MqttReadiness {
+    let worker = state
+        .mqtt_state
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|_| MqttWorkerState {
+            enabled: true,
+            connected: false,
+            subscribed: false,
+            broker_url: None,
+            topic_filter: None,
+            last_error: Some("mqtt worker state lock was poisoned".to_string()),
+            last_message_at: None,
+            last_successful_ingest_at: None,
+            last_failed_ingest_at: None,
+        });
+    let ready = !worker.enabled || (worker.connected && worker.subscribed);
+    MqttReadiness {
+        ready,
+        enabled: worker.enabled,
+        connected: worker.connected,
+        subscribed: worker.subscribed,
+        broker_url: worker.broker_url,
+        topic_filter: worker.topic_filter,
+        last_error: worker.last_error,
+        last_message_at: worker.last_message_at,
+        last_successful_ingest_at: worker.last_successful_ingest_at,
+        last_failed_ingest_at: worker.last_failed_ingest_at,
+    }
 }
 
 pub fn parse_mqtt_topic(topic: &str) -> Result<MqttTopicParts, String> {
@@ -227,11 +414,11 @@ async fn handle_publish(
                     None,
                     None,
                     raw_message.id,
-                    "invalid MQTT topic",
+                    "unsupported MQTT payload format",
                     json!({
                         "topic": topic,
-                        "reason": "invalid_topic",
-                        "parse_error": err
+                        "reason": "unsupported_payload_format",
+                        "error": err
                     }),
                 )?;
                 return Ok(());
@@ -267,7 +454,7 @@ async fn handle_publish(
     )?;
 
     let Some(topic_parts) = topic_parts else {
-        record_mqtt_failure(
+        record_mqtt_rejection(
             state,
             &topic,
             producer_entity_id,
@@ -282,8 +469,41 @@ async fn handle_publish(
         return Ok(());
     };
 
-    ensure_entity_exists(state, topic_parts.producer_entity_id)?;
-    ensure_entity_exists(state, topic_parts.feature_of_interest_id)?;
+    if !entity_exists(state, topic_parts.producer_entity_id)? {
+        record_mqtt_rejection(
+            state,
+            &topic,
+            Some(topic_parts.producer_entity_id),
+            Some(topic_parts.feature_of_interest_id),
+            raw_message.id,
+            "MQTT message rejected because producer entity does not exist",
+            json!({
+                "topic": topic,
+                "reason": "producer_entity_not_found",
+                "producer_entity_id": topic_parts.producer_entity_id,
+                "feature_of_interest_id": topic_parts.feature_of_interest_id
+            }),
+        )?;
+        return Ok(());
+    }
+
+    if !entity_exists(state, topic_parts.feature_of_interest_id)? {
+        record_mqtt_rejection(
+            state,
+            &topic,
+            Some(topic_parts.producer_entity_id),
+            Some(topic_parts.feature_of_interest_id),
+            raw_message.id,
+            "MQTT message rejected because feature entity does not exist",
+            json!({
+                "topic": topic,
+                "reason": "feature_entity_not_found",
+                "producer_entity_id": topic_parts.producer_entity_id,
+                "feature_of_interest_id": topic_parts.feature_of_interest_id
+            }),
+        )?;
+        return Ok(());
+    }
 
     let profile = state
         .storage
@@ -300,11 +520,12 @@ async fn handle_publish(
                 producer_entity_id,
                 feature_of_interest_id,
                 raw_message.id,
-                "missing payload profile mapping",
+                "UltraLight MQTT payloads require a stored producer PayloadProfile attribute_mapping",
                 json!({
                     "topic": topic,
                     "reason": "missing_mapping",
-                    "payload_format": context.payload_format
+                    "payload_format": context.payload_format,
+                    "producer_entity_id": topic_parts.producer_entity_id
                 }),
             )?;
             return Ok(());
@@ -397,38 +618,9 @@ async fn handle_publish(
             "ingest_source": "mqtt"
         }),
     )?;
+    mark_worker_ingest_success(state);
 
     Ok(())
-}
-
-async fn wait_for_connection(
-    eventloop: &mut rumqttc::EventLoop,
-    config: &MqttIngestConfig,
-) -> Result<(), StartupError> {
-    timeout(
-        StdDuration::from_secs(DEFAULT_MQTT_POLL_TIMEOUT_SECS),
-        async {
-            loop {
-                match eventloop.poll().await {
-                    Ok(Event::Incoming(Incoming::ConnAck(_))) => return Ok(()),
-                    Ok(_) => continue,
-                    Err(err) => {
-                        return Err(StartupError::backend_initialization(format!(
-                            "failed to connect to MQTT broker at {}: {err}",
-                            config.broker_url
-                        )))
-                    }
-                }
-            }
-        },
-    )
-    .await
-    .map_err(|_| {
-        StartupError::backend_initialization(format!(
-            "timed out connecting to MQTT broker at {}",
-            config.broker_url
-        ))
-    })?
 }
 
 fn resolve_mqtt_payload_format(configured: Option<&str>) -> Result<String, String> {
@@ -581,6 +773,7 @@ fn record_mqtt_failure(
     state
         .storage
         .mark_raw_message_failed(state.tenant_id, raw_message_id, &message)?;
+    mark_worker_ingest_failed(state, message.clone());
     record_ingest_event_optional(
         state,
         "aion:PayloadIngestionFailed",
@@ -597,6 +790,85 @@ fn record_mqtt_failure(
         }),
     )?;
     Ok(())
+}
+
+fn record_mqtt_rejection(
+    state: &AppState,
+    topic: &str,
+    producer_entity_id: Option<Uuid>,
+    feature_of_interest_id: Option<Uuid>,
+    raw_message_id: Uuid,
+    message: impl Into<String>,
+    metadata: Value,
+) -> Result<(), ApiError> {
+    let message = message.into();
+    state
+        .storage
+        .mark_raw_message_failed(state.tenant_id, raw_message_id, &message)?;
+    mark_worker_ingest_failed(state, message.clone());
+    record_ingest_event_optional(
+        state,
+        "aion:MqttMessageRejected",
+        EventSeverity::Warning,
+        producer_entity_id,
+        feature_of_interest_id,
+        Some(raw_message_id),
+        Some(message.to_string()),
+        json!({
+            "topic": topic,
+            "message": message,
+            "ingest_source": "mqtt",
+            "details": metadata
+        }),
+    )?;
+    Ok(())
+}
+
+fn entity_exists(state: &AppState, entity_id: Uuid) -> Result<bool, ApiError> {
+    Ok(state
+        .storage
+        .get_entity(state.tenant_id, entity_id)?
+        .is_some())
+}
+
+fn update_worker_state(state: &AppState, update: impl FnOnce(&mut MqttWorkerState)) {
+    if let Ok(mut worker) = state.mqtt_state.write() {
+        update(&mut worker);
+    }
+}
+
+fn mark_worker_failure(state: &AppState, message: String) {
+    update_worker_state(state, |worker| {
+        worker.connected = false;
+        worker.subscribed = false;
+        worker.last_error = Some(message);
+    });
+}
+
+fn mark_worker_ingest_success(state: &AppState) {
+    update_worker_state(state, |worker| {
+        worker.last_successful_ingest_at = Some(Utc::now());
+        worker.last_error = None;
+    });
+}
+
+fn mark_worker_ingest_failed(state: &AppState, message: String) {
+    update_worker_state(state, |worker| {
+        worker.last_failed_ingest_at = Some(Utc::now());
+        worker.last_error = Some(message);
+    });
+}
+
+fn record_mqtt_worker_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    severity: EventSeverity,
+    message: Option<String>,
+    metadata: Value,
+) -> Result<Event, ApiError> {
+    record_ingest_event_optional(
+        state, event_type, severity, None, None, None, message, metadata,
+    )
 }
 
 #[allow(dead_code)]
@@ -620,6 +892,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_mqtt_config_defaults() {
+        let config = MqttIngestConfig::from_env_values(MqttEnvValues::default()).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.broker_url, DEFAULT_MQTT_BROKER_URL);
+        assert_eq!(config.client_id, DEFAULT_MQTT_CLIENT_ID);
+        assert_eq!(config.topic_filter, DEFAULT_MQTT_TOPIC_FILTER);
+        assert_eq!(config.payload_format, None);
+        assert_eq!(config.username, None);
+        assert_eq!(config.password, None);
+    }
+
+    #[test]
+    fn parses_mqtt_config_with_username_and_password() {
+        let config = MqttIngestConfig::from_env_values(MqttEnvValues {
+            enabled: Some("true".to_string()),
+            username: Some("worker".to_string()),
+            password: Some("secret-password".to_string()),
+            ..MqttEnvValues::default()
+        })
+        .unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.username.as_deref(), Some("worker"));
+        assert_eq!(config.password.as_deref(), Some("secret-password"));
+    }
+
+    #[test]
+    fn mqtt_config_debug_redacts_password() {
+        let config = MqttIngestConfig::from_env_values(MqttEnvValues {
+            password: Some("secret-password".to_string()),
+            ..MqttEnvValues::default()
+        })
+        .unwrap();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret-password"));
+    }
+
+    #[test]
     fn parses_simple_mqtt_topic() {
         let producer = Uuid::new_v4();
         let feature = Uuid::new_v4();
@@ -639,6 +949,13 @@ mod tests {
         let parsed = parse_mqtt_topic(&topic).expect("topic should parse");
         assert_eq!(parsed.producer_entity_id, producer);
         assert_eq!(parsed.feature_of_interest_id, feature);
+    }
+
+    #[test]
+    fn rejects_invalid_mqtt_topic() {
+        let err =
+            parse_mqtt_topic("aioncore/not-a-uuid/data").expect_err("topic should be rejected");
+        assert!(err.contains("four segments"));
     }
 
     #[test]
@@ -668,5 +985,122 @@ mod tests {
     #[test]
     fn rejects_unsupported_payload_format() {
         assert!(resolve_mqtt_payload_format(Some("xml")).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_mqtt_message_when_producer_entity_does_not_exist() {
+        let state = AppState::local();
+        let feature = insert_test_entity(&state, "feature", "aion:FeatureOfInterest");
+        let producer = Uuid::new_v4();
+        let topic = format!("aioncore/{producer}/{feature}/data");
+        let config = test_config("senml-json");
+
+        handle_publish(
+            &state,
+            &config,
+            rumqttc::Publish::new(
+                topic,
+                QoS::AtLeastOnce,
+                br#"{ "e": [ { "n": "temperature", "v": 20 } ] }"#.to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let rejections = state
+            .storage
+            .query_events(
+                state.tenant_id,
+                EventFilter {
+                    event_type: Some("aion:MqttMessageRejected".to_string()),
+                    ..EventFilter::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(rejections.len(), 1);
+        assert!(rejections[0]
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("producer entity does not exist"));
+
+        let observations = state
+            .storage
+            .query_observations(state.tenant_id, None, None, None, None, 10)
+            .unwrap();
+        assert!(observations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_mqtt_message_when_feature_entity_does_not_exist() {
+        let state = AppState::local();
+        let producer = insert_test_entity(&state, "producer", "aion:Sensor");
+        let feature = Uuid::new_v4();
+        let topic = format!("aioncore/{producer}/{feature}/data");
+        let config = test_config("senml-json");
+
+        handle_publish(
+            &state,
+            &config,
+            rumqttc::Publish::new(
+                topic,
+                QoS::AtLeastOnce,
+                br#"{ "e": [ { "n": "temperature", "v": 20 } ] }"#.to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let rejections = state
+            .storage
+            .query_events(
+                state.tenant_id,
+                EventFilter {
+                    event_type: Some("aion:MqttMessageRejected".to_string()),
+                    ..EventFilter::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(rejections.len(), 1);
+        assert!(rejections[0]
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("feature entity does not exist"));
+
+        let observations = state
+            .storage
+            .query_observations(state.tenant_id, None, None, None, None, 10)
+            .unwrap();
+        assert!(observations.is_empty());
+    }
+
+    fn test_config(payload_format: &str) -> MqttIngestConfig {
+        MqttIngestConfig {
+            enabled: true,
+            broker_url: DEFAULT_MQTT_BROKER_URL.to_string(),
+            client_id: DEFAULT_MQTT_CLIENT_ID.to_string(),
+            topic_filter: DEFAULT_MQTT_TOPIC_FILTER.to_string(),
+            payload_format: Some(payload_format.to_string()),
+            username: None,
+            password: None,
+        }
+    }
+
+    fn insert_test_entity(state: &AppState, key: &str, entity_type: &str) -> Uuid {
+        let entity = Entity::new(
+            state.tenant_id,
+            key,
+            entity_type,
+            json!({
+                "@context": "https://aioncore.dev/context",
+                "@id": format!("urn:aion:test:{key}"),
+                "@type": entity_type
+            }),
+            Utc::now(),
+        )
+        .unwrap();
+        let entity = state.storage.create_entity(entity).unwrap();
+        entity.id
     }
 }
