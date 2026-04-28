@@ -32,6 +32,7 @@ The local in-memory runtime also exposes a minimal MCP-ready HTTP tool layer for
 ```text
 GET  /mcp/tools
 POST /mcp/tools/{tool_name}
+POST /mcp
 ```
 
 Initial local tool names:
@@ -46,7 +47,15 @@ get_pending_commands
 build_ai_context
 ```
 
-This is not a standalone MCP server yet. It is an internal MCP-style tool abstraction using structured tool definitions, requests, responses, results, and errors. A future MCP server can wrap the same tool layer without changing AionCore's domain model.
+`/mcp/tools` and `/mcp/tools/{tool_name}` are the development HTTP API for listing and invoking the local tool abstraction directly.
+
+`/mcp` is a minimal JSON-RPC compatibility endpoint for local testing of the core MCP `tools/list` and `tools/call` flow. It maps the same local tool definitions into MCP-like `name`, `description`, and `inputSchema` fields, and maps successful tool calls into MCP-like `content`, `structuredContent`, and `isError` fields.
+
+This is not a standalone production MCP server yet. It is an internal MCP-style tool abstraction using structured tool definitions, requests, responses, results, and errors, plus a thin local JSON-RPC wrapper. A future MCP server can wrap the same tool layer without changing AionCore's domain model.
+
+No real LLM is called by either `/mcp/tools` or `/mcp`. The AI context builder only assembles stored AionCore data from the in-memory runtime.
+
+The minimal `/mcp` endpoint is intended for localhost development only. Do not expose it publicly without authentication and Origin validation. Production MCP transport, authentication, Origin validation, and SSE or streaming support are future work.
 
 ### query_entities
 

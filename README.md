@@ -887,4 +887,55 @@ Invoke-RestMethod `
   } | ConvertTo-Json -Depth 10)
 ```
 
+Use the minimal JSON-RPC MCP compatibility endpoint for local client testing:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/mcp" `
+  -ContentType "application/json" `
+  -Body (@{
+    jsonrpc = "2.0"
+    id = 1
+    method = "tools/list"
+    params = @{}
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/mcp" `
+  -ContentType "application/json" `
+  -Body (@{
+    jsonrpc = "2.0"
+    id = 2
+    method = "tools/call"
+    params = @{
+      name = "list_entities"
+      arguments = @{}
+    }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/mcp" `
+  -ContentType "application/json" `
+  -Body (@{
+    jsonrpc = "2.0"
+    id = 3
+    method = "tools/call"
+    params = @{
+      name = "build_ai_context"
+      arguments = @{
+        entity_id = $mcpTank.id
+        include_observations = $true
+        include_events = $true
+        include_commands = $true
+        limit = 10
+      }
+    }
+  } | ConvertTo-Json -Depth 10)
+```
+
+The `/mcp` endpoint is a minimal localhost-development compatibility layer for the MCP `tools/list` and `tools/call` JSON-RPC flow. Do not expose it publicly without authentication and Origin validation.
+
 In-memory data is lost when the process exits.

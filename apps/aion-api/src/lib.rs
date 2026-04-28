@@ -17,6 +17,7 @@ use aion_storage::{
     PolicyStore, RawMessageStore, RelationshipStore, StorageError,
 };
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -362,6 +363,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/events", post(create_event).get(query_events))
         .route("/events/:event_id", get(get_event))
         .route("/ai/context/entity/:entity_id", get(get_ai_entity_context))
+        .route("/mcp", post(handle_mcp_json_rpc))
         .route("/mcp/tools", get(list_mcp_tools))
         .route("/mcp/tools/:tool_name", post(invoke_mcp_tool))
         .route("/ingest/http", post(ingest_http))
@@ -758,6 +760,101 @@ async fn list_mcp_tools() -> Json<Vec<ToolDefinition>> {
     Json(mcp_tool_definitions())
 }
 
+async fn handle_mcp_json_rpc(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> (StatusCode, Json<Value>) {
+    let request = match serde_json::from_slice::<Value>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::OK,
+                Json(json_rpc_error(
+                    Value::Null,
+                    -32700,
+                    format!("parse error: {error}"),
+                    None,
+                )),
+            );
+        }
+    };
+
+    let object = match request.as_object() {
+        Some(object) => object,
+        None => {
+            return (
+                StatusCode::OK,
+                Json(json_rpc_error(
+                    Value::Null,
+                    -32600,
+                    "invalid JSON-RPC request",
+                    None,
+                )),
+            );
+        }
+    };
+
+    let id = object.get("id").cloned().unwrap_or(Value::Null);
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return (
+            StatusCode::OK,
+            Json(json_rpc_error(id, -32600, "jsonrpc must be \"2.0\"", None)),
+        );
+    }
+
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return (
+            StatusCode::OK,
+            Json(json_rpc_error(id, -32600, "method is required", None)),
+        );
+    };
+
+    let response = match method {
+        "tools/list" => json_rpc_success(
+            id,
+            json!({
+                "tools": mcp_tool_definitions()
+                    .into_iter()
+                    .map(mcp_compatible_tool_definition)
+                    .collect::<Vec<_>>()
+            }),
+        ),
+        "tools/call" => match parse_mcp_tools_call_params(object.get("params")) {
+            Ok((tool_name, arguments)) => {
+                match invoke_local_mcp_tool(&state, &tool_name, arguments) {
+                    Ok(content) => json_rpc_success(id, mcp_compatible_tool_result(content)),
+                    Err(error) => json_rpc_error(
+                        id,
+                        json_rpc_code_for_tool_failure(&error),
+                        error.message,
+                        Some(json!({
+                            "code": error.code,
+                            "isError": true
+                        })),
+                    ),
+                }
+            }
+            Err(error) => json_rpc_error(
+                id,
+                -32602,
+                error.message,
+                Some(json!({
+                    "code": error.code,
+                    "isError": true
+                })),
+            ),
+        },
+        _ => json_rpc_error(
+            id,
+            -32601,
+            format!("unknown JSON-RPC method '{method}'"),
+            None,
+        ),
+    };
+
+    (StatusCode::OK, Json(response))
+}
+
 async fn invoke_mcp_tool(
     State(state): State<AppState>,
     Path(tool_name): Path<String>,
@@ -862,6 +959,113 @@ fn mcp_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+fn mcp_compatible_tool_definition(tool: ToolDefinition) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": mcp_compatible_input_schema(tool.input_schema)
+    })
+}
+
+fn mcp_compatible_input_schema(input_schema: Value) -> Value {
+    let has_parameters = input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| !properties.is_empty())
+        .unwrap_or(false)
+        || input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|required| !required.is_empty())
+            .unwrap_or(false);
+
+    if has_parameters {
+        input_schema
+    } else {
+        json!({
+            "type": "object",
+            "additionalProperties": false
+        })
+    }
+}
+
+fn parse_mcp_tools_call_params(params: Option<&Value>) -> Result<(String, Value), McpToolFailure> {
+    let params = params.ok_or_else(|| {
+        McpToolFailure::bad_request("missing_params", "params is required for tools/call")
+    })?;
+    let object = params.as_object().ok_or_else(|| {
+        McpToolFailure::bad_request("invalid_params", "params must be a JSON object")
+    })?;
+    let tool_name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| McpToolFailure::bad_request("missing_argument", "params.name is required"))?
+        .to_string();
+    let arguments = object
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !arguments.is_object() {
+        return Err(McpToolFailure::bad_request(
+            "invalid_arguments",
+            "params.arguments must be a JSON object",
+        ));
+    }
+
+    Ok((tool_name, arguments))
+}
+
+fn mcp_compatible_tool_result(content: Value) -> Value {
+    let text = serde_json::to_string(&content)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize tool result\"}".to_string());
+
+    json!({
+        "content": [
+            {
+                "type": "text",
+                "text": text
+            }
+        ],
+        "structuredContent": content,
+        "isError": false
+    })
+}
+
+fn json_rpc_success(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
+fn json_rpc_error(id: Value, code: i64, message: impl Into<String>, data: Option<Value>) -> Value {
+    let mut error = json!({
+        "code": code,
+        "message": message.into()
+    });
+    if let Some(data) = data {
+        if let Some(object) = error.as_object_mut() {
+            object.insert("data".to_string(), data);
+        }
+    }
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": error
+    })
+}
+
+fn json_rpc_code_for_tool_failure(error: &McpToolFailure) -> i64 {
+    match error.status {
+        StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST => -32602,
+        _ => -32000,
+    }
 }
 
 fn invoke_local_mcp_tool(
@@ -3588,6 +3792,217 @@ mod tests {
         assert!(tool_response["result"].is_null());
         assert_eq!(tool_response["error"]["code"], "missing_argument");
         assert_eq!(tool_response["error"]["message"], "entity_id is required");
+    }
+
+    #[tokio::test]
+    async fn mcp_json_rpc_tools_list_returns_tool_definitions() {
+        let app = app();
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_json(response).await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 1);
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["name"] == "list_entities"
+            && tool["inputSchema"]["additionalProperties"] == false));
+        assert!(tools.iter().any(|tool| tool["name"] == "build_ai_context"
+            && tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("entity_id"))));
+    }
+
+    #[tokio::test]
+    async fn mcp_json_rpc_tools_call_build_ai_context_works() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "json-rpc-tank-01", "aion:WaterTank").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "build_ai_context",
+                        "arguments": {
+                            "entity_id": tank_id,
+                            "include_observations": false,
+                            "include_events": false,
+                            "include_commands": false
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_json(response).await;
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["context"]["target_entity"]["id"],
+            tank_id
+        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("json-rpc-tank-01"));
+    }
+
+    #[tokio::test]
+    async fn mcp_json_rpc_tools_call_list_entities_works() {
+        let app = app();
+        let entity_id = create_test_entity(&app, "json-rpc-entity-01", "aion:Sensor").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "list-entities",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "list_entities",
+                        "arguments": {}
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_json(response).await;
+        assert_eq!(response["id"], "list-entities");
+        assert!(response["result"]["structuredContent"]["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |entity| entity["id"] == entity_id && entity["entity_key"] == "json-rpc-entity-01"
+            ));
+    }
+
+    #[tokio::test]
+    async fn mcp_json_rpc_unknown_method_returns_error() {
+        let app = app();
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "resources/list",
+                    "params": {}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_json(response).await;
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown JSON-RPC method"));
+    }
+
+    #[tokio::test]
+    async fn mcp_json_rpc_unknown_tool_returns_error() {
+        let app = app();
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "no_such_tool",
+                        "arguments": {}
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_json(response).await;
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["data"]["code"], "not_found");
+        assert_eq!(response["error"]["data"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn mcp_json_rpc_missing_required_tool_argument_returns_error() {
+        let app = app();
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/mcp",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "build_ai_context",
+                        "arguments": {}
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_json(response).await;
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["data"]["code"], "missing_argument");
+        assert_eq!(response["error"]["message"], "entity_id is required");
+    }
+
+    #[tokio::test]
+    async fn mcp_json_rpc_malformed_request_returns_error() {
+        let app = app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_json(response).await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert!(response["id"].is_null());
+        assert_eq!(response["error"]["code"], -32700);
     }
 
     #[tokio::test]
