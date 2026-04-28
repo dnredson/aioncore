@@ -247,6 +247,14 @@ pub struct RawMessageQuery {
     pub payload_format: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AiContextQuery {
+    pub include_observations: Option<bool>,
+    pub include_events: Option<bool>,
+    pub include_commands: Option<bool>,
+    pub limit: Option<u32>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RawMessageResponse {
     pub id: Uuid,
@@ -269,6 +277,21 @@ pub struct EntityContextResponse {
     pub entity: Entity,
     pub outgoing_relationships: Vec<Relationship>,
     pub incoming_relationships: Vec<Relationship>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AiEntityContextResponse {
+    pub target_entity: Entity,
+    pub outgoing_relationships: Vec<Relationship>,
+    pub incoming_relationships: Vec<Relationship>,
+    pub recent_observations: Vec<Observation>,
+    pub recent_events: Vec<Event>,
+    pub related_commands: Vec<Command>,
+    pub related_actions: Vec<Action>,
+    pub related_action_results: Vec<ActionResult>,
+    pub raw_message_refs: Vec<Uuid>,
+    pub generated_at: DateTime<Utc>,
+    pub metadata: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,6 +342,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/events", post(create_event).get(query_events))
         .route("/events/:event_id", get(get_event))
+        .route("/ai/context/entity/:entity_id", get(get_ai_entity_context))
         .route("/ingest/http", post(ingest_http))
         .route("/raw-messages", get(query_raw_messages))
         .route("/raw-messages/:raw_message_id", get(get_raw_message))
@@ -541,6 +565,164 @@ async fn get_entity_context(
         outgoing_relationships,
         incoming_relationships,
     }))
+}
+
+async fn get_ai_entity_context(
+    State(state): State<AppState>,
+    Path(entity_id): Path<Uuid>,
+    Query(query): Query<AiContextQuery>,
+) -> Result<Json<AiEntityContextResponse>, ApiError> {
+    let target_entity = state
+        .storage
+        .get_entity(state.tenant_id, entity_id)?
+        .ok_or_else(ApiError::not_found)?;
+
+    let limit = query.limit.unwrap_or(10);
+    let include_observations = query.include_observations.unwrap_or(true);
+    let include_events = query.include_events.unwrap_or(true);
+    let include_commands = query.include_commands.unwrap_or(true);
+
+    let outgoing_relationships =
+        state
+            .storage
+            .list_relationships(state.tenant_id, Some(entity_id), None)?;
+    let incoming_relationships =
+        state
+            .storage
+            .list_relationships(state.tenant_id, None, Some(entity_id))?;
+
+    let recent_observations = if include_observations {
+        state.storage.query_observations(
+            state.tenant_id,
+            Some(entity_id),
+            None,
+            None,
+            None,
+            limit,
+        )?
+    } else {
+        Vec::new()
+    };
+
+    let recent_events = if include_events {
+        query_events_for_entity(&state, entity_id, limit)?
+    } else {
+        Vec::new()
+    };
+
+    let related_commands = if include_commands {
+        state
+            .storage
+            .query_commands(state.tenant_id, Some(entity_id), None)?
+            .into_iter()
+            .take(limit as usize)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let mut related_actions = Vec::new();
+    let mut related_action_results = Vec::new();
+    if include_commands {
+        for command in &related_commands {
+            related_actions.extend(
+                state
+                    .storage
+                    .query_actions(state.tenant_id, Some(command.id))?,
+            );
+            related_action_results.extend(state.storage.query_action_results(
+                state.tenant_id,
+                None,
+                Some(command.id),
+            )?);
+        }
+        related_actions.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        related_action_results.sort_by(|left, right| {
+            right
+                .observed_at
+                .cmp(&left.observed_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        related_actions.truncate(limit as usize);
+        related_action_results.truncate(limit as usize);
+    }
+
+    let mut raw_message_refs = Vec::new();
+    for raw_message_id in recent_observations
+        .iter()
+        .filter_map(|observation| observation.raw_message_id)
+        .chain(
+            recent_events
+                .iter()
+                .filter_map(|event| event.raw_message_id),
+        )
+    {
+        if !raw_message_refs.contains(&raw_message_id) {
+            raw_message_refs.push(raw_message_id);
+        }
+    }
+
+    Ok(Json(AiEntityContextResponse {
+        target_entity,
+        outgoing_relationships,
+        incoming_relationships,
+        recent_observations,
+        recent_events,
+        related_commands,
+        related_actions,
+        related_action_results,
+        raw_message_refs,
+        generated_at: Utc::now(),
+        metadata: json!({
+            "builder": "aion:AiContextBuilder",
+            "domain_agnostic": true,
+            "llm_invoked": false,
+            "include_observations": include_observations,
+            "include_events": include_events,
+            "include_commands": include_commands,
+            "limit": limit
+        }),
+    }))
+}
+
+fn query_events_for_entity(
+    state: &AppState,
+    entity_id: Uuid,
+    limit: u32,
+) -> Result<Vec<Event>, ApiError> {
+    let mut events = state.storage.query_events(
+        state.tenant_id,
+        EventFilter {
+            target_entity_id: Some(entity_id),
+            ..Default::default()
+        },
+    )?;
+
+    for event in state.storage.query_events(
+        state.tenant_id,
+        EventFilter {
+            source_entity_id: Some(entity_id),
+            ..Default::default()
+        },
+    )? {
+        if !events.iter().any(|existing| existing.id == event.id) {
+            events.push(event);
+        }
+    }
+
+    events.sort_by(|left, right| {
+        right
+            .occurred_at
+            .cmp(&left.occurred_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    events.truncate(limit as usize);
+    Ok(events)
 }
 
 async fn put_capabilities(
@@ -2494,6 +2676,294 @@ mod tests {
         assert!(event_types.contains(&"aion:CommandApproved"));
         assert!(event_types.contains(&"aion:CommandClaimed"));
         assert!(event_types.contains(&"aion:CommandExecuted"));
+    }
+
+    #[tokio::test]
+    async fn builds_ai_context_for_entity_with_relationships_only() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "context-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&app, "context-pump-01", "aion:Pump").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/relationships",
+                json!({
+                    "source_entity_id": pump_id,
+                    "relationship_type": "aion:fills",
+                    "target_entity_id": tank_id,
+                    "jsonld": {
+                        "@type": "aion:Relationship"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/ai/context/entity/{tank_id}?include_observations=false&include_events=false&include_commands=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let context = to_json(response).await;
+        assert_eq!(context["target_entity"]["id"], tank_id);
+        assert_eq!(
+            context["incoming_relationships"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            context["outgoing_relationships"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(context["recent_observations"].as_array().unwrap().len(), 0);
+        assert_eq!(context["recent_events"].as_array().unwrap().len(), 0);
+        assert_eq!(context["related_commands"].as_array().unwrap().len(), 0);
+        assert_eq!(context["metadata"]["llm_invoked"], false);
+    }
+
+    #[tokio::test]
+    async fn builds_ai_context_with_observations() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "context-level-sensor-01", "aion:Sensor").await;
+        let tank_id = create_test_entity(&app, "context-tank-02", "aion:WaterTank").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/observations",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": tank_id,
+                    "observed_property": "water_level",
+                    "value": {
+                        "type": "number",
+                        "value": 42.0
+                    },
+                    "unit": "%",
+                    "observed_at": "2026-04-27T13:00:00Z",
+                    "received_at": "2026-04-27T13:00:01Z",
+                    "protocol": "http",
+                    "payload_format": "json_mapping",
+                    "quality": {},
+                    "metadata": {}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/ai/context/entity/{tank_id}?include_events=false&include_commands=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let context = to_json(response).await;
+        let observations = context["recent_observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["feature_of_interest_id"], tank_id);
+        assert_eq!(observations[0]["observed_property"], "water_level");
+    }
+
+    #[tokio::test]
+    async fn builds_ai_context_with_events() {
+        let app = app();
+        let tank_id = create_test_entity(&app, "context-tank-03", "aion:WaterTank").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/events",
+                json!({
+                    "event_type": "aion:LowWaterLevel",
+                    "severity": "warning",
+                    "target_entity_id": tank_id,
+                    "message": "Water level is below threshold",
+                    "occurred_at": "2026-04-27T13:00:00Z",
+                    "metadata": {
+                        "threshold": 30
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/ai/context/entity/{tank_id}?include_observations=false&include_commands=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let context = to_json(response).await;
+        let events = context["recent_events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "aion:LowWaterLevel");
+        assert_eq!(events[0]["target_entity_id"], tank_id);
+    }
+
+    #[tokio::test]
+    async fn builds_ai_context_with_command_action_result_history() {
+        let app = app();
+        let pump_id = create_test_entity(&app, "context-pump-02", "aion:Pump").await;
+        let command = create_test_command(&app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        claim_test_command(&app, command_id, "executor-01").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/actions",
+                json!({
+                    "command_id": command_id,
+                    "executor_entity_id": pump_id,
+                    "action_type": "StartPump",
+                    "status": "started",
+                    "started_at": "2026-04-27T13:01:00Z",
+                    "metadata": {
+                        "executor": "test"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let action = to_json(response).await;
+        let action_id = action["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/action-results",
+                json!({
+                    "command_id": command_id,
+                    "action_id": action_id,
+                    "status": "succeeded",
+                    "verified": true,
+                    "result_payload": {
+                        "pump_state": "running"
+                    },
+                    "observed_at": "2026-04-27T13:01:30Z",
+                    "metadata": {
+                        "source": "test"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/ai/context/entity/{pump_id}?include_observations=false&include_events=false&include_commands=true"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let context = to_json(response).await;
+        assert_eq!(context["related_commands"].as_array().unwrap().len(), 1);
+        assert_eq!(context["related_commands"][0]["id"], command_id);
+        assert_eq!(context["related_actions"].as_array().unwrap().len(), 1);
+        assert_eq!(context["related_actions"][0]["command_id"], command_id);
+        assert_eq!(
+            context["related_action_results"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            context["related_action_results"][0]["command_id"],
+            command_id
+        );
+        assert_eq!(context["related_action_results"][0]["action_id"], action_id);
+    }
+
+    #[tokio::test]
+    async fn ai_context_limit_is_respected() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "context-level-sensor-02", "aion:Sensor").await;
+        let tank_id = create_test_entity(&app, "context-tank-04", "aion:WaterTank").await;
+
+        for (observed_at, value) in [
+            ("2026-04-27T13:00:00Z", 41.0),
+            ("2026-04-27T13:05:00Z", 39.5),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/observations",
+                    json!({
+                        "producer_entity_id": sensor_id,
+                        "feature_of_interest_id": tank_id,
+                        "observed_property": "water_level",
+                        "value": {
+                            "type": "number",
+                            "value": value
+                        },
+                        "unit": "%",
+                        "observed_at": observed_at,
+                        "received_at": observed_at,
+                        "protocol": "http",
+                        "payload_format": "json_mapping",
+                        "quality": {},
+                        "metadata": {}
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/ai/context/entity/{tank_id}?limit=1&include_events=false&include_commands=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let context = to_json(response).await;
+        let observations = context["recent_observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["value"]["value"], 39.5);
     }
 
     #[tokio::test]

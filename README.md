@@ -656,4 +656,132 @@ Query command lifecycle events:
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?command_id=$($claimed.id)"
 ```
 
+Build AI context for a smart-building water tank and pump:
+
+```powershell
+$contextTank = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "context-water-tank-01"
+    entity_type = "aion:WaterTank"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:context-water-tank:01"
+      "@type" = "aion:WaterTank"
+      name = "Context Water Tank 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$contextPump = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "context-pump-01"
+    entity_type = "aion:Pump"
+    jsonld = @{
+      "@context" = @{ aion = "https://aioncore.org/ns#" }
+      "@id" = "urn:aion:building:context-pump:01"
+      "@type" = "aion:Pump"
+      name = "Context Pump 01"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/relationships" `
+  -ContentType "application/json" `
+  -Body (@{
+    source_entity_id = $contextPump.id
+    relationship_type = "aion:fills"
+    target_entity_id = $contextTank.id
+    jsonld = @{ "@type" = "aion:Relationship" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/observations" `
+  -ContentType "application/json" `
+  -Body (@{
+    producer_entity_id = $contextPump.id
+    feature_of_interest_id = $contextTank.id
+    observed_property = "water_level"
+    value = @{ type = "number"; value = 24.5 }
+    unit = "%"
+    observed_at = "2026-04-27T13:00:00Z"
+    received_at = "2026-04-27T13:00:01Z"
+    protocol = "http"
+    payload_format = "json_mapping"
+    quality = @{}
+    metadata = @{}
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/events" `
+  -ContentType "application/json" `
+  -Body (@{
+    event_type = "aion:LowWaterLevel"
+    severity = "warning"
+    target_entity_id = $contextTank.id
+    message = "Water level is below target"
+    occurred_at = "2026-04-27T13:00:05Z"
+    metadata = @{ threshold = 30 }
+  } | ConvertTo-Json -Depth 10)
+
+$contextCommand = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands" `
+  -ContentType "application/json" `
+  -Body (@{
+    target_entity_id = $contextPump.id
+    command_type = "StartPump"
+    payload = @{ target_state = "running" }
+    requested_by = "operator@example.com"
+    reason = "Water tank level is low"
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($contextCommand.id)/approve"
+
+$contextClaimed = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands/$($contextCommand.id)/claim" `
+  -ContentType "application/json" `
+  -Body (@{ claimed_by = "edge-agent-01" } | ConvertTo-Json)
+
+$contextAction = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/actions" `
+  -ContentType "application/json" `
+  -Body (@{
+    command_id = $contextClaimed.id
+    executor_entity_id = $contextPump.id
+    action_type = "StartPump"
+    status = "started"
+    started_at = "2026-04-27T13:01:00Z"
+    metadata = @{ executor = "edge-agent-01" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($contextClaimed.id)/mark-executed"
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/action-results" `
+  -ContentType "application/json" `
+  -Body (@{
+    command_id = $contextClaimed.id
+    action_id = $contextAction.id
+    status = "succeeded"
+    verified = $true
+    result_payload = @{ pump_state = "running" }
+    observed_at = "2026-04-27T13:01:30Z"
+    metadata = @{ verification_source = "simulated_executor" }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ai/context/entity/$($contextTank.id)"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ai/context/entity/$($contextPump.id)?limit=10"
+```
+
 In-memory data is lost when the process exits.
