@@ -79,6 +79,17 @@ impl PostgresStorage {
     }
 }
 
+impl StorageBackend for PostgresStorage {
+    fn check_readiness(&self) -> StorageResult<()> {
+        self.with_client(|client| {
+            client
+                .simple_query("SELECT 1")
+                .map_err(map_postgres_error)?;
+            Ok(())
+        })
+    }
+}
+
 fn backend_error_with_context(name: &str, err: ::postgres::Error) -> StorageError {
     StorageError::Backend(format!("failed to run migration {name}: {err}"))
 }

@@ -401,11 +401,13 @@ impl<T> AiContextStore for T where
 pub trait StorageBackend:
     ControlPlaneStore + TelemetryStore + AiContextStore + fmt::Debug + Send + Sync
 {
+    fn check_readiness(&self) -> StorageResult<()>;
 }
 
-impl<T> StorageBackend for T where
-    T: ControlPlaneStore + TelemetryStore + AiContextStore + fmt::Debug + Send + Sync
-{
+impl StorageBackend for InMemoryStorage {
+    fn check_readiness(&self) -> StorageResult<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]

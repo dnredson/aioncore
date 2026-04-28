@@ -10,6 +10,9 @@ AionCore currently runs on the in-memory storage implementation. The PostgreSQL 
 - `PostgresStorage` is introduced as an opt-in backend, but it is not the default runtime backend.
 - Migrations define the durable schema contract only.
 - Docker or a running PostgreSQL instance is not required for the Rust test suite.
+- `/health` is a lightweight liveness check.
+- `/ready` is the storage readiness check.
+- PostgreSQL mode does not fall back to memory if readiness fails.
 
 ## Pluggable Storage Strategy
 
@@ -185,6 +188,7 @@ The future PostgreSQL repository adapter should preserve the same behavior as th
 - Keep SmartSentinel or any other domain pack optional.
 
 Runtime persistence, migrations execution strategy, connection configuration, and operational hardening are future work.
+Runtime readiness now validates storage connectivity through `/ready`, and startup diagnostics report the selected backend, whether a database URL was provided in postgres mode, and whether embedded migrations were applied.
 
 ## Optional PostgreSQL Tests
 
@@ -202,3 +206,11 @@ Lifecycle parity coverage includes command create/query/update behavior, action 
 The tests apply the embedded migrations before exercising the adapter. The database must have access to the required PostgreSQL and TimescaleDB extensions.
 
 Telemetry parity coverage includes raw message filtering, canonical observation storage and lookup, and event storage/query behavior. `InMemoryStorage` remains the runtime default and the reference for local tests outside the PostgreSQL-specific suite.
+
+The optional runtime validation path uses the same backend-selection variables as the server:
+
+```powershell
+$env:AIONCORE_STORAGE_BACKEND = "postgres"
+$env:AIONCORE_DATABASE_URL = "postgres://user:password@localhost:5432/aioncore"
+cargo run -p aion-api
+```

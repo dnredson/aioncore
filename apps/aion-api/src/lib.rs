@@ -38,7 +38,7 @@ pub enum StorageBackendName {
 }
 
 impl StorageBackendName {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Memory => "memory",
             Self::Postgres => "postgres",
@@ -134,6 +134,13 @@ pub struct AppState {
     tenant_id: Uuid,
 }
 
+#[derive(Debug, Clone)]
+pub struct StartupDiagnostics {
+    pub storage_backend: StorageBackendName,
+    pub database_url_provided: bool,
+    pub migrations_applied: Option<bool>,
+}
+
 impl AppState {
     pub fn local() -> Self {
         Self::with_backend_storage(
@@ -160,8 +167,21 @@ impl AppState {
     }
 
     pub fn from_config(config: StorageBackendConfig) -> Result<Self, StartupError> {
+        Self::from_config_with_diagnostics(config).map(|(state, _)| state)
+    }
+
+    pub fn from_config_with_diagnostics(
+        config: StorageBackendConfig,
+    ) -> Result<(Self, StartupDiagnostics), StartupError> {
         match config {
-            StorageBackendConfig::Memory => Ok(Self::local()),
+            StorageBackendConfig::Memory => Ok((
+                Self::local(),
+                StartupDiagnostics {
+                    storage_backend: StorageBackendName::Memory,
+                    database_url_provided: false,
+                    migrations_applied: None,
+                },
+            )),
             StorageBackendConfig::Postgres { database_url } => {
                 let storage = PostgresStorage::connect(PostgresStorageConfig::new(database_url))
                     .map_err(|err| {
@@ -174,10 +194,17 @@ impl AppState {
                         "failed to initialize postgres storage: {err}"
                     ))
                 })?;
-                Ok(Self::with_backend_storage(
-                    Arc::new(storage),
-                    StorageBackendName::Postgres,
-                    Uuid::nil(),
+                Ok((
+                    Self::with_backend_storage(
+                        Arc::new(storage),
+                        StorageBackendName::Postgres,
+                        Uuid::nil(),
+                    ),
+                    StartupDiagnostics {
+                        storage_backend: StorageBackendName::Postgres,
+                        database_url_provided: true,
+                        migrations_applied: Some(true),
+                    },
                 ))
             }
         }
@@ -186,6 +213,10 @@ impl AppState {
     pub fn from_env() -> Result<Self, StartupError> {
         Self::from_config(StorageBackendConfig::from_env()?)
     }
+
+    pub fn from_env_with_diagnostics() -> Result<(Self, StartupDiagnostics), StartupError> {
+        Self::from_config_with_diagnostics(StorageBackendConfig::from_env()?)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -193,6 +224,16 @@ struct HealthResponse {
     status: &'static str,
     service: &'static str,
     storage: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadyResponse {
+    ready: bool,
+    status: &'static str,
+    service: &'static str,
+    storage: &'static str,
+    migrations_ready: Option<bool>,
+    details: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -573,9 +614,15 @@ pub fn app_from_env() -> Result<Router, StartupError> {
     Ok(app_with_state(AppState::from_env()?))
 }
 
+pub fn app_from_env_with_diagnostics() -> Result<(Router, StartupDiagnostics), StartupError> {
+    let (state, diagnostics) = AppState::from_env_with_diagnostics()?;
+    Ok((app_with_state(state), diagnostics))
+}
+
 pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/entities", post(create_entity).get(list_entities))
         .route("/entities/:entity_id", get(get_entity))
         .route("/entities/:entity_id/context", get(get_entity_context))
@@ -677,6 +724,39 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         service: "aion-api",
         storage: state.storage_backend.as_str(),
     })
+}
+
+async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
+    match state.storage.check_readiness() {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ReadyResponse {
+                ready: true,
+                status: "ready",
+                service: "aion-api",
+                storage: state.storage_backend.as_str(),
+                migrations_ready: match state.storage_backend {
+                    StorageBackendName::Memory => None,
+                    StorageBackendName::Postgres => Some(true),
+                },
+                details: None,
+            }),
+        ),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadyResponse {
+                ready: false,
+                status: "not_ready",
+                service: "aion-api",
+                storage: state.storage_backend.as_str(),
+                migrations_ready: match state.storage_backend {
+                    StorageBackendName::Memory => None,
+                    StorageBackendName::Postgres => Some(false),
+                },
+                details: Some(err.to_string()),
+            }),
+        ),
+    }
 }
 
 async fn create_entity(
@@ -4033,6 +4113,26 @@ mod tests {
         assert_eq!(body["storage"], "memory");
     }
 
+    #[tokio::test]
+    async fn ready_reports_memory_storage_as_ready() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_json(response).await;
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["storage"], "memory");
+        assert_eq!(body["migrations_ready"], Value::Null);
+    }
+
     #[test]
     fn storage_backend_config_defaults_to_memory() {
         assert_eq!(
@@ -4092,6 +4192,142 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_json(response).await;
         assert_eq!(body["storage"], "postgres");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_runtime_end_to_end_validation() {
+        let Some(database_url) = std::env::var("AIONCORE_TEST_DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+
+        let state = AppState::from_config(StorageBackendConfig::Postgres { database_url })
+            .expect("postgres state should initialize");
+        let app = app_with_state(state);
+
+        let ready_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_response.status(), StatusCode::OK);
+        let ready = to_json(ready_response).await;
+        assert_eq!(ready["ready"], true);
+        assert_eq!(ready["storage"], "postgres");
+
+        let tank = create_test_entity(&app, "runtime-tank-01", "aion:WaterTank").await;
+        let pump = create_test_entity(&app, "runtime-pump-01", "aion:Pump").await;
+
+        let relationship_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/relationships",
+                json!({
+                    "source_entity_id": tank,
+                    "relationship_type": "feeds",
+                    "target_entity_id": pump,
+                    "jsonld": {}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(relationship_response.status(), StatusCode::CREATED);
+
+        let ingest_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": tank,
+                    "feature_of_interest_id": pump,
+                    "payload_format": "senml-json",
+                    "protocol": "http",
+                    "content_type": "application/senml+json",
+                    "observed_at": "2026-04-27T13:00:00Z",
+                    "payload": {
+                        "e": [{
+                            "n": "WaterTankLevel",
+                            "v": 12,
+                            "u": "%"
+                        }]
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ingest_response.status(), StatusCode::OK);
+
+        let observations_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/observations?feature_of_interest_id={pump}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observations_response.status(), StatusCode::OK);
+        let observations = to_json(observations_response).await;
+        assert!(!observations.as_array().unwrap().is_empty());
+
+        let policy_response = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                "/policies",
+                json!([{
+                    "target_entity_id": pump,
+                    "command_type": "StartPump",
+                    "requires_approval": false,
+                    "auto_execute_allowed": false,
+                    "metadata": {"source": "runtime-e2e"}
+                }]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(policy_response.status(), StatusCode::OK);
+
+        let command_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/commands",
+                json!({
+                    "target_entity_id": pump,
+                    "command_type": "StartPump",
+                    "payload": {"target_state": "running"},
+                    "requested_by": "runtime-test",
+                    "reason": "runtime e2e"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(command_response.status(), StatusCode::CREATED);
+        let command = to_json(command_response).await;
+        let command_id = command["id"].as_str().unwrap().to_string();
+
+        let command_lookup = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/commands/{command_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(command_lookup.status(), StatusCode::OK);
+        assert_eq!(to_json(command_lookup).await["id"], command_id);
     }
 
     #[tokio::test]

@@ -92,6 +92,15 @@ The backend selection variables are:
 
 If `AIONCORE_STORAGE_BACKEND` is unset, the API uses memory.
 
+Health and readiness:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/health"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
+```
+
+`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` is the storage readiness check. In memory mode it returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable.
+
 ## Optional PostgreSQL Adapter Tests
 
 Set `AIONCORE_TEST_DATABASE_URL` to a PostgreSQL database that has the required extensions available, then run the storage crate tests that target the adapter:
@@ -102,6 +111,20 @@ cargo test -p aion-storage postgres_
 ```
 
 If the environment variable is unset, the PostgreSQL adapter tests skip cleanly and the normal in-memory test suite still passes.
+
+If a postgres runtime URL is available, you can also validate the API startup path:
+
+```powershell
+$env:AIONCORE_STORAGE_BACKEND = "postgres"
+$env:AIONCORE_DATABASE_URL = $env:AIONCORE_TEST_DATABASE_URL
+cargo run -p aion-api
+```
+
+Troubleshooting:
+
+- If startup exits with `AIONCORE_DATABASE_URL is required when AIONCORE_STORAGE_BACKEND=postgres`, set the database URL before starting the API.
+- If `/ready` returns not ready in postgres mode, check database connectivity and confirm the migrations can run against the target database.
+- If an unknown backend value is set, the API fails fast instead of silently changing modes.
 
 Telemetry parity tests cover raw message filtering, canonical observation storage, and event storage/query behavior:
 
