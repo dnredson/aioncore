@@ -1,179 +1,85 @@
 # Ingestion Model
 
-AionCore ingestion is payload-agnostic. Ingestion endpoints receive telemetry, store the raw message, and then pass the payload to a decoder selected by hint, content type, mapping, or route configuration.
+AionCore ingestion is payload-agnostic. HTTP and MQTT ingestion both preserve the raw message first and then normalize supported payloads into canonical observations.
 
 ## Core Rule
 
 Raw messages must always be stored before normalization.
 
-This preserves auditability and enables later replay when decoders, mappings, or entity registrations change.
-
-## Raw Message
-
-Recommended stored fields:
-
-- `id`: raw message UUID.
-- `tenant_id`: owning tenant.
-- `source_type`: `http` or `mqtt`.
-- `source_ref`: topic, route, or integration reference.
-- `device_key`: optional device identifier.
-- `decoder_hint`: optional decoder name or mapping key.
-- `content_type`: original content type.
-- `headers`: request or protocol metadata.
-- `payload`: original payload bytes.
-- `received_at`: platform receive time.
-- `normalization_status`: `pending`, `normalized`, or `failed`.
-- `normalization_error`: optional failure message.
+This preserves auditability and enables later replay when decoders, payload profiles, or entity registrations change.
 
 ## HTTP Ingestion
 
-Initial endpoint:
+Current HTTP endpoint:
 
 ```text
-POST /v1/ingest/http
+POST /ingest/http
 ```
 
-Suggested headers:
+HTTP ingestion accepts a producer entity, a feature of interest, a payload format, and the payload itself. The current runtime stores the raw message, selects the decoder, produces canonical observations, and then updates raw-message status.
 
-```text
-X-Aion-Tenant: tenant slug or ID
-X-Aion-Device: device key
-X-Aion-Decoder: senml_json | ultralight | json_mapping | mapping name
-Content-Type: application/json | text/plain
-```
+HTTP payload formats supported by the local runtime:
 
-HTTP ingestion flow:
+- `senml-json`
+- `ultralight`
+- `canonical-json`
+
+UltraLight HTTP ingestion can use the producer entity payload profile mapping when one is stored.
+
+HTTP flow:
 
 ```text
 Receive request
-  -> authenticate tenant/device
+  -> verify referenced entities
   -> store raw message
   -> select decoder
   -> decode payload
-  -> resolve entity
   -> write canonical observations
   -> update raw message status
-  -> return ingestion result
+  -> emit ingestion events
 ```
 
-Recommended MVP response behavior:
+## MQTT Ingestion
 
-- If raw storage fails, return an error.
-- If raw storage succeeds but normalization fails, return an accepted response with failure details.
-- Record normalization failure on the raw message.
+MQTT ingestion is now available as an opt-in local-runtime foundation. It remains disabled unless `AIONCORE_MQTT_ENABLED=true`.
 
-## MQTT Ingestion Design
-
-MQTT implementation can be postponed, but the design should be compatible with the raw-message model.
-
-Suggested topic pattern:
+MVP topic convention:
 
 ```text
-aion/{tenant}/{device}/telemetry
+aioncore/{producer_entity_id}/{feature_of_interest_id}/data
 ```
 
-Optional decoder-specific topic:
+The topic segments are URL-decoded before UUID parsing. If the topic cannot be parsed, AionCore still preserves the raw message when possible and records a failed-ingestion event.
 
-```text
-aion/{tenant}/{device}/telemetry/{decoder}
-```
+MQTT payload formats supported by this milestone:
+
+- `senml-json`
+- `ultralight`
+- `canonical-json`
+
+MQTT format selection:
+
+- explicit `AIONCORE_MQTT_PAYLOAD_FORMAT`
+- default `canonical-json` when nothing is configured
+
+UltraLight MQTT ingestion uses the stored producer entity payload profile mapping when one exists. Inline mapping is not supported over raw MQTT in this milestone.
 
 MQTT flow:
 
 ```text
-Device publishes telemetry
-  -> broker receives message
+Broker receives message
   -> AionCore MQTT worker subscribes
-  -> worker stores raw message with source_type = mqtt
-  -> normalizer processes payload
+  -> worker stores raw message
+  -> worker decodes payload
+  -> worker writes canonical observations
+  -> worker updates raw-message status
+  -> worker emits ingestion events
 ```
 
-MVP 1 should document MQTT and reserve the model. The first implementation can focus on HTTP ingestion.
+## Limitations
 
-## Decoder Selection
+- MQTT authentication is not implemented yet.
+- Production broker scaling is not implemented yet.
+- No MQTT fallback exists; if MQTT is enabled and the broker cannot be reached, startup fails clearly.
+- HTTP and MQTT ingest into the same canonical-observation model, but the runtime still defaults to in-memory storage unless PostgreSQL is selected explicitly.
 
-Decoder selection can use:
-
-- Explicit `X-Aion-Decoder` header.
-- Device configuration.
-- Decoder mapping name.
-- Content type.
-- MQTT topic segment.
-
-MVP 1 should prefer explicit decoder hints to avoid ambiguous behavior.
-
-## Payload Decoder Interface
-
-Each decoder converts raw payload bytes into decoded measurements. The normalizer then turns decoded measurements into canonical observations.
-
-Logical decoder output:
-
-```text
-entity_key
-observed_property
-time
-value
-unit
-metadata
-```
-
-Initial decoders:
-
-- SenML JSON.
-- UltraLight.
-- JSON mapping.
-
-## SenML JSON
-
-MVP support should include:
-
-- `bn`: base name.
-- `bt`: base time.
-- `bu`: base unit.
-- `e`: entries.
-- `n`: measurement name.
-- `t`: relative time.
-- `u`: unit.
-- `v`: numeric value.
-- `vs`: string value.
-- `vb`: boolean value.
-- `vd`: data value as string.
-
-## UltraLight
-
-MVP support should include payloads like:
-
-```text
-t|21.4|h|52
-```
-
-Attribute aliases should map short names to observed properties.
-
-Example:
-
-```text
-t -> temperature
-h -> humidity
-```
-
-## JSON Mapping
-
-JSON mapping should be configuration-driven.
-
-Example mapping:
-
-```json
-{
-  "entity_key": "$.deviceId",
-  "timestamp": "$.timestamp",
-  "measurements": [
-    {
-      "property": "temperature",
-      "value": "$.temperature",
-      "unit": "Cel"
-    }
-  ]
-}
-```
-
-MVP 1 can support a small JSON path subset before adopting a full JSONPath implementation.

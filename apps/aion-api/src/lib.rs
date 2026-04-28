@@ -31,6 +31,8 @@ use serde_json::{json, Value};
 use std::{env, str::FromStr, sync::Arc};
 use uuid::Uuid;
 
+mod mqtt_ingest;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageBackendName {
     Memory,
@@ -617,6 +619,10 @@ pub fn app_from_env() -> Result<Router, StartupError> {
 pub fn app_from_env_with_diagnostics() -> Result<(Router, StartupDiagnostics), StartupError> {
     let (state, diagnostics) = AppState::from_env_with_diagnostics()?;
     Ok((app_with_state(state), diagnostics))
+}
+
+pub async fn start_mqtt_ingest_if_enabled(state: AppState) -> Result<(), StartupError> {
+    mqtt_ingest::start_if_enabled(state).await
 }
 
 pub fn app_with_state(state: AppState) -> Router {
@@ -3486,18 +3492,41 @@ fn record_ingest_event(
     message: Option<String>,
     metadata: Value,
 ) -> Result<Event, ApiError> {
+    record_ingest_event_optional(
+        state,
+        event_type,
+        severity,
+        Some(source_entity_id),
+        Some(target_entity_id),
+        Some(raw_message_id),
+        message,
+        metadata,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_ingest_event_optional(
+    state: &AppState,
+    event_type: impl Into<String>,
+    severity: EventSeverity,
+    source_entity_id: Option<Uuid>,
+    target_entity_id: Option<Uuid>,
+    raw_message_id: Option<Uuid>,
+    message: Option<String>,
+    metadata: Value,
+) -> Result<Event, ApiError> {
     record_event(
         state,
         EventDraft {
             event_type: event_type.into(),
             severity,
-            source_entity_id: Some(source_entity_id),
-            target_entity_id: Some(target_entity_id),
+            source_entity_id,
+            target_entity_id,
             message,
             occurred_at: Utc::now(),
             observed_at: None,
             correlation_id: None,
-            raw_message_id: Some(raw_message_id),
+            raw_message_id,
             observation_id: None,
             command_id: None,
             action_id: None,

@@ -2,13 +2,15 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() {
-    let (app, diagnostics) = match aion_api::app_from_env_with_diagnostics() {
+    let (state, diagnostics) = match aion_api::AppState::from_env_with_diagnostics() {
         Ok(value) => value,
         Err(error) => {
             eprintln!("{error}");
             std::process::exit(1);
         }
     };
+
+    let app = aion_api::app_with_state(state.clone());
 
     eprintln!(
         "startup storage backend={}, database_url_provided={}, migrations_applied={}",
@@ -19,6 +21,11 @@ async fn main() {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "n/a".to_string())
     );
+
+    if let Err(error) = aion_api::start_mqtt_ingest_if_enabled(state).await {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     let listener = tokio::net::TcpListener::bind(addr)
