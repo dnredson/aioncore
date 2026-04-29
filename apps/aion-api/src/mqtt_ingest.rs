@@ -148,6 +148,35 @@ impl MqttIngestConfig {
             connector: Some(connector),
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_connector_with_basic_auth(
+        broker_url: String,
+        client_id: String,
+        topic_filter: String,
+        payload_format: Option<String>,
+        content_type: Option<String>,
+        username: Option<String>,
+        password: String,
+        connector: MqttConnectorMetadata,
+    ) -> Self {
+        Self {
+            enabled: true,
+            broker_url,
+            client_id,
+            topic_filter,
+            payload_format,
+            content_type,
+            username,
+            password: Some(password),
+            connector: Some(connector),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn password_configured(&self) -> bool {
+        self.password.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -435,6 +464,9 @@ async fn start_connector_runtime(
         loop {
             let mut options = MqttOptions::new(config.client_id.clone(), host.clone(), port);
             options.set_keep_alive(StdDuration::from_secs(30));
+            if let Some(username) = config.username.as_deref() {
+                options.set_credentials(username, config.password.as_deref().unwrap_or_default());
+            }
             let (client, mut eventloop) = AsyncClient::new(options, 16);
             let mut reconnected_event_emitted = false;
 

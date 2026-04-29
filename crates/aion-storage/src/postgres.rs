@@ -187,8 +187,25 @@ fn row_to_ingestion_connector(row: Row) -> StorageResult<IngestionConnector> {
         http_path: row.get("http_path"),
         payload_format: row.get("payload_format"),
         content_type: row.get("content_type"),
+        secret_ref_id: row.get("secret_ref_id"),
         default_producer_entity_id: row.get("default_producer_entity_id"),
         default_feature_of_interest_id: row.get("default_feature_of_interest_id"),
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_connector_secret(row: Row) -> StorageResult<ConnectorSecret> {
+    Ok(ConnectorSecret {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        secret_key: row.get("secret_key"),
+        secret_type: connector_secret_type_from_db(row.get::<_, String>("secret_type"))?,
+        username: row.get("username"),
+        secret_value: row.get("secret_value"),
         metadata: row
             .get::<_, Option<Json<Value>>>("metadata")
             .map(|Json(value)| value),
@@ -233,6 +250,27 @@ fn connector_profile_from_db(value: String) -> StorageResult<ConnectorProfile> {
         "custom" => Ok(ConnectorProfile::Custom),
         other => Err(StorageError::Backend(format!(
             "unknown connector profile in database: {other}"
+        ))),
+    }
+}
+
+fn connector_secret_type_to_db(secret_type: &ConnectorSecretType) -> &'static str {
+    match secret_type {
+        ConnectorSecretType::MqttBasicAuth => "mqtt_basic_auth",
+        ConnectorSecretType::Token => "token",
+        ConnectorSecretType::ApiKey => "api_key",
+        ConnectorSecretType::Custom => "custom",
+    }
+}
+
+fn connector_secret_type_from_db(value: String) -> StorageResult<ConnectorSecretType> {
+    match value.as_str() {
+        "mqtt_basic_auth" => Ok(ConnectorSecretType::MqttBasicAuth),
+        "token" => Ok(ConnectorSecretType::Token),
+        "api_key" => Ok(ConnectorSecretType::ApiKey),
+        "custom" => Ok(ConnectorSecretType::Custom),
+        other => Err(StorageError::Backend(format!(
+            "unknown connector secret type in database: {other}"
         ))),
     }
 }
@@ -2096,6 +2134,7 @@ impl IngestionConnectorStore for PostgresStorage {
                         http_path,
                         payload_format,
                         content_type,
+                        secret_ref_id,
                         default_producer_entity_id,
                         default_feature_of_interest_id,
                         metadata,
@@ -2103,12 +2142,12 @@ impl IngestionConnectorStore for PostgresStorage {
                         updated_at
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+                        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
                     )
                     RETURNING id, tenant_id, connector_key, connector_type, connector_profile,
                         enabled, display_name, protocol, endpoint, broker_url, client_id,
                         topic_filter, http_path, payload_format, content_type,
-                        default_producer_entity_id, default_feature_of_interest_id, metadata,
+                        secret_ref_id, default_producer_entity_id, default_feature_of_interest_id, metadata,
                         created_at, updated_at
                     ",
                     &[
@@ -2127,6 +2166,7 @@ impl IngestionConnectorStore for PostgresStorage {
                         &connector.http_path,
                         &connector.payload_format,
                         &connector.content_type,
+                        &connector.secret_ref_id,
                         &connector.default_producer_entity_id,
                         &connector.default_feature_of_interest_id,
                         &json_option_column(connector.metadata.as_ref()),
@@ -2151,7 +2191,7 @@ impl IngestionConnectorStore for PostgresStorage {
                     SELECT id, tenant_id, connector_key, connector_type, connector_profile,
                         enabled, display_name, protocol, endpoint, broker_url, client_id,
                         topic_filter, http_path, payload_format, content_type,
-                        default_producer_entity_id, default_feature_of_interest_id, metadata,
+                        secret_ref_id, default_producer_entity_id, default_feature_of_interest_id, metadata,
                         created_at, updated_at
                     FROM ingestion_connectors
                     WHERE tenant_id = $1 AND id = $2
@@ -2171,7 +2211,7 @@ impl IngestionConnectorStore for PostgresStorage {
                     SELECT id, tenant_id, connector_key, connector_type, connector_profile,
                         enabled, display_name, protocol, endpoint, broker_url, client_id,
                         topic_filter, http_path, payload_format, content_type,
-                        default_producer_entity_id, default_feature_of_interest_id, metadata,
+                        secret_ref_id, default_producer_entity_id, default_feature_of_interest_id, metadata,
                         created_at, updated_at
                     FROM ingestion_connectors
                     WHERE tenant_id = $1
@@ -2208,16 +2248,17 @@ impl IngestionConnectorStore for PostgresStorage {
                         http_path = $13,
                         payload_format = $14,
                         content_type = $15,
-                        default_producer_entity_id = $16,
-                        default_feature_of_interest_id = $17,
-                        metadata = $18,
-                        created_at = $19,
-                        updated_at = $20
+                        secret_ref_id = $16,
+                        default_producer_entity_id = $17,
+                        default_feature_of_interest_id = $18,
+                        metadata = $19,
+                        created_at = $20,
+                        updated_at = $21
                     WHERE tenant_id = $1 AND id = $2
                     RETURNING id, tenant_id, connector_key, connector_type, connector_profile,
                         enabled, display_name, protocol, endpoint, broker_url, client_id,
                         topic_filter, http_path, payload_format, content_type,
-                        default_producer_entity_id, default_feature_of_interest_id, metadata,
+                        secret_ref_id, default_producer_entity_id, default_feature_of_interest_id, metadata,
                         created_at, updated_at
                     ",
                     &[
@@ -2236,6 +2277,7 @@ impl IngestionConnectorStore for PostgresStorage {
                         &connector.http_path,
                         &connector.payload_format,
                         &connector.content_type,
+                        &connector.secret_ref_id,
                         &connector.default_producer_entity_id,
                         &connector.default_feature_of_interest_id,
                         &json_option_column(connector.metadata.as_ref()),
@@ -2247,6 +2289,93 @@ impl IngestionConnectorStore for PostgresStorage {
             row.map(row_to_ingestion_connector)
                 .transpose()?
                 .ok_or(StorageError::NotFound)
+        })
+    }
+}
+
+impl ConnectorSecretStore for PostgresStorage {
+    fn create_connector_secret(&self, secret: ConnectorSecret) -> StorageResult<ConnectorSecret> {
+        self.with_client(|client| {
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO connector_secrets (
+                        id, tenant_id, secret_key, secret_type, username, secret_value, metadata,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    RETURNING id, tenant_id, secret_key, secret_type, username, secret_value,
+                        metadata, created_at, updated_at
+                    ",
+                    &[
+                        &secret.id,
+                        &secret.tenant_id,
+                        &secret.secret_key,
+                        &connector_secret_type_to_db(&secret.secret_type),
+                        &secret.username,
+                        &secret.secret_value,
+                        &json_option_column(secret.metadata.as_ref()),
+                        &secret.created_at,
+                        &secret.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row_to_connector_secret(row)
+        })
+    }
+
+    fn get_connector_secret(
+        &self,
+        tenant_id: Uuid,
+        secret_id: Uuid,
+    ) -> StorageResult<Option<ConnectorSecret>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, secret_key, secret_type, username, secret_value,
+                        metadata, created_at, updated_at
+                    FROM connector_secrets
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &secret_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_connector_secret).transpose()
+        })
+    }
+
+    fn list_connector_secrets(&self, tenant_id: Uuid) -> StorageResult<Vec<ConnectorSecret>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, secret_key, secret_type, username, secret_value,
+                        metadata, created_at, updated_at
+                    FROM connector_secrets
+                    WHERE tenant_id = $1
+                    ORDER BY secret_key ASC
+                    ",
+                    &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_connector_secret)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn delete_connector_secret(&self, tenant_id: Uuid, secret_id: Uuid) -> StorageResult<()> {
+        self.with_client(|client| {
+            let deleted = client
+                .execute(
+                    "DELETE FROM connector_secrets WHERE tenant_id = $1 AND id = $2",
+                    &[&tenant_id, &secret_id],
+                )
+                .map_err(map_postgres_error)?;
+            if deleted == 0 {
+                return Err(StorageError::NotFound);
+            }
+            Ok(())
         })
     }
 }
@@ -2793,6 +2922,19 @@ mod tests {
         .expect("valid ingestion connector")
     }
 
+    fn build_connector_secret(tenant_id: Uuid, suffix: &str) -> ConnectorSecret {
+        ConnectorSecret::new(
+            tenant_id,
+            format!("broker-secret-{suffix}"),
+            ConnectorSecretType::MqttBasicAuth,
+            Some(format!("mqtt-user-{suffix}")),
+            format!("secret-value-{suffix}"),
+            Some(json!({"suite": "postgres", "suffix": suffix})),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
+        )
+        .expect("valid connector secret")
+    }
+
     fn build_relationship(
         tenant_id: Uuid,
         source_entity_id: Uuid,
@@ -3214,6 +3356,51 @@ mod tests {
                     .expect("missing disabled connector")
                     .enabled
             );
+        }
+    }
+
+    #[test]
+    fn postgres_parity_connector_secrets() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+
+        for store in [
+            &in_memory as &dyn ConnectorSecretStore,
+            &pg as &dyn ConnectorSecretStore,
+        ] {
+            let secret = build_connector_secret(tenant.id, &suffix);
+            let secret = store
+                .create_connector_secret(secret)
+                .expect("create connector secret");
+            assert_eq!(
+                store
+                    .get_connector_secret(tenant.id, secret.id)
+                    .expect("get connector secret")
+                    .expect("missing connector secret"),
+                secret
+            );
+            assert_eq!(
+                store
+                    .list_connector_secrets(tenant.id)
+                    .expect("list connector secrets")
+                    .len(),
+                1
+            );
+            assert!(!format!("{secret:?}").contains(&secret.secret_value));
+            store
+                .delete_connector_secret(tenant.id, secret.id)
+                .expect("delete connector secret");
+            assert!(store
+                .get_connector_secret(tenant.id, secret.id)
+                .expect("get deleted connector secret")
+                .is_none());
         }
     }
 

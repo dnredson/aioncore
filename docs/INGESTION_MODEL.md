@@ -51,6 +51,7 @@ Connector fields include:
 - `connector_type`: `http`, `mqtt`, or `future`
 - `connector_profile`: `generic-aion-mqtt`, `generic-mqtt`, `ttn-v3`, or `custom`
 - runtime defaults such as `protocol`, `endpoint`, `broker_url`, `client_id`, `topic_filter`, `http_path`, `payload_format`, `content_type`, default producer entity, and default feature of interest
+- optional `secret_ref_id` pointing to a connector secret
 - `enabled`
 - metadata and timestamps
 
@@ -65,6 +66,17 @@ PUT /ingestion/connectors/{connector_id}/disable
 GET /ingestion/connectors/{connector_id}/status
 GET /ingestion/workers/plan
 ```
+
+Connector secret endpoints:
+
+```text
+POST /secrets/connectors
+GET /secrets/connectors
+GET /secrets/connectors/{secret_id}
+DELETE /secrets/connectors/{secret_id}
+```
+
+Connector secrets are tenant-scoped credential references for connector workers. A secret includes `secret_key`, `secret_type`, optional `username`, write-only `secret_value`, metadata, and timestamps. API responses never include `secret_value`. Connector records store only `secret_ref_id`, not raw usernames/passwords beyond non-secret connector fields.
 
 Connector-aware HTTP ingestion:
 
@@ -131,7 +143,7 @@ When enabled, startup reads the planner and starts one MQTT subscriber worker fo
 - `generic-aion-mqtt`
 - `generic-mqtt`
 
-Each connector worker uses the connector `broker_url`, `client_id`, `topic_filter`, `payload_format`, and `content_type` defaults. Raw messages and ingestion events include `connector_id`, `connector_key`, and `connector_profile`.
+Each connector worker uses the connector `broker_url`, `client_id`, `topic_filter`, `payload_format`, and `content_type` defaults. When `secret_ref_id` points to a `mqtt_basic_auth` connector secret, the dynamic MQTT worker resolves the secret internally and applies broker username/password authentication. Raw messages and ingestion events include `connector_id`, `connector_key`, and `connector_profile`, but never include secret values.
 
 Connector worker runtime state is exposed through:
 
@@ -150,6 +162,7 @@ Status values include:
 - `planned`
 - `starting`
 - `running`
+- `reconnecting`
 - `stopped`
 - `degraded`
 - `skipped`
@@ -186,7 +199,7 @@ Reconciliation is triggered after:
 - `PUT /ingestion/connectors/{connector_id}/disable`
 - `POST /ingestion/workers/reconcile`
 
-Connector updates can change operational fields such as display name, enabled state, protocol, endpoint, broker URL, client ID, topic filter, HTTP path, payload format, content type, default entity IDs, and metadata. Immutable identity fields are not part of the update request: `id`, `tenant_id`, `connector_key`, `connector_type`, and `connector_profile`.
+Connector updates can change operational fields such as display name, enabled state, protocol, endpoint, broker URL, client ID, topic filter, HTTP path, payload format, content type, secret reference, default entity IDs, and metadata. Immutable identity fields are not part of the update request: `id`, `tenant_id`, `connector_key`, `connector_type`, and `connector_profile`.
 
 During reconciliation:
 
@@ -208,9 +221,13 @@ Connector MQTT workers automatically retry broker disconnects and event-loop fai
 
 Successful resubscription returns the worker to `running`. The environment-variable MQTT worker keeps its existing behavior and is not changed by connector-worker reconnect handling.
 
+If a connector references a missing secret or a currently unsupported secret type, reconciliation marks the worker invalid and reports a validation issue. Deleting a secret clears connector references in the local storage behavior and prevents future worker starts from using that secret.
+
 Worker lifecycle events include:
 
 - `aion:IngestionConnectorUpdated`
+- `aion:ConnectorSecretCreated`
+- `aion:ConnectorSecretDeleted`
 - `aion:ConnectorWorkerStarted`
 - `aion:ConnectorWorkerStopped`
 - `aion:ConnectorWorkerRestarted`
@@ -264,6 +281,8 @@ Optional broker credentials:
 
 These credentials authenticate the AionCore worker to the broker. They are not per-device authorization and do not replace future device-level MQTT authentication.
 
+Dynamic connector-worker broker authentication uses connector secret references instead of connector fields. Only `mqtt_basic_auth` is consumed by the current MQTT worker. `token`, `api_key`, and `custom` are persisted for future adapters but are not applied to MQTT connections yet.
+
 MQTT readiness state is exposed through `/ready`:
 
 - `enabled`
@@ -314,8 +333,9 @@ Full TTN uplink decoding is not implemented yet. Future TTN adapter behavior sho
 - Connector registry persistence is available for in-memory and PostgreSQL storage.
 - Dynamic MQTT workers are implemented only for `generic-aion-mqtt` and `generic-mqtt` connector profiles and must be explicitly enabled.
 - TTN/The Things Stack live connectivity and full uplink decoding are not implemented yet.
-- Secrets storage is not implemented yet.
-- Connector authentication is not implemented yet.
+- Connector secret references are local-development friendly and are not a production secret manager.
+- Connector secret values are persisted by the configured storage backend, but encryption, KMS, and Vault integration are not implemented yet.
+- Dynamic MQTT connector authentication supports only `mqtt_basic_auth` secrets.
 - MQTT broker username/password authentication is supported for the worker only.
 - Per-device MQTT authorization is not implemented yet.
 - TLS/mTLS is not implemented yet.

@@ -36,6 +36,8 @@ pub const MIGRATION_0006_CREATE_RUNTIME_PERSISTENCE_TABLES: &str =
     include_str!("../../../migrations/0006_create_runtime_persistence_tables.sql");
 pub const MIGRATION_0007_CREATE_INGESTION_CONNECTORS: &str =
     include_str!("../../../migrations/0007_create_ingestion_connectors.sql");
+pub const MIGRATION_0008_CREATE_CONNECTOR_SECRETS: &str =
+    include_str!("../../../migrations/0008_create_connector_secrets.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -59,6 +61,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0007_create_ingestion_connectors.sql",
         MIGRATION_0007_CREATE_INGESTION_CONNECTORS,
+    ),
+    (
+        "0008_create_connector_secrets.sql",
+        MIGRATION_0008_CREATE_CONNECTOR_SECRETS,
     ),
 ];
 
@@ -99,6 +105,81 @@ pub enum ConnectorProfile {
     Custom,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorSecretType {
+    MqttBasicAuth,
+    Token,
+    ApiKey,
+    Custom,
+}
+
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct ConnectorSecret {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub secret_key: String,
+    pub secret_type: ConnectorSecretType,
+    pub username: Option<String>,
+    pub secret_value: String,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for ConnectorSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectorSecret")
+            .field("id", &self.id)
+            .field("tenant_id", &self.tenant_id)
+            .field("secret_key", &self.secret_key)
+            .field("secret_type", &self.secret_type)
+            .field("username", &self.username)
+            .field("secret_value", &"***REDACTED***")
+            .field("metadata", &self.metadata)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+impl ConnectorSecret {
+    pub fn new(
+        tenant_id: Uuid,
+        secret_key: impl Into<String>,
+        secret_type: ConnectorSecretType,
+        username: Option<String>,
+        secret_value: impl Into<String>,
+        metadata: Option<Value>,
+        now: DateTime<Utc>,
+    ) -> StorageResult<Self> {
+        let secret_key = secret_key.into();
+        if secret_key.trim().is_empty() {
+            return Err(StorageError::InvalidInput(
+                "secret_key must not be empty".to_string(),
+            ));
+        }
+        let secret_value = secret_value.into();
+        if secret_value.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "secret_value must not be empty".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            tenant_id,
+            secret_key,
+            secret_type,
+            username,
+            secret_value,
+            metadata,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IngestionConnector {
     pub id: Uuid,
@@ -116,6 +197,7 @@ pub struct IngestionConnector {
     pub http_path: Option<String>,
     pub payload_format: Option<String>,
     pub content_type: Option<String>,
+    pub secret_ref_id: Option<Uuid>,
     pub default_producer_entity_id: Option<Uuid>,
     pub default_feature_of_interest_id: Option<Uuid>,
     pub metadata: Option<Value>,
@@ -168,6 +250,7 @@ impl IngestionConnector {
             http_path,
             payload_format,
             content_type,
+            secret_ref_id: None,
             default_producer_entity_id,
             default_feature_of_interest_id,
             metadata,
@@ -332,6 +415,17 @@ pub trait IngestionConnectorStore {
     ) -> StorageResult<IngestionConnector>;
 }
 
+pub trait ConnectorSecretStore {
+    fn create_connector_secret(&self, secret: ConnectorSecret) -> StorageResult<ConnectorSecret>;
+    fn get_connector_secret(
+        &self,
+        tenant_id: Uuid,
+        secret_id: Uuid,
+    ) -> StorageResult<Option<ConnectorSecret>>;
+    fn list_connector_secrets(&self, tenant_id: Uuid) -> StorageResult<Vec<ConnectorSecret>>;
+    fn delete_connector_secret(&self, tenant_id: Uuid, secret_id: Uuid) -> StorageResult<()>;
+}
+
 pub trait CapabilityStore {
     fn put_capabilities(
         &self,
@@ -469,6 +563,7 @@ pub trait ControlPlaneStore:
     + RelationshipStore
     + PayloadProfileStore
     + IngestionConnectorStore
+    + ConnectorSecretStore
     + CapabilityStore
     + PolicyStore
     + CommandStore
@@ -486,6 +581,7 @@ impl<T> ControlPlaneStore for T where
         + RelationshipStore
         + PayloadProfileStore
         + IngestionConnectorStore
+        + ConnectorSecretStore
         + CapabilityStore
         + PolicyStore
         + CommandStore
@@ -552,6 +648,8 @@ struct InMemoryState {
     payload_profiles: HashMap<(Uuid, Uuid), PayloadProfile>,
     ingestion_connectors: HashMap<Uuid, IngestionConnector>,
     ingestion_connector_key_index: HashMap<(Uuid, String), Uuid>,
+    connector_secrets: HashMap<Uuid, ConnectorSecret>,
+    connector_secret_key_index: HashMap<(Uuid, String), Uuid>,
     capabilities: HashMap<(Uuid, Uuid), Vec<Capability>>,
     executors: HashMap<Uuid, ExecutorAgent>,
     executor_key_index: HashMap<(Uuid, String), Uuid>,
@@ -970,6 +1068,72 @@ impl IngestionConnectorStore for InMemoryStorage {
 
         *stored = connector.clone();
         Ok(connector)
+    }
+}
+
+impl ConnectorSecretStore for InMemoryStorage {
+    fn create_connector_secret(&self, secret: ConnectorSecret) -> StorageResult<ConnectorSecret> {
+        let mut state = self.write_state()?;
+        let index_key = (secret.tenant_id, secret.secret_key.clone());
+        if state.connector_secrets.contains_key(&secret.id)
+            || state.connector_secret_key_index.contains_key(&index_key)
+        {
+            return Err(StorageError::Conflict);
+        }
+
+        state
+            .connector_secret_key_index
+            .insert(index_key, secret.id);
+        state.connector_secrets.insert(secret.id, secret.clone());
+        Ok(secret)
+    }
+
+    fn get_connector_secret(
+        &self,
+        tenant_id: Uuid,
+        secret_id: Uuid,
+    ) -> StorageResult<Option<ConnectorSecret>> {
+        Ok(self
+            .read_state()?
+            .connector_secrets
+            .get(&secret_id)
+            .filter(|secret| secret.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn list_connector_secrets(&self, tenant_id: Uuid) -> StorageResult<Vec<ConnectorSecret>> {
+        let mut secrets = self
+            .read_state()?
+            .connector_secrets
+            .values()
+            .filter(|secret| secret.tenant_id == tenant_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        secrets.sort_by(|left, right| left.secret_key.cmp(&right.secret_key));
+        Ok(secrets)
+    }
+
+    fn delete_connector_secret(&self, tenant_id: Uuid, secret_id: Uuid) -> StorageResult<()> {
+        let mut state = self.write_state()?;
+        let secret = state
+            .connector_secrets
+            .get(&secret_id)
+            .filter(|secret| secret.tenant_id == tenant_id)
+            .cloned()
+            .ok_or(StorageError::NotFound)?;
+        state.connector_secrets.remove(&secret_id);
+        state
+            .connector_secret_key_index
+            .remove(&(secret.tenant_id, secret.secret_key));
+        let now = Utc::now();
+        for connector in state.ingestion_connectors.values_mut() {
+            if connector.tenant_id == tenant_id && connector.secret_ref_id == Some(secret_id) {
+                connector.secret_ref_id = None;
+                connector.updated_at = now;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1526,7 +1690,7 @@ mod tests {
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 7);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 8);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
@@ -1537,6 +1701,7 @@ mod tests {
             ORDERED_MIGRATIONS[6].0,
             "0007_create_ingestion_connectors.sql"
         );
+        assert_eq!(ORDERED_MIGRATIONS[7].0, "0008_create_connector_secrets.sql");
     }
 
     #[test]
@@ -1566,6 +1731,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS command_leases",
             "CREATE TABLE IF NOT EXISTS rules",
             "CREATE TABLE IF NOT EXISTS ingestion_connectors",
+            "CREATE TABLE IF NOT EXISTS connector_secrets",
         ] {
             assert!(
                 combined.contains(table),
@@ -1847,6 +2013,43 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_storage_creates_lists_and_deletes_connector_secrets() {
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let now = Utc::now();
+        let secret = ConnectorSecret::new(
+            tenant_id,
+            "farm-broker",
+            ConnectorSecretType::MqttBasicAuth,
+            Some("mqtt-user".to_string()),
+            "super-secret",
+            Some(serde_json::json!({"purpose": "test"})),
+            now,
+        )
+        .unwrap();
+
+        let secret = storage.create_connector_secret(secret).unwrap();
+        assert_eq!(
+            storage
+                .get_connector_secret(tenant_id, secret.id)
+                .unwrap()
+                .unwrap()
+                .secret_value,
+            "super-secret"
+        );
+        assert_eq!(storage.list_connector_secrets(tenant_id).unwrap().len(), 1);
+        assert!(!format!("{secret:?}").contains("super-secret"));
+
+        storage
+            .delete_connector_secret(tenant_id, secret.id)
+            .unwrap();
+        assert!(storage
+            .get_connector_secret(tenant_id, secret.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn in_memory_storage_lists_raw_messages_by_tenant() {
         use aion_raw_message::RawMessageSource;
         use chrono::TimeZone;
@@ -2026,6 +2229,23 @@ mod tests {
             "idx_ingestion_connectors_enabled",
         ] {
             assert!(migration.contains(index), "missing index: {index}");
+        }
+    }
+
+    #[test]
+    fn connector_secret_migration_defines_required_indexes_and_redaction_columns() {
+        let migration = MIGRATION_0008_CREATE_CONNECTOR_SECRETS;
+        for required in [
+            "CREATE TABLE IF NOT EXISTS connector_secrets",
+            "secret_value TEXT NOT NULL",
+            "secret_type IN ('mqtt_basic_auth', 'token', 'api_key', 'custom')",
+            "ADD COLUMN IF NOT EXISTS secret_ref_id UUID REFERENCES connector_secrets(id) ON DELETE SET NULL",
+            "idx_connector_secrets_tenant",
+            "idx_connector_secrets_secret_key",
+            "idx_connector_secrets_secret_type",
+            "idx_ingestion_connectors_secret_ref",
+        ] {
+            assert!(migration.contains(required), "missing migration item: {required}");
         }
     }
 }

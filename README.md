@@ -287,6 +287,63 @@ cargo run -p aion-api
 
 If both `AIONCORE_MQTT_ENABLED=true` and `AIONCORE_CONNECTOR_WORKERS_ENABLED=true` are set, the env-var MQTT worker and connector-based MQTT workers may run at the same time.
 
+Connector MQTT workers can use local connector secret references for broker username/password authentication. Secret values are accepted on write, stored outside `IngestionConnector`, and never returned by the API:
+
+```powershell
+$brokerSecret = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/secrets/connectors" `
+  -ContentType "application/json" `
+  -Body (@{
+    secret_key = "farm-broker-basic-auth"
+    secret_type = "mqtt_basic_auth"
+    username = "aioncore-worker"
+    secret_value = "change-me"
+    metadata = @{
+      purpose = "local broker auth"
+    }
+  } | ConvertTo-Json -Depth 8)
+
+$brokerSecret.secret_value
+```
+
+The last expression returns nothing because secret values are not included in responses. Create a connector that references the secret by ID:
+
+```powershell
+$genericMqttConnector = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors" `
+  -ContentType "application/json" `
+  -Body (@{
+    connector_key = "farm-mqtt-auth"
+    connector_type = "mqtt"
+    connector_profile = "generic-mqtt"
+    enabled = $true
+    broker_url = "mqtt://127.0.0.1:1883"
+    client_id = "aioncore-farm-mqtt-auth"
+    topic_filter = "aioncore/+/+/data"
+    payload_format = "senml-json"
+    secret_ref_id = $brokerSecret.id
+  } | ConvertTo-Json -Depth 8)
+
+$genericMqttConnector.secret_ref_id
+$genericMqttConnector.secret_value
+```
+
+Inspect the connector and worker status without exposing the secret:
+
+```powershell
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/connectors/$($genericMqttConnector.id)"
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/workers/status"
+```
+
+This is a local-development credential foundation only. It does not implement encryption, KMS, Vault, TLS/mTLS, per-device MQTT authorization, or AionCore user/device authentication.
+
 Inspect intended and runtime connector workers:
 
 ```powershell

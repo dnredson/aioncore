@@ -14,8 +14,9 @@ use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_rule::{Rule, RuleAction, RuleCondition, RuleEvaluationResult, RuleTriggerType};
 use aion_storage::{
-    ConnectorProfile, EventFilter, InMemoryStorage, IngestionConnector, IngestionConnectorType,
-    PayloadProfile, PostgresStorage, PostgresStorageConfig, StorageBackend, StorageError,
+    ConnectorProfile, ConnectorSecret, ConnectorSecretType, EventFilter, InMemoryStorage,
+    IngestionConnector, IngestionConnectorType, PayloadProfile, PostgresStorage,
+    PostgresStorageConfig, StorageBackend, StorageError,
 };
 use axum::{
     body::Bytes,
@@ -158,6 +159,7 @@ struct ConnectorWorkerSignature {
     topic_filter: Option<String>,
     payload_format: Option<String>,
     content_type: Option<String>,
+    secret_ref_id: Option<Uuid>,
     connector_profile: ConnectorProfile,
 }
 
@@ -364,6 +366,7 @@ pub struct CreateIngestionConnectorRequest {
     pub http_path: Option<String>,
     pub payload_format: Option<String>,
     pub content_type: Option<String>,
+    pub secret_ref_id: Option<Uuid>,
     pub default_producer_entity_id: Option<Uuid>,
     pub default_feature_of_interest_id: Option<Uuid>,
     pub metadata: Option<Value>,
@@ -382,9 +385,31 @@ pub struct UpdateIngestionConnectorRequest {
     pub http_path: Option<String>,
     pub payload_format: Option<String>,
     pub content_type: Option<String>,
+    pub secret_ref_id: Option<Uuid>,
     pub default_producer_entity_id: Option<Uuid>,
     pub default_feature_of_interest_id: Option<Uuid>,
     pub metadata: Option<Value>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateConnectorSecretRequest {
+    pub secret_key: String,
+    pub secret_type: ConnectorSecretType,
+    pub username: Option<String>,
+    pub secret_value: String,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConnectorSecretResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub secret_key: String,
+    pub secret_type: ConnectorSecretType,
+    pub username: Option<String>,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -438,6 +463,7 @@ pub struct IngestionWorkerSpec {
     pub http_path: Option<String>,
     pub payload_format: Option<String>,
     pub content_type: Option<String>,
+    pub secret_ref_id: Option<Uuid>,
     pub status: IngestionWorkerSpecStatus,
     pub validation_issues: Vec<IngestionWorkerValidationIssue>,
     pub metadata: Option<Value>,
@@ -494,6 +520,7 @@ pub struct ConnectorWorkerRuntimeStatus {
     pub http_path: Option<String>,
     pub payload_format: Option<String>,
     pub content_type: Option<String>,
+    pub secret_ref_id: Option<Uuid>,
     pub last_error: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
     pub last_successful_ingest_at: Option<DateTime<Utc>>,
@@ -984,6 +1011,14 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/events", post(create_event).get(query_events))
         .route("/events/:event_id", get(get_event))
+        .route(
+            "/secrets/connectors",
+            post(create_connector_secret).get(list_connector_secrets),
+        )
+        .route(
+            "/secrets/connectors/:secret_id",
+            get(get_connector_secret).delete(delete_connector_secret),
+        )
         .route("/ai/context/entity/:entity_id", get(get_ai_entity_context))
         .route("/mcp", post(handle_mcp_json_rpc))
         .route("/mcp/tools", get(list_mcp_tools))
@@ -3097,10 +3132,78 @@ async fn query_raw_messages(
     Ok(Json(raw_messages))
 }
 
+async fn create_connector_secret(
+    State(state): State<AppState>,
+    Json(request): Json<CreateConnectorSecretRequest>,
+) -> Result<(StatusCode, Json<ConnectorSecretResponse>), ApiError> {
+    let secret = ConnectorSecret::new(
+        state.tenant_id,
+        request.secret_key,
+        request.secret_type,
+        request.username,
+        request.secret_value,
+        request.metadata,
+        Utc::now(),
+    )?;
+    let secret = state.storage.create_connector_secret(secret)?;
+    record_connector_secret_event(
+        &state,
+        "aion:ConnectorSecretCreated",
+        &secret,
+        Some("Connector secret created".to_string()),
+    )?;
+    Ok((StatusCode::CREATED, Json(connector_secret_response(secret))))
+}
+
+async fn list_connector_secrets(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ConnectorSecretResponse>>, ApiError> {
+    let secrets = state
+        .storage
+        .list_connector_secrets(state.tenant_id)?
+        .into_iter()
+        .map(connector_secret_response)
+        .collect();
+    Ok(Json(secrets))
+}
+
+async fn get_connector_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<Uuid>,
+) -> Result<Json<ConnectorSecretResponse>, ApiError> {
+    let secret = state
+        .storage
+        .get_connector_secret(state.tenant_id, secret_id)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(connector_secret_response(secret)))
+}
+
+async fn delete_connector_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let secret = state
+        .storage
+        .get_connector_secret(state.tenant_id, secret_id)?
+        .ok_or_else(ApiError::not_found)?;
+    state
+        .storage
+        .delete_connector_secret(state.tenant_id, secret_id)?;
+    record_connector_secret_event(
+        &state,
+        "aion:ConnectorSecretDeleted",
+        &secret,
+        Some("Connector secret deleted".to_string()),
+    )?;
+    reconcile_connector_workers_after_mutation(&state).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn create_ingestion_connector(
     State(state): State<AppState>,
     Json(request): Json<CreateIngestionConnectorRequest>,
 ) -> Result<(StatusCode, Json<IngestionConnector>), ApiError> {
+    ensure_connector_secret_exists(&state, request.secret_ref_id)?;
     let connector = IngestionConnector::new(
         state.tenant_id,
         request.connector_key,
@@ -3121,6 +3224,8 @@ async fn create_ingestion_connector(
         request.metadata,
         Utc::now(),
     )?;
+    let mut connector = connector;
+    connector.secret_ref_id = request.secret_ref_id;
     let connector = state.storage.create_ingestion_connector(connector)?;
     record_connector_event(
         &state,
@@ -3184,6 +3289,10 @@ async fn update_ingestion_connector(
     }
     if let Some(content_type) = request.content_type {
         connector.content_type = Some(content_type);
+    }
+    if let Some(secret_ref_id) = request.secret_ref_id {
+        ensure_connector_secret_exists(&state, Some(secret_ref_id))?;
+        connector.secret_ref_id = Some(secret_ref_id);
     }
     if let Some(default_producer_entity_id) = request.default_producer_entity_id {
         connector.default_producer_entity_id = Some(default_producer_entity_id);
@@ -3641,6 +3750,20 @@ fn ensure_entity_exists(state: &AppState, entity_id: Uuid) -> Result<(), ApiErro
         .ok_or_else(ApiError::not_found)
 }
 
+fn ensure_connector_secret_exists(
+    state: &AppState,
+    secret_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let Some(secret_id) = secret_id else {
+        return Ok(());
+    };
+    state
+        .storage
+        .get_connector_secret(state.tenant_id, secret_id)?
+        .map(|_| ())
+        .ok_or_else(ApiError::not_found)
+}
+
 fn get_connector(state: &AppState, connector_id: Uuid) -> Result<IngestionConnector, ApiError> {
     state
         .storage
@@ -3751,8 +3874,8 @@ fn build_ingestion_worker_plan(state: &AppState) -> Result<IngestionWorkerPlan, 
         .storage
         .list_ingestion_connectors(state.tenant_id)?
         .into_iter()
-        .map(connector_worker_spec)
-        .collect::<Vec<_>>();
+        .map(|connector| connector_worker_spec(state, connector))
+        .collect::<Result<Vec<_>, _>>()?;
     let planned_workers = specs
         .iter()
         .filter(|spec| spec.status == IngestionWorkerSpecStatus::Planned)
@@ -4091,20 +4214,49 @@ async fn start_connector_worker_from_spec(
         return Ok(());
     }
 
-    let mqtt_config = mqtt_ingest::MqttIngestConfig::for_connector(
-        spec.broker_url.clone().unwrap_or_default(),
-        spec.client_id
-            .clone()
-            .unwrap_or_else(|| format!("aioncore-connector-{}", spec.connector_id)),
-        spec.topic_filter.clone().unwrap_or_default(),
-        spec.payload_format.clone(),
-        spec.content_type.clone(),
-        mqtt_ingest::MqttConnectorMetadata {
-            connector_id: spec.connector_id,
-            connector_key: spec.connector_key.clone(),
-            connector_profile: spec.connector_profile.clone(),
-        },
-    );
+    let connector_metadata = mqtt_ingest::MqttConnectorMetadata {
+        connector_id: spec.connector_id,
+        connector_key: spec.connector_key.clone(),
+        connector_profile: spec.connector_profile.clone(),
+    };
+    let mqtt_config = if let Some(secret_ref_id) = spec.secret_ref_id {
+        let secret = state
+            .storage
+            .get_connector_secret(state.tenant_id, secret_ref_id)?
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "connector secret_ref_id does not reference an existing connector secret",
+                )
+            })?;
+        if secret.secret_type != ConnectorSecretType::MqttBasicAuth {
+            return Err(ApiError::bad_request(
+                "dynamic MQTT connector workers currently support only mqtt_basic_auth secrets",
+            ));
+        }
+        mqtt_ingest::MqttIngestConfig::for_connector_with_basic_auth(
+            spec.broker_url.clone().unwrap_or_default(),
+            spec.client_id
+                .clone()
+                .unwrap_or_else(|| format!("aioncore-connector-{}", spec.connector_id)),
+            spec.topic_filter.clone().unwrap_or_default(),
+            spec.payload_format.clone(),
+            spec.content_type.clone(),
+            secret.username,
+            secret.secret_value,
+            connector_metadata,
+        )
+    } else {
+        mqtt_ingest::MqttIngestConfig::for_connector(
+            spec.broker_url.clone().unwrap_or_default(),
+            spec.client_id
+                .clone()
+                .unwrap_or_else(|| format!("aioncore-connector-{}", spec.connector_id)),
+            spec.topic_filter.clone().unwrap_or_default(),
+            spec.payload_format.clone(),
+            spec.content_type.clone(),
+            connector_metadata,
+        )
+    };
 
     match mqtt_ingest::start_connector_worker(state.clone(), mqtt_config).await {
         Ok(task) => {
@@ -4259,6 +4411,7 @@ fn connector_worker_signature(spec: &IngestionWorkerSpec) -> ConnectorWorkerSign
         topic_filter: spec.topic_filter.clone(),
         payload_format: spec.payload_format.clone(),
         content_type: spec.content_type.clone(),
+        secret_ref_id: spec.secret_ref_id,
         connector_profile: spec.connector_profile.clone(),
     }
 }
@@ -4285,7 +4438,9 @@ fn connector_worker_event_metadata(spec: &IngestionWorkerSpec, reason: Option<&s
         "worker_kind": spec.worker_kind,
         "broker_url": spec.broker_url,
         "topic_filter": spec.topic_filter,
-        "payload_format": spec.payload_format
+        "payload_format": spec.payload_format,
+        "secret_ref_id": spec.secret_ref_id,
+        "secret_configured": spec.secret_ref_id.is_some()
     });
     if let (Some(object), Some(reason)) = (metadata.as_object_mut(), reason) {
         object.insert("reason".to_string(), json!(reason));
@@ -4353,6 +4508,7 @@ fn connector_runtime_status_from_spec(spec: &IngestionWorkerSpec) -> ConnectorWo
         http_path: spec.http_path.clone(),
         payload_format: spec.payload_format.clone(),
         content_type: spec.content_type.clone(),
+        secret_ref_id: spec.secret_ref_id,
         last_error,
         last_message_at: None,
         last_successful_ingest_at: None,
@@ -4474,7 +4630,10 @@ fn set_connector_workers_enabled(state: &AppState, enabled: bool) {
     }
 }
 
-fn connector_worker_spec(connector: IngestionConnector) -> IngestionWorkerSpec {
+fn connector_worker_spec(
+    state: &AppState,
+    connector: IngestionConnector,
+) -> Result<IngestionWorkerSpec, ApiError> {
     let mut validation_issues = Vec::new();
     let worker_kind = match &connector.connector_type {
         IngestionConnectorType::Http => IngestionWorkerKind::HttpListener,
@@ -4485,6 +4644,24 @@ fn connector_worker_spec(connector: IngestionConnector) -> IngestionWorkerSpec {
     let status = if !connector.enabled {
         IngestionWorkerSpecStatus::Skipped
     } else {
+        if let Some(secret_ref_id) = connector.secret_ref_id {
+            match state
+                .storage
+                .get_connector_secret(state.tenant_id, secret_ref_id)?
+            {
+                Some(secret) if secret.secret_type != ConnectorSecretType::MqttBasicAuth => {
+                    validation_issues.push(worker_issue(
+                        "unsupported_secret_type",
+                        "dynamic MQTT connector workers currently support only mqtt_basic_auth secrets",
+                    ));
+                }
+                Some(_) => {}
+                None => validation_issues.push(worker_issue(
+                    "missing_secret_ref",
+                    "connector secret_ref_id does not reference an existing connector secret",
+                )),
+            }
+        }
         match &connector.connector_type {
             IngestionConnectorType::Http => {
                 if connector
@@ -4544,7 +4721,13 @@ fn connector_worker_spec(connector: IngestionConnector) -> IngestionWorkerSpec {
                     ));
                 }
                 if validation_issues.iter().any(|issue| {
-                    issue.code == "missing_broker_url" || issue.code == "missing_topic_filter"
+                    matches!(
+                        issue.code.as_str(),
+                        "missing_broker_url"
+                            | "missing_topic_filter"
+                            | "missing_secret_ref"
+                            | "unsupported_secret_type"
+                    )
                 }) {
                     IngestionWorkerSpecStatus::Invalid
                 } else {
@@ -4561,7 +4744,7 @@ fn connector_worker_spec(connector: IngestionConnector) -> IngestionWorkerSpec {
         }
     };
 
-    IngestionWorkerSpec {
+    Ok(IngestionWorkerSpec {
         connector_id: connector.id,
         connector_key: connector.connector_key,
         connector_type: connector.connector_type,
@@ -4574,10 +4757,11 @@ fn connector_worker_spec(connector: IngestionConnector) -> IngestionWorkerSpec {
         http_path: connector.http_path.or(connector.endpoint),
         payload_format: connector.payload_format,
         content_type: connector.content_type,
+        secret_ref_id: connector.secret_ref_id,
         status,
         validation_issues,
         metadata: connector.metadata,
-    }
+    })
 }
 
 fn worker_issue(
@@ -4600,7 +4784,30 @@ fn connector_event_metadata(connector: &IngestionConnector) -> Value {
         "connector_key": connector.connector_key,
         "connector_type": connector.connector_type,
         "connector_profile": connector.connector_profile,
-        "enabled": connector.enabled
+        "enabled": connector.enabled,
+        "secret_ref_id": connector.secret_ref_id
+    })
+}
+
+fn connector_secret_response(secret: ConnectorSecret) -> ConnectorSecretResponse {
+    ConnectorSecretResponse {
+        id: secret.id,
+        tenant_id: secret.tenant_id,
+        secret_key: secret.secret_key,
+        secret_type: secret.secret_type,
+        username: secret.username,
+        metadata: secret.metadata,
+        created_at: secret.created_at,
+        updated_at: secret.updated_at,
+    }
+}
+
+fn connector_secret_event_metadata(secret: &ConnectorSecret) -> Value {
+    json!({
+        "secret_id": secret.id,
+        "secret_key": secret.secret_key,
+        "secret_type": secret.secret_type,
+        "username_configured": secret.username.is_some()
     })
 }
 
@@ -5190,6 +5397,33 @@ fn record_connector_event(
             action_id: None,
             action_result_id: None,
             metadata: Some(connector_event_metadata(connector)),
+        },
+    )
+}
+
+fn record_connector_secret_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    secret: &ConnectorSecret,
+    message: Option<String>,
+) -> Result<Event, ApiError> {
+    record_event(
+        state,
+        EventDraft {
+            event_type: event_type.into(),
+            severity: EventSeverity::Info,
+            source_entity_id: None,
+            target_entity_id: None,
+            message,
+            occurred_at: Utc::now(),
+            observed_at: None,
+            correlation_id: None,
+            raw_message_id: None,
+            observation_id: None,
+            command_id: None,
+            action_id: None,
+            action_result_id: None,
+            metadata: Some(connector_secret_event_metadata(secret)),
         },
     )
 }
@@ -8867,6 +9101,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_secret_responses_do_not_expose_secret_value() {
+        let app = app();
+        let secret =
+            create_connector_secret(&app, "broker-secret", "mqtt-user", "secret-pass").await;
+        assert_eq!(secret["secret_key"], "broker-secret");
+        assert!(secret.get("secret_value").is_none());
+
+        let secret_id = secret["id"].as_str().unwrap();
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/secrets/connectors/{secret_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = to_json(get_response).await;
+        assert!(get_body.get("secret_value").is_none());
+        assert_ne!(get_body.to_string().contains("secret-pass"), true);
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/secrets/connectors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = to_json(list_response).await;
+        assert!(list_body[0].get("secret_value").is_none());
+        assert_ne!(list_body.to_string().contains("secret-pass"), true);
+    }
+
+    #[tokio::test]
+    async fn connector_can_reference_secret_without_leaking_value() {
+        let app = app();
+        let secret =
+            create_connector_secret(&app, "connector-broker-secret", "mqtt-user", "secret-pass")
+                .await;
+        let secret_id = secret["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": "mqtt-secret-ref",
+                    "connector_type": "mqtt",
+                    "connector_profile": "generic-mqtt",
+                    "enabled": false,
+                    "broker_url": "mqtt://127.0.0.1:1883",
+                    "client_id": "mqtt-secret-ref-client",
+                    "topic_filter": "aioncore/+/+/data",
+                    "payload_format": "canonical-json",
+                    "secret_ref_id": secret_id
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let connector = to_json(response).await;
+        assert_eq!(connector["secret_ref_id"], secret_id);
+        assert_ne!(connector.to_string().contains("secret-pass"), true);
+    }
+
+    #[tokio::test]
+    async fn deleting_connector_secret_clears_future_worker_auth_reference() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        let secret =
+            create_connector_secret(&app, "delete-broker-secret", "mqtt-user", "secret-pass").await;
+        let secret_id = secret["id"].as_str().unwrap();
+        create_mqtt_connector_with_secret(
+            &app,
+            "mqtt-deleted-secret",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+            Some(secret_id),
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/secrets/connectors/{secret_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let plan = build_ingestion_worker_plan(&state).unwrap();
+        assert_eq!(plan.specs[0].secret_ref_id, None);
+    }
+
+    #[test]
+    fn mqtt_connector_config_with_basic_auth_redacts_debug_output() {
+        let config = mqtt_ingest::MqttIngestConfig::for_connector_with_basic_auth(
+            "mqtt://127.0.0.1:1883".to_string(),
+            "client".to_string(),
+            "aioncore/+/+/data".to_string(),
+            Some("canonical-json".to_string()),
+            None,
+            Some("mqtt-user".to_string()),
+            "secret-pass".to_string(),
+            mqtt_ingest::MqttConnectorMetadata {
+                connector_id: Uuid::new_v4(),
+                connector_key: "mqtt-secret".to_string(),
+                connector_profile: ConnectorProfile::GenericMqtt,
+            },
+        );
+
+        assert_eq!(config.username.as_deref(), Some("mqtt-user"));
+        assert!(config.password_configured());
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret-pass"));
+    }
+
+    #[tokio::test]
     async fn patch_connector_updates_runtime_fields() {
         let app = app();
         let connector = create_mqtt_connector(
@@ -9191,6 +9557,7 @@ mod tests {
             http_path: None,
             payload_format: Some("canonical-json".to_string()),
             content_type: None,
+            secret_ref_id: None,
             status: IngestionWorkerSpecStatus::Planned,
             validation_issues: Vec::new(),
             metadata: None,
@@ -10279,6 +10646,65 @@ mod tests {
                     "client_id": format!("{connector_key}-client"),
                     "topic_filter": topic_filter,
                     "payload_format": payload_format
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_mqtt_connector_with_secret(
+        app: &Router,
+        connector_key: &str,
+        enabled: bool,
+        broker_url: Option<&str>,
+        topic_filter: Option<&str>,
+        payload_format: Option<&str>,
+        secret_ref_id: Option<&str>,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": connector_key,
+                    "connector_type": "mqtt",
+                    "connector_profile": "generic-mqtt",
+                    "enabled": enabled,
+                    "broker_url": broker_url,
+                    "client_id": format!("{connector_key}-client"),
+                    "topic_filter": topic_filter,
+                    "payload_format": payload_format,
+                    "secret_ref_id": secret_ref_id
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_connector_secret(
+        app: &Router,
+        secret_key: &str,
+        username: &str,
+        secret_value: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/secrets/connectors",
+                json!({
+                    "secret_key": secret_key,
+                    "secret_type": "mqtt_basic_auth",
+                    "username": username,
+                    "secret_value": secret_value,
+                    "metadata": {"suite": "api"}
                 }),
             ))
             .await

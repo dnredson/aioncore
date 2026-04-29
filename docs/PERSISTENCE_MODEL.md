@@ -114,6 +114,7 @@ The PostgreSQL adapter currently covers the control-plane subset needed for pari
 - `command_leases`
 - `rules`
 - `ingestion_connectors`
+- `connector_secrets`
 
 The PostgreSQL adapter now also covers the telemetry-oriented core tables:
 
@@ -157,6 +158,7 @@ JSONB is used for structured or extensible fields:
 - Observation values, quality, and metadata: `observations.value_json`, `observations.quality`, `observations.metadata`
 - Payload profile mappings and metadata: `payload_profiles.attribute_mapping`, `payload_profiles.metadata`
 - Ingestion connector metadata: `ingestion_connectors.metadata`
+- Connector secret metadata: `connector_secrets.metadata`
 - Capability, policy, command, action, result, event, executor, lease, and rule metadata
 - Command payloads and policy decisions
 - Action result payloads
@@ -181,6 +183,7 @@ The schema includes indexes for common local API and future repository queries:
 - Command leases by command, executor, status, and expiry.
 - Rules by enabled state, trigger type, observed property, and event type.
 - Ingestion connectors by tenant, key, type, profile, and enabled state.
+- Connector secrets by tenant, key, type, and connector reference.
 
 ## Ingestion Connector Persistence
 
@@ -190,7 +193,26 @@ This includes generic HTTP connectors, generic AionCore MQTT connectors, generic
 
 Connector status remains runtime-derived in the current model. The table persists connector configuration and enablement, but it does not yet persist last error, last message time, last successful ingest time, or last failed ingest time.
 
-Secrets are not stored in ingestion connector records. Broker passwords, token material, TLS credentials, and per-device authorization remain future work.
+Secrets are not stored in ingestion connector records. Connectors can hold `secret_ref_id`, which points to `connector_secrets`.
+
+## Connector Secret Persistence
+
+PostgreSQL now persists connector secrets through `connector_secrets`.
+
+Connector secret rows include:
+
+- `id`
+- `tenant_id`
+- `secret_key`
+- `secret_type`: `mqtt_basic_auth`, `token`, `api_key`, or `custom`
+- optional `username`
+- `secret_value`
+- optional JSONB metadata
+- timestamps
+
+The API treats `secret_value` as write-only and never returns it in create/get/list responses. Event metadata, worker status, readiness, connector responses, raw-message headers, and debug output must not include secret values.
+
+This milestone deliberately does not implement encryption, KMS, Vault, rotation, access policy, TLS/mTLS, or per-device MQTT authorization. The stored value is suitable for local-development and adapter-plumbing validation only. Production deployments should replace or harden this with an external secret manager and encrypted-at-rest behavior.
 
 The `ttn-v3` connector profile configuration is persisted, including broker URL, topic filter, payload format, and metadata. Full TTN uplink decoding remains future work.
 
