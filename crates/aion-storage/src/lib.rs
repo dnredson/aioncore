@@ -38,6 +38,8 @@ pub const MIGRATION_0007_CREATE_INGESTION_CONNECTORS: &str =
     include_str!("../../../migrations/0007_create_ingestion_connectors.sql");
 pub const MIGRATION_0008_CREATE_CONNECTOR_SECRETS: &str =
     include_str!("../../../migrations/0008_create_connector_secrets.sql");
+pub const MIGRATION_0009_CREATE_TTN_DEVICE_MAPPINGS: &str =
+    include_str!("../../../migrations/0009_create_ttn_device_mappings.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -65,6 +67,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0008_create_connector_secrets.sql",
         MIGRATION_0008_CREATE_CONNECTOR_SECRETS,
+    ),
+    (
+        "0009_create_ttn_device_mappings.sql",
+        MIGRATION_0009_CREATE_TTN_DEVICE_MAPPINGS,
     ),
 ];
 
@@ -265,6 +271,68 @@ impl IngestionConnector {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TtnDeviceMapping {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub connector_id: Uuid,
+    pub ttn_application_id: Option<String>,
+    pub ttn_device_id: String,
+    pub producer_entity_id: Uuid,
+    pub feature_of_interest_id: Option<Uuid>,
+    pub enabled: bool,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TtnDeviceMapping {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        ttn_application_id: Option<String>,
+        ttn_device_id: impl Into<String>,
+        producer_entity_id: Uuid,
+        feature_of_interest_id: Option<Uuid>,
+        enabled: bool,
+        metadata: Option<Value>,
+        now: DateTime<Utc>,
+    ) -> StorageResult<Self> {
+        let ttn_device_id = ttn_device_id.into();
+        if ttn_device_id.trim().is_empty() {
+            return Err(StorageError::InvalidInput(
+                "ttn_device_id must not be empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            id: Uuid::new_v4(),
+            tenant_id,
+            connector_id,
+            ttn_application_id: ttn_application_id.and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }),
+            ttn_device_id,
+            producer_entity_id,
+            feature_of_interest_id,
+            enabled,
+            metadata,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool, now: DateTime<Utc>) {
+        self.enabled = enabled;
+        self.updated_at = now;
+    }
+}
+
 impl PayloadProfile {
     pub fn new(
         entity_id: Uuid,
@@ -426,6 +494,35 @@ pub trait ConnectorSecretStore {
     fn delete_connector_secret(&self, tenant_id: Uuid, secret_id: Uuid) -> StorageResult<()>;
 }
 
+pub trait TtnDeviceMappingStore {
+    fn create_ttn_device_mapping(
+        &self,
+        mapping: TtnDeviceMapping,
+    ) -> StorageResult<TtnDeviceMapping>;
+    fn get_ttn_device_mapping(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        mapping_id: Uuid,
+    ) -> StorageResult<Option<TtnDeviceMapping>>;
+    fn list_ttn_device_mappings(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+    ) -> StorageResult<Vec<TtnDeviceMapping>>;
+    fn update_ttn_device_mapping(
+        &self,
+        mapping: TtnDeviceMapping,
+    ) -> StorageResult<TtnDeviceMapping>;
+    fn find_ttn_device_mapping(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        ttn_application_id: Option<&str>,
+        ttn_device_id: &str,
+    ) -> StorageResult<Option<TtnDeviceMapping>>;
+}
+
 pub trait CapabilityStore {
     fn put_capabilities(
         &self,
@@ -564,6 +661,7 @@ pub trait ControlPlaneStore:
     + PayloadProfileStore
     + IngestionConnectorStore
     + ConnectorSecretStore
+    + TtnDeviceMappingStore
     + CapabilityStore
     + PolicyStore
     + CommandStore
@@ -582,6 +680,7 @@ impl<T> ControlPlaneStore for T where
         + PayloadProfileStore
         + IngestionConnectorStore
         + ConnectorSecretStore
+        + TtnDeviceMappingStore
         + CapabilityStore
         + PolicyStore
         + CommandStore
@@ -650,6 +749,7 @@ struct InMemoryState {
     ingestion_connector_key_index: HashMap<(Uuid, String), Uuid>,
     connector_secrets: HashMap<Uuid, ConnectorSecret>,
     connector_secret_key_index: HashMap<(Uuid, String), Uuid>,
+    ttn_device_mappings: HashMap<Uuid, TtnDeviceMapping>,
     capabilities: HashMap<(Uuid, Uuid), Vec<Capability>>,
     executors: HashMap<Uuid, ExecutorAgent>,
     executor_key_index: HashMap<(Uuid, String), Uuid>,
@@ -1134,6 +1234,108 @@ impl ConnectorSecretStore for InMemoryStorage {
             }
         }
         Ok(())
+    }
+}
+
+impl TtnDeviceMappingStore for InMemoryStorage {
+    fn create_ttn_device_mapping(
+        &self,
+        mapping: TtnDeviceMapping,
+    ) -> StorageResult<TtnDeviceMapping> {
+        let mut state = self.write_state()?;
+        if state.ttn_device_mappings.contains_key(&mapping.id) {
+            return Err(StorageError::Conflict);
+        }
+        state
+            .ttn_device_mappings
+            .insert(mapping.id, mapping.clone());
+        Ok(mapping)
+    }
+
+    fn get_ttn_device_mapping(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        mapping_id: Uuid,
+    ) -> StorageResult<Option<TtnDeviceMapping>> {
+        Ok(self
+            .read_state()?
+            .ttn_device_mappings
+            .get(&mapping_id)
+            .filter(|mapping| {
+                mapping.tenant_id == tenant_id && mapping.connector_id == connector_id
+            })
+            .cloned())
+    }
+
+    fn list_ttn_device_mappings(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+    ) -> StorageResult<Vec<TtnDeviceMapping>> {
+        let mut mappings = self
+            .read_state()?
+            .ttn_device_mappings
+            .values()
+            .filter(|mapping| {
+                mapping.tenant_id == tenant_id && mapping.connector_id == connector_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        mappings.sort_by(|left, right| {
+            left.ttn_device_id
+                .cmp(&right.ttn_device_id)
+                .then(left.ttn_application_id.cmp(&right.ttn_application_id))
+        });
+        Ok(mappings)
+    }
+
+    fn update_ttn_device_mapping(
+        &self,
+        mapping: TtnDeviceMapping,
+    ) -> StorageResult<TtnDeviceMapping> {
+        let mut state = self.write_state()?;
+        let stored = state
+            .ttn_device_mappings
+            .get_mut(&mapping.id)
+            .filter(|stored| {
+                stored.tenant_id == mapping.tenant_id && stored.connector_id == mapping.connector_id
+            })
+            .ok_or(StorageError::NotFound)?;
+        *stored = mapping.clone();
+        Ok(mapping)
+    }
+
+    fn find_ttn_device_mapping(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        ttn_application_id: Option<&str>,
+        ttn_device_id: &str,
+    ) -> StorageResult<Option<TtnDeviceMapping>> {
+        let mappings = self.read_state()?;
+        let matches = |mapping: &&TtnDeviceMapping| {
+            mapping.tenant_id == tenant_id
+                && mapping.connector_id == connector_id
+                && mapping.enabled
+                && mapping.ttn_device_id == ttn_device_id
+        };
+        if let Some(application_id) = ttn_application_id {
+            if let Some(mapping) = mappings
+                .ttn_device_mappings
+                .values()
+                .filter(matches)
+                .find(|mapping| mapping.ttn_application_id.as_deref() == Some(application_id))
+            {
+                return Ok(Some(mapping.clone()));
+            }
+        }
+        Ok(mappings
+            .ttn_device_mappings
+            .values()
+            .filter(matches)
+            .find(|mapping| mapping.ttn_application_id.is_none())
+            .cloned())
     }
 }
 
@@ -1690,7 +1892,7 @@ mod tests {
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 8);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 9);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
@@ -1702,6 +1904,10 @@ mod tests {
             "0007_create_ingestion_connectors.sql"
         );
         assert_eq!(ORDERED_MIGRATIONS[7].0, "0008_create_connector_secrets.sql");
+        assert_eq!(
+            ORDERED_MIGRATIONS[8].0,
+            "0009_create_ttn_device_mappings.sql"
+        );
     }
 
     #[test]
@@ -1732,6 +1938,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS rules",
             "CREATE TABLE IF NOT EXISTS ingestion_connectors",
             "CREATE TABLE IF NOT EXISTS connector_secrets",
+            "CREATE TABLE IF NOT EXISTS ttn_device_mappings",
         ] {
             assert!(
                 combined.contains(table),
@@ -2050,6 +2257,88 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_storage_creates_updates_and_finds_ttn_device_mappings() {
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let connector_id = Uuid::new_v4();
+        let producer_entity_id = Uuid::new_v4();
+        let feature_of_interest_id = Uuid::new_v4();
+        let now = Utc::now();
+        let generic = TtnDeviceMapping::new(
+            tenant_id,
+            connector_id,
+            None,
+            "soil-node-01",
+            producer_entity_id,
+            Some(feature_of_interest_id),
+            true,
+            Some(serde_json::json!({"scope": "generic"})),
+            now,
+        )
+        .unwrap();
+        let application_specific = TtnDeviceMapping::new(
+            tenant_id,
+            connector_id,
+            Some("farm-app".to_string()),
+            "soil-node-01",
+            producer_entity_id,
+            Some(feature_of_interest_id),
+            true,
+            Some(serde_json::json!({"scope": "application"})),
+            now,
+        )
+        .unwrap();
+
+        let generic = storage.create_ttn_device_mapping(generic).unwrap();
+        let application_specific = storage
+            .create_ttn_device_mapping(application_specific)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_ttn_device_mapping(tenant_id, connector_id, generic.id)
+                .unwrap()
+                .unwrap(),
+            generic
+        );
+        assert_eq!(
+            storage
+                .list_ttn_device_mappings(tenant_id, connector_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            storage
+                .find_ttn_device_mapping(tenant_id, connector_id, Some("farm-app"), "soil-node-01")
+                .unwrap()
+                .unwrap()
+                .id,
+            application_specific.id
+        );
+        assert_eq!(
+            storage
+                .find_ttn_device_mapping(tenant_id, connector_id, Some("other-app"), "soil-node-01")
+                .unwrap()
+                .unwrap()
+                .id,
+            generic.id
+        );
+
+        let mut disabled = application_specific.clone();
+        disabled.set_enabled(false, Utc::now());
+        storage.update_ttn_device_mapping(disabled).unwrap();
+        assert_eq!(
+            storage
+                .find_ttn_device_mapping(tenant_id, connector_id, Some("farm-app"), "soil-node-01")
+                .unwrap()
+                .unwrap()
+                .id,
+            generic.id
+        );
+    }
+
+    #[test]
     fn in_memory_storage_lists_raw_messages_by_tenant() {
         use aion_raw_message::RawMessageSource;
         use chrono::TimeZone;
@@ -2246,6 +2535,27 @@ mod tests {
             "idx_ingestion_connectors_secret_ref",
         ] {
             assert!(migration.contains(required), "missing migration item: {required}");
+        }
+    }
+
+    #[test]
+    fn ttn_device_mapping_migration_defines_required_columns_and_indexes() {
+        let migration = MIGRATION_0009_CREATE_TTN_DEVICE_MAPPINGS;
+        for required in [
+            "CREATE TABLE IF NOT EXISTS ttn_device_mappings",
+            "connector_id UUID NOT NULL REFERENCES ingestion_connectors(id) ON DELETE CASCADE",
+            "ttn_application_id TEXT",
+            "ttn_device_id TEXT NOT NULL",
+            "producer_entity_id UUID NOT NULL REFERENCES entities(id) ON DELETE RESTRICT",
+            "feature_of_interest_id UUID REFERENCES entities(id) ON DELETE SET NULL",
+            "idx_ttn_device_mappings_connector",
+            "idx_ttn_device_mappings_device",
+            "idx_ttn_device_mappings_enabled",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing migration item: {required}"
+            );
         }
     }
 }

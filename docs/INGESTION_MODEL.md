@@ -78,6 +78,18 @@ DELETE /secrets/connectors/{secret_id}
 
 Connector secrets are tenant-scoped credential references for connector workers. A secret includes `secret_key`, `secret_type`, optional `username`, write-only `secret_value`, metadata, and timestamps. API responses never include `secret_value`. Connector records store only `secret_ref_id`, not raw usernames/passwords beyond non-secret connector fields.
 
+TTN device mapping endpoints:
+
+```text
+POST /ingestion/connectors/{connector_id}/ttn-device-mappings
+GET /ingestion/connectors/{connector_id}/ttn-device-mappings
+GET /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}
+PUT /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/enable
+PUT /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/disable
+```
+
+TTN device mappings are explicit tenant-scoped rules for `ttn-v3` connectors. A mapping links a connector, optional TTN application ID, and TTN device ID to an existing `producer_entity_id` and optional `feature_of_interest_id`. They do not create entities.
+
 Connector-aware HTTP ingestion:
 
 ```text
@@ -206,7 +218,7 @@ During reconciliation:
 - valid enabled `generic-aion-mqtt` and `generic-mqtt` MQTT connectors start a worker if none is running;
 - disabled connectors stop any tracked worker;
 - invalid connectors remain stopped and report validation errors;
-- TTN v3 connectors remain skipped until TTN decoding is implemented;
+- TTN v3 connectors with `payload_format = "ttn-uplink-json"` can plan/start MQTT subscriber workers when broker and topic settings are valid;
 - if a tracked worker's relevant signature differs from the planned connector configuration, the worker is restarted.
 
 Relevant signature fields are broker URL, client ID, topic filter, payload format, content type, and connector profile. Public connector updates trigger reconciliation, so changing one of those fields restarts the tracked connector worker when dynamic workers are enabled. If an update saves invalid worker configuration, reconciliation stops any tracked worker and reports `invalid` status with validation details.
@@ -355,11 +367,26 @@ Observation time prefers `uplink_message.received_at`, then root `received_at`, 
 }
 ```
 
-The decoder does not auto-create entities. The ingestion context must still provide `producer_entity_id` and `feature_of_interest_id`, either in the request or through connector defaults. TTN device and application IDs are preserved in observation and `PayloadIngested` event metadata.
+The decoder does not auto-create entities. Producer and feature resolution order for connector-aware TTN ingestion is:
+
+1. Explicit request `producer_entity_id` / `feature_of_interest_id`.
+2. Enabled TTN device mapping for connector + device ID, preferring a mapping with matching application ID over a connector/device fallback without application ID.
+3. Connector default producer/feature IDs.
+
+If no producer entity can be resolved for a TTN uplink, AionCore still stores the raw message, marks it failed, emits `aion:TtnDeviceMappingMissing` and `aion:PayloadIngestionFailed`, and creates no observations. If a mapping resolves successfully, `aion:TtnDeviceMappingResolved` is emitted and `ttn_mapping_id` is included in the successful `PayloadIngested` event metadata.
+
+TTN device and application IDs are preserved in observation and `PayloadIngested` event metadata.
+
+TTN mapping events include:
+
+- `aion:TtnDeviceMappingCreated`
+- `aion:TtnDeviceMappingEnabled`
+- `aion:TtnDeviceMappingDisabled`
+- `aion:TtnDeviceMappingResolved`
+- `aion:TtnDeviceMappingMissing`
 
 Future TTN adapter behavior should:
 
-- map TTN `device_id` to producer entities;
 - map `decoded_payload` fields to canonical observations;
 - preserve uplink metadata such as RSSI, SNR, gateway IDs, frame counters, and timestamps;
 - support topic differences across tenant, application, and regional endpoint conventions.
@@ -368,13 +395,13 @@ Future TTN adapter behavior should:
 ## Limitations
 
 - Connector registry persistence is available for in-memory and PostgreSQL storage.
-- Dynamic MQTT workers are implemented only for `generic-aion-mqtt` and `generic-mqtt` connector profiles and must be explicitly enabled.
-- TTN/The Things Stack live connectivity and full uplink decoding are not implemented yet.
+- Dynamic MQTT workers are implemented for `generic-aion-mqtt`, `generic-mqtt`, and `ttn-v3` connector profiles and must be explicitly enabled.
+- TTN/The Things Stack live account validation and full adapter behavior are not implemented yet.
 - Connector secret references are local-development friendly and are not a production secret manager.
 - Connector secret values are persisted by the configured storage backend, but encryption, KMS, and Vault integration are not implemented yet.
 - Dynamic MQTT connector authentication supports only `mqtt_basic_auth` secrets.
 - TTN v3 uplink JSON decoding is local and sample-payload based; live TTN account integration is not implemented.
-- TTN entity auto-provisioning is not implemented yet.
+- TTN entity auto-provisioning is not implemented; device-to-entity association requires explicit TTN device mappings or request/default entity IDs.
 - TTN downlinks are not implemented yet.
 - MQTT broker username/password authentication is supported for the worker only.
 - Per-device MQTT authorization is not implemented yet.

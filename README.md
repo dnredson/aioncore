@@ -244,9 +244,41 @@ $raw.connector_key
 $raw.connector_profile
 ```
 
-TTN v3 uplink JSON can be tested locally through connector-aware HTTP ingestion without a live TTN broker. Create a TTN connector with default AionCore entity IDs:
+TTN v3 uplink JSON can be tested locally through connector-aware HTTP ingestion without a live TTN broker. Create existing AionCore entities, a TTN connector, and an explicit device mapping:
 
 ```powershell
+$ttnProducer = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "ttn-soil-node-01"
+    entity_type = "aion:Sensor"
+    jsonld = @{
+      "@context" = @{
+        aion = "https://w3id.org/aion/"
+      }
+      "@id" = "urn:aion:device:ttn-soil-node-01"
+      "@type" = "aion:Sensor"
+    }
+  } | ConvertTo-Json -Depth 8)
+
+$ttnFeature = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/entities" `
+  -ContentType "application/json" `
+  -Body (@{
+    entity_key = "plot-01"
+    entity_type = "aion:Plot"
+    jsonld = @{
+      "@context" = @{
+        aion = "https://w3id.org/aion/"
+      }
+      "@id" = "urn:aion:plot:01"
+      "@type" = "aion:Plot"
+    }
+  } | ConvertTo-Json -Depth 8)
+
 $ttnConnector = Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8080/ingestion/connectors" `
@@ -260,8 +292,6 @@ $ttnConnector = Invoke-RestMethod `
     topic_filter = "v3/demo-application/devices/+/up"
     payload_format = "ttn-uplink-json"
     content_type = "application/json"
-    default_producer_entity_id = "11111111-1111-1111-1111-111111111111"
-    default_feature_of_interest_id = "22222222-2222-2222-2222-222222222222"
     metadata = @{
       unit_mapping = @{
         temperature = "Cel"
@@ -269,9 +299,23 @@ $ttnConnector = Invoke-RestMethod `
       }
     }
   } | ConvertTo-Json -Depth 10)
+
+$ttnMapping = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings" `
+  -ContentType "application/json" `
+  -Body (@{
+    ttn_application_id = "farm-app"
+    ttn_device_id = "soil-node-01"
+    producer_entity_id = $ttnProducer.id
+    feature_of_interest_id = $ttnFeature.id
+    metadata = @{
+      source = "local-demo"
+    }
+  } | ConvertTo-Json -Depth 8)
 ```
 
-Ingest a sample TTN uplink:
+Ingest a sample TTN uplink without passing `producer_entity_id`; AionCore resolves it through the mapping:
 
 ```powershell
 $ttnIngest = Invoke-RestMethod `
@@ -319,6 +363,8 @@ $raw.connector_profile
 $events.metadata
 ```
 
+If no enabled mapping matches and the request does not provide a producer entity, AionCore preserves the raw message, marks it failed, emits `aion:TtnDeviceMappingMissing`, and creates no observations. Application-specific mappings are preferred over connector/device fallback mappings without `ttn_application_id`.
+
 Plan ingestion workers without starting them:
 
 ```powershell
@@ -345,7 +391,7 @@ Planner behavior:
 
 `GET /ingestion/workers/plan` is read-only. It does not connect to brokers or start dynamic workers.
 
-The connector registry is available in memory and through the PostgreSQL backend. Existing env-var MQTT config remains the default runtime MQTT connector behavior. Dynamic MQTT workers per connector are opt-in. TTN uplink decoding is local and sample-payload testable; live TTN broker validation, downlinks, and entity auto-provisioning are future work.
+The connector registry is available in memory and through the PostgreSQL backend. Existing env-var MQTT config remains the default runtime MQTT connector behavior. Dynamic MQTT workers per connector are opt-in. TTN uplink decoding and explicit device mappings are local and sample-payload testable; live TTN broker validation, downlinks, and entity auto-provisioning are future work.
 
 Dynamic connector workers are disabled unless explicitly enabled:
 
@@ -481,7 +527,7 @@ mosquitto_pub.exe `
   -V mqttv5
 ```
 
-TTN v3 connectors can be registered and planned, but connector workers skip them for now because `ttn-uplink-json` decoding is not implemented yet.
+TTN v3 connectors with `payload_format = "ttn-uplink-json"` can be registered, planned, decoded from sample uplink JSON, and resolved through explicit TTN device mappings. Live TTN account validation, downlinks, and entity auto-provisioning are not implemented yet.
 
 With PostgreSQL selected as the storage backend, connector records are stored durably. Example connector payloads:
 

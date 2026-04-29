@@ -115,6 +115,7 @@ The PostgreSQL adapter currently covers the control-plane subset needed for pari
 - `rules`
 - `ingestion_connectors`
 - `connector_secrets`
+- `ttn_device_mappings`
 
 The PostgreSQL adapter now also covers the telemetry-oriented core tables:
 
@@ -184,6 +185,7 @@ The schema includes indexes for common local API and future repository queries:
 - Rules by enabled state, trigger type, observed property, and event type.
 - Ingestion connectors by tenant, key, type, profile, and enabled state.
 - Connector secrets by tenant, key, type, and connector reference.
+- TTN device mappings by tenant, connector, application ID, device ID, and enabled state.
 
 ## Ingestion Connector Persistence
 
@@ -214,7 +216,15 @@ The API treats `secret_value` as write-only and never returns it in create/get/l
 
 This milestone deliberately does not implement encryption, KMS, Vault, rotation, access policy, TLS/mTLS, or per-device MQTT authorization. The stored value is suitable for local-development and adapter-plumbing validation only. Production deployments should replace or harden this with an external secret manager and encrypted-at-rest behavior.
 
-The `ttn-v3` connector profile configuration is persisted, including broker URL, topic filter, payload format, and metadata. Full TTN uplink decoding remains future work.
+The `ttn-v3` connector profile configuration is persisted, including broker URL, topic filter, payload format, and metadata. Full TTN adapter behavior remains future work.
+
+## TTN Device Mapping Persistence
+
+PostgreSQL now persists explicit TTN device-to-entity mapping rules through `ttn_device_mappings`.
+
+Rows include tenant and connector IDs, optional `ttn_application_id`, required `ttn_device_id`, required `producer_entity_id`, optional `feature_of_interest_id`, `enabled`, optional metadata, and timestamps. The table references existing connectors and entities; it does not auto-provision entities from TTN device IDs.
+
+Mapping lookup is scoped to tenant and connector, requires an enabled row, and prefers an exact application ID match over a connector/device fallback row with no application ID.
 
 ## Future Adapter Expectations
 

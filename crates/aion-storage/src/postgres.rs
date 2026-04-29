@@ -214,6 +214,24 @@ fn row_to_connector_secret(row: Row) -> StorageResult<ConnectorSecret> {
     })
 }
 
+fn row_to_ttn_device_mapping(row: Row) -> TtnDeviceMapping {
+    TtnDeviceMapping {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        connector_id: row.get("connector_id"),
+        ttn_application_id: row.get("ttn_application_id"),
+        ttn_device_id: row.get("ttn_device_id"),
+        producer_entity_id: row.get("producer_entity_id"),
+        feature_of_interest_id: row.get("feature_of_interest_id"),
+        enabled: row.get("enabled"),
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
 fn ingestion_connector_type_to_db(connector_type: &IngestionConnectorType) -> &'static str {
     match connector_type {
         IngestionConnectorType::Http => "http",
@@ -2380,6 +2398,167 @@ impl ConnectorSecretStore for PostgresStorage {
     }
 }
 
+impl TtnDeviceMappingStore for PostgresStorage {
+    fn create_ttn_device_mapping(
+        &self,
+        mapping: TtnDeviceMapping,
+    ) -> StorageResult<TtnDeviceMapping> {
+        self.with_client(|client| {
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO ttn_device_mappings (
+                        id, tenant_id, connector_id, ttn_application_id, ttn_device_id,
+                        producer_entity_id, feature_of_interest_id, enabled, metadata,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    RETURNING id, tenant_id, connector_id, ttn_application_id, ttn_device_id,
+                        producer_entity_id, feature_of_interest_id, enabled, metadata,
+                        created_at, updated_at
+                    ",
+                    &[
+                        &mapping.id,
+                        &mapping.tenant_id,
+                        &mapping.connector_id,
+                        &mapping.ttn_application_id,
+                        &mapping.ttn_device_id,
+                        &mapping.producer_entity_id,
+                        &mapping.feature_of_interest_id,
+                        &mapping.enabled,
+                        &json_option_column(mapping.metadata.as_ref()),
+                        &mapping.created_at,
+                        &mapping.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            Ok(row_to_ttn_device_mapping(row))
+        })
+    }
+
+    fn get_ttn_device_mapping(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        mapping_id: Uuid,
+    ) -> StorageResult<Option<TtnDeviceMapping>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, connector_id, ttn_application_id, ttn_device_id,
+                        producer_entity_id, feature_of_interest_id, enabled, metadata,
+                        created_at, updated_at
+                    FROM ttn_device_mappings
+                    WHERE tenant_id = $1 AND connector_id = $2 AND id = $3
+                    ",
+                    &[&tenant_id, &connector_id, &mapping_id],
+                )
+                .map_err(map_postgres_error)?;
+            Ok(row.map(row_to_ttn_device_mapping))
+        })
+    }
+
+    fn list_ttn_device_mappings(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+    ) -> StorageResult<Vec<TtnDeviceMapping>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, connector_id, ttn_application_id, ttn_device_id,
+                        producer_entity_id, feature_of_interest_id, enabled, metadata,
+                        created_at, updated_at
+                    FROM ttn_device_mappings
+                    WHERE tenant_id = $1 AND connector_id = $2
+                    ORDER BY ttn_device_id ASC, ttn_application_id ASC NULLS LAST
+                    ",
+                    &[&tenant_id, &connector_id],
+                )
+                .map_err(map_postgres_error)?;
+            Ok(rows.into_iter().map(row_to_ttn_device_mapping).collect())
+        })
+    }
+
+    fn update_ttn_device_mapping(
+        &self,
+        mapping: TtnDeviceMapping,
+    ) -> StorageResult<TtnDeviceMapping> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE ttn_device_mappings SET
+                        ttn_application_id = $4,
+                        ttn_device_id = $5,
+                        producer_entity_id = $6,
+                        feature_of_interest_id = $7,
+                        enabled = $8,
+                        metadata = $9,
+                        created_at = $10,
+                        updated_at = $11
+                    WHERE tenant_id = $1 AND connector_id = $2 AND id = $3
+                    RETURNING id, tenant_id, connector_id, ttn_application_id, ttn_device_id,
+                        producer_entity_id, feature_of_interest_id, enabled, metadata,
+                        created_at, updated_at
+                    ",
+                    &[
+                        &mapping.tenant_id,
+                        &mapping.connector_id,
+                        &mapping.id,
+                        &mapping.ttn_application_id,
+                        &mapping.ttn_device_id,
+                        &mapping.producer_entity_id,
+                        &mapping.feature_of_interest_id,
+                        &mapping.enabled,
+                        &json_option_column(mapping.metadata.as_ref()),
+                        &mapping.created_at,
+                        &mapping.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_ttn_device_mapping)
+                .ok_or(StorageError::NotFound)
+        })
+    }
+
+    fn find_ttn_device_mapping(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        ttn_application_id: Option<&str>,
+        ttn_device_id: &str,
+    ) -> StorageResult<Option<TtnDeviceMapping>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, connector_id, ttn_application_id, ttn_device_id,
+                        producer_entity_id, feature_of_interest_id, enabled, metadata,
+                        created_at, updated_at
+                    FROM ttn_device_mappings
+                    WHERE tenant_id = $1
+                        AND connector_id = $2
+                        AND ttn_device_id = $3
+                        AND enabled = TRUE
+                        AND (ttn_application_id = $4 OR ttn_application_id IS NULL)
+                    ORDER BY CASE WHEN ttn_application_id = $4 THEN 0 ELSE 1 END
+                    LIMIT 1
+                    ",
+                    &[
+                        &tenant_id,
+                        &connector_id,
+                        &ttn_device_id,
+                        &ttn_application_id,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            Ok(row.map(row_to_ttn_device_mapping))
+        })
+    }
+}
+
 impl CapabilityStore for PostgresStorage {
     fn put_capabilities(
         &self,
@@ -2935,6 +3114,28 @@ mod tests {
         .expect("valid connector secret")
     }
 
+    fn build_ttn_device_mapping(
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        producer_entity_id: Uuid,
+        feature_of_interest_id: Option<Uuid>,
+        suffix: &str,
+        ttn_application_id: Option<&str>,
+    ) -> TtnDeviceMapping {
+        TtnDeviceMapping::new(
+            tenant_id,
+            connector_id,
+            ttn_application_id.map(ToOwned::to_owned),
+            format!("soil-node-{suffix}"),
+            producer_entity_id,
+            feature_of_interest_id,
+            true,
+            Some(json!({"suite": "postgres", "suffix": suffix})),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
+        )
+        .expect("valid TTN device mapping")
+    }
+
     fn build_relationship(
         tenant_id: Uuid,
         source_entity_id: Uuid,
@@ -3401,6 +3602,130 @@ mod tests {
                 .get_connector_secret(tenant.id, secret.id)
                 .expect("get deleted connector secret")
                 .is_none());
+        }
+    }
+
+    #[test]
+    fn postgres_parity_ttn_device_mappings() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let producer = build_entity(tenant.id, &format!("{suffix}-producer"), "aion:Sensor");
+        let feature = build_entity(tenant.id, &format!("{suffix}-feature"), "aion:Field");
+        let connector = build_connector(
+            tenant.id,
+            &suffix,
+            "ttn-mapping",
+            IngestionConnectorType::Mqtt,
+            ConnectorProfile::TtnV3,
+            "ttn-uplink-json",
+        );
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+        for store in [&in_memory as &dyn EntityStore, &pg as &dyn EntityStore] {
+            store
+                .create_entity(producer.clone())
+                .expect("create producer");
+            store
+                .create_entity(feature.clone())
+                .expect("create feature");
+        }
+        for store in [
+            &in_memory as &dyn IngestionConnectorStore,
+            &pg as &dyn IngestionConnectorStore,
+        ] {
+            store
+                .create_ingestion_connector(connector.clone())
+                .expect("create connector");
+        }
+
+        for store in [
+            &in_memory as &dyn TtnDeviceMappingStore,
+            &pg as &dyn TtnDeviceMappingStore,
+        ] {
+            let generic = build_ttn_device_mapping(
+                tenant.id,
+                connector.id,
+                producer.id,
+                Some(feature.id),
+                &suffix,
+                None,
+            );
+            let app_specific = build_ttn_device_mapping(
+                tenant.id,
+                connector.id,
+                producer.id,
+                Some(feature.id),
+                &format!("{suffix}-app"),
+                Some("farm-app"),
+            );
+            let generic = store
+                .create_ttn_device_mapping(generic)
+                .expect("create generic mapping");
+            let app_specific = store
+                .create_ttn_device_mapping(app_specific)
+                .expect("create application mapping");
+
+            assert_eq!(
+                store
+                    .get_ttn_device_mapping(tenant.id, connector.id, generic.id)
+                    .expect("get mapping")
+                    .expect("missing mapping"),
+                generic
+            );
+            assert_eq!(
+                store
+                    .list_ttn_device_mappings(tenant.id, connector.id)
+                    .expect("list mappings")
+                    .len(),
+                2
+            );
+            assert_eq!(
+                store
+                    .find_ttn_device_mapping(
+                        tenant.id,
+                        connector.id,
+                        Some("farm-app"),
+                        &app_specific.ttn_device_id
+                    )
+                    .expect("find app mapping")
+                    .expect("missing app mapping")
+                    .id,
+                app_specific.id
+            );
+
+            let mut disabled = app_specific.clone();
+            disabled.set_enabled(false, Utc.with_ymd_and_hms(2026, 4, 27, 12, 1, 0).unwrap());
+            store
+                .update_ttn_device_mapping(disabled)
+                .expect("disable mapping");
+            assert!(store
+                .find_ttn_device_mapping(
+                    tenant.id,
+                    connector.id,
+                    Some("farm-app"),
+                    &app_specific.ttn_device_id
+                )
+                .expect("find disabled mapping")
+                .is_none());
+            assert_eq!(
+                store
+                    .find_ttn_device_mapping(
+                        tenant.id,
+                        connector.id,
+                        Some("other-app"),
+                        &generic.ttn_device_id
+                    )
+                    .expect("find generic mapping")
+                    .expect("missing generic mapping")
+                    .id,
+                generic.id
+            );
         }
     }
 

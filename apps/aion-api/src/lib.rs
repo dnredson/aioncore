@@ -16,7 +16,7 @@ use aion_rule::{Rule, RuleAction, RuleCondition, RuleEvaluationResult, RuleTrigg
 use aion_storage::{
     ConnectorProfile, ConnectorSecret, ConnectorSecretType, EventFilter, InMemoryStorage,
     IngestionConnector, IngestionConnectorType, PayloadProfile, PostgresStorage,
-    PostgresStorageConfig, StorageBackend, StorageError,
+    PostgresStorageConfig, StorageBackend, StorageError, TtnDeviceMapping,
 };
 use axum::{
     body::Bytes,
@@ -350,6 +350,19 @@ pub struct HttpIngestResponse {
     pub observations: Vec<Observation>,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedTtnDeviceMapping {
+    mapping_id: Uuid,
+    ttn_device_id: String,
+    ttn_application_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TtnUplinkIds {
+    device_id: String,
+    application_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateIngestionConnectorRequest {
     pub connector_key: String,
@@ -407,6 +420,31 @@ pub struct ConnectorSecretResponse {
     pub secret_key: String,
     pub secret_type: ConnectorSecretType,
     pub username: Option<String>,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTtnDeviceMappingRequest {
+    pub ttn_application_id: Option<String>,
+    pub ttn_device_id: String,
+    pub producer_entity_id: Uuid,
+    pub feature_of_interest_id: Option<Uuid>,
+    pub enabled: Option<bool>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TtnDeviceMappingResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub connector_id: Uuid,
+    pub ttn_application_id: Option<String>,
+    pub ttn_device_id: String,
+    pub producer_entity_id: Uuid,
+    pub feature_of_interest_id: Option<Uuid>,
+    pub enabled: bool,
     pub metadata: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -1042,6 +1080,22 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/ingestion/connectors/:connector_id/status",
             get(get_ingestion_connector_status),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/ttn-device-mappings",
+            post(create_ttn_device_mapping).get(list_ttn_device_mappings),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id",
+            get(get_ttn_device_mapping),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id/enable",
+            put(enable_ttn_device_mapping),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id/disable",
+            put(disable_ttn_device_mapping),
         )
         .route(
             "/ingestion/connectors/:connector_id/ingest",
@@ -3358,6 +3412,118 @@ async fn get_ingestion_connector_status(
     Ok(Json(connector_status(&state, &connector)))
 }
 
+async fn create_ttn_device_mapping(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+    Json(request): Json<CreateTtnDeviceMappingRequest>,
+) -> Result<(StatusCode, Json<TtnDeviceMappingResponse>), ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    ensure_ttn_connector(&connector)?;
+    ensure_entity_exists(&state, request.producer_entity_id)?;
+    if let Some(feature_of_interest_id) = request.feature_of_interest_id {
+        ensure_entity_exists(&state, feature_of_interest_id)?;
+    }
+
+    let now = Utc::now();
+    let mut mapping = TtnDeviceMapping::new(
+        state.tenant_id,
+        connector_id,
+        request.ttn_application_id,
+        request.ttn_device_id,
+        request.producer_entity_id,
+        request.feature_of_interest_id,
+        request.enabled.unwrap_or(true),
+        request.metadata,
+        now,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    mapping = state.storage.create_ttn_device_mapping(mapping)?;
+    record_ttn_device_mapping_event(
+        &state,
+        "aion:TtnDeviceMappingCreated",
+        &mapping,
+        Some("TTN device mapping created".to_string()),
+    )?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ttn_device_mapping_response(mapping)),
+    ))
+}
+
+async fn list_ttn_device_mappings(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+) -> Result<Json<Vec<TtnDeviceMappingResponse>>, ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    ensure_ttn_connector(&connector)?;
+    let mappings = state
+        .storage
+        .list_ttn_device_mappings(state.tenant_id, connector_id)?
+        .into_iter()
+        .map(ttn_device_mapping_response)
+        .collect();
+    Ok(Json(mappings))
+}
+
+async fn get_ttn_device_mapping(
+    State(state): State<AppState>,
+    Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<TtnDeviceMappingResponse>, ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    ensure_ttn_connector(&connector)?;
+    let mapping = state
+        .storage
+        .get_ttn_device_mapping(state.tenant_id, connector_id, mapping_id)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(ttn_device_mapping_response(mapping)))
+}
+
+async fn enable_ttn_device_mapping(
+    State(state): State<AppState>,
+    Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<TtnDeviceMappingResponse>, ApiError> {
+    set_ttn_device_mapping_enabled(state, connector_id, mapping_id, true).await
+}
+
+async fn disable_ttn_device_mapping(
+    State(state): State<AppState>,
+    Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<TtnDeviceMappingResponse>, ApiError> {
+    set_ttn_device_mapping_enabled(state, connector_id, mapping_id, false).await
+}
+
+async fn set_ttn_device_mapping_enabled(
+    state: AppState,
+    connector_id: Uuid,
+    mapping_id: Uuid,
+    enabled: bool,
+) -> Result<Json<TtnDeviceMappingResponse>, ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    ensure_ttn_connector(&connector)?;
+    let mut mapping = state
+        .storage
+        .get_ttn_device_mapping(state.tenant_id, connector_id, mapping_id)?
+        .ok_or_else(ApiError::not_found)?;
+    mapping.set_enabled(enabled, Utc::now());
+    let mapping = state.storage.update_ttn_device_mapping(mapping)?;
+    record_ttn_device_mapping_event(
+        &state,
+        if enabled {
+            "aion:TtnDeviceMappingEnabled"
+        } else {
+            "aion:TtnDeviceMappingDisabled"
+        },
+        &mapping,
+        Some(if enabled {
+            "TTN device mapping enabled".to_string()
+        } else {
+            "TTN device mapping disabled".to_string()
+        }),
+    )?;
+    Ok(Json(ttn_device_mapping_response(mapping)))
+}
+
 async fn get_ingestion_worker_plan(
     State(state): State<AppState>,
 ) -> Result<Json<IngestionWorkerPlan>, ApiError> {
@@ -3386,14 +3552,6 @@ async fn ingest_http_for_connector(
         return Err(ApiError::bad_request("ingestion connector is disabled"));
     }
 
-    let producer_entity_id = request
-        .producer_entity_id
-        .or(connector.default_producer_entity_id)
-        .ok_or_else(|| ApiError::bad_request("producer_entity_id is required"))?;
-    let feature_of_interest_id = request
-        .feature_of_interest_id
-        .or(connector.default_feature_of_interest_id)
-        .ok_or_else(|| ApiError::bad_request("feature_of_interest_id is required"))?;
     let payload_format = request
         .payload_format
         .or_else(|| connector.payload_format.clone())
@@ -3406,6 +3564,60 @@ async fn ingest_http_for_connector(
         .content_type
         .or_else(|| connector.content_type.clone());
 
+    let mut producer_entity_id = request
+        .producer_entity_id
+        .or(connector.default_producer_entity_id);
+    let mut feature_of_interest_id = request
+        .feature_of_interest_id
+        .or(connector.default_feature_of_interest_id);
+    let mut resolved_ttn_mapping = None;
+
+    if connector.connector_profile == ConnectorProfile::TtnV3
+        && is_ttn_uplink_payload_format(&payload_format)
+        && (producer_entity_id.is_none() || feature_of_interest_id.is_none())
+    {
+        let ttn_ids = extract_ttn_uplink_ids(&request.payload)?;
+        if let Some(mapping) = state.storage.find_ttn_device_mapping(
+            state.tenant_id,
+            connector.id,
+            ttn_ids.application_id.as_deref(),
+            &ttn_ids.device_id,
+        )? {
+            if producer_entity_id.is_none() {
+                producer_entity_id = Some(mapping.producer_entity_id);
+            }
+            if feature_of_interest_id.is_none() {
+                feature_of_interest_id = mapping.feature_of_interest_id;
+            }
+            resolved_ttn_mapping = Some(ResolvedTtnDeviceMapping {
+                mapping_id: mapping.id,
+                ttn_device_id: mapping.ttn_device_id.clone(),
+                ttn_application_id: mapping.ttn_application_id.clone(),
+            });
+            record_ttn_device_mapping_event(
+                &state,
+                "aion:TtnDeviceMappingResolved",
+                &mapping,
+                Some("TTN device mapping resolved".to_string()),
+            )?;
+        } else if producer_entity_id.is_none() {
+            return fail_ttn_device_mapping_missing(
+                &state,
+                &connector,
+                &payload_format,
+                &protocol,
+                content_type.clone(),
+                &request.payload,
+                &ttn_ids,
+            );
+        }
+    }
+
+    let producer_entity_id = producer_entity_id
+        .ok_or_else(|| ApiError::bad_request("producer_entity_id is required"))?;
+    let feature_of_interest_id = feature_of_interest_id
+        .ok_or_else(|| ApiError::bad_request("feature_of_interest_id is required"))?;
+
     let request = HttpIngestRequest {
         producer_entity_id,
         feature_of_interest_id,
@@ -3417,20 +3629,21 @@ async fn ingest_http_for_connector(
         mapping: request.mapping,
     };
 
-    ingest_http_resolved(&state, request, Some(connector)).await
+    ingest_http_resolved(&state, request, Some(connector), resolved_ttn_mapping).await
 }
 
 async fn ingest_http(
     State(state): State<AppState>,
     Json(request): Json<HttpIngestRequest>,
 ) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
-    ingest_http_resolved(&state, request, None).await
+    ingest_http_resolved(&state, request, None, None).await
 }
 
 async fn ingest_http_resolved(
     state: &AppState,
     request: HttpIngestRequest,
     connector: Option<IngestionConnector>,
+    resolved_ttn_mapping: Option<ResolvedTtnDeviceMapping>,
 ) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
     ensure_entity_exists(&state, request.producer_entity_id)?;
     ensure_entity_exists(&state, request.feature_of_interest_id)?;
@@ -3636,6 +3849,16 @@ async fn ingest_http_resolved(
         "observation_count": observations.len()
     });
     merge_json_object(&mut payload_event_metadata, ingest_metadata);
+    if let Some(mapping) = resolved_ttn_mapping {
+        merge_json_object(
+            &mut payload_event_metadata,
+            json!({
+                "ttn_mapping_id": mapping.mapping_id,
+                "ttn_device_id": mapping.ttn_device_id,
+                "ttn_application_id": mapping.ttn_application_id
+            }),
+        );
+    }
     record_ingest_event(
         &state,
         "aion:PayloadIngested",
@@ -3689,6 +3912,144 @@ fn is_ttn_uplink_payload_format(payload_format: &str) -> bool {
             .as_str(),
         "ttn_uplink_json"
     )
+}
+
+fn extract_ttn_uplink_ids(payload: &Value) -> Result<TtnUplinkIds, ApiError> {
+    let payload = payload_as_json_value(payload)?;
+    let end_device_ids = payload
+        .get("end_device_ids")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ApiError::bad_request("TTN uplink payload is missing end_device_ids"))?;
+    let device_id = end_device_ids
+        .get("device_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ApiError::bad_request("TTN uplink payload is missing device_id"))?;
+    let application_id = end_device_ids
+        .get("application_ids")
+        .and_then(Value::as_object)
+        .and_then(|application_ids| application_ids.get("application_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    Ok(TtnUplinkIds {
+        device_id,
+        application_id,
+    })
+}
+
+fn payload_as_json_value(payload: &Value) -> Result<Value, ApiError> {
+    if let Some(payload) = payload.as_str() {
+        serde_json::from_str(payload)
+            .map_err(|err| ApiError::bad_request(format!("invalid TTN uplink JSON: {err}")))
+    } else {
+        Ok(payload.clone())
+    }
+}
+
+fn fail_ttn_device_mapping_missing(
+    state: &AppState,
+    connector: &IngestionConnector,
+    payload_format: &str,
+    protocol: &str,
+    content_type: Option<String>,
+    payload: &Value,
+    ttn_ids: &TtnUplinkIds,
+) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
+    let received_at = Utc::now();
+    let source_ref = connector
+        .http_path
+        .clone()
+        .or_else(|| connector.endpoint.clone())
+        .or_else(|| connector.topic_filter.clone())
+        .unwrap_or_else(|| "/ingestion/connectors/{connector_id}/ingest".to_string());
+    let connector_metadata = Some(connector_event_metadata(connector));
+    let mut headers = json!({
+        "protocol": protocol,
+        "payload_format": payload_format,
+        "source_endpoint": connector.endpoint.clone().unwrap_or_else(|| source_ref.clone()),
+        "topic_or_path": source_ref,
+        "decoder_metadata": {
+            "decoder": payload_format,
+            "mapping_source": "ttn_device_mapping",
+            "reason": "ttn_device_mapping_missing"
+        },
+        "ttn_device_id": ttn_ids.device_id,
+        "ttn_application_id": ttn_ids.application_id
+    });
+    if let Some(object) = headers.as_object_mut() {
+        let metadata = connector_metadata.clone().unwrap_or_else(|| json!({}));
+        object.insert("connector".to_string(), metadata.clone());
+        object.insert("connector_id".to_string(), metadata["connector_id"].clone());
+        object.insert(
+            "connector_key".to_string(),
+            metadata["connector_key"].clone(),
+        );
+        object.insert(
+            "connector_profile".to_string(),
+            metadata["connector_profile"].clone(),
+        );
+    }
+
+    let mut raw_message = RawMessage::new(
+        state.tenant_id,
+        RawMessageSource::Http,
+        Some(source_ref),
+        Some(ttn_ids.device_id.clone()),
+        Some(payload_format.to_string()),
+        content_type,
+        None,
+        None,
+        Some(payload_format.to_string()),
+        headers,
+        payload_to_bytes(payload),
+        received_at,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    raw_message = state.storage.store_raw_message(raw_message)?;
+
+    let message = format!(
+        "no enabled TTN device mapping found for connector {} and device {}",
+        connector.id, ttn_ids.device_id
+    );
+    state
+        .storage
+        .mark_raw_message_failed(state.tenant_id, raw_message.id, &message)?;
+    let event_metadata = metadata_with_connector(
+        json!({
+            "payload_format": payload_format,
+            "reason": "ttn_device_mapping_missing",
+            "ttn_device_id": ttn_ids.device_id,
+            "ttn_application_id": ttn_ids.application_id
+        }),
+        connector_metadata,
+    );
+    record_ingest_event_optional(
+        state,
+        "aion:TtnDeviceMappingMissing",
+        EventSeverity::Error,
+        None,
+        None,
+        Some(raw_message.id),
+        Some(message.clone()),
+        event_metadata.clone(),
+    )?;
+    record_ingest_event_optional(
+        state,
+        "aion:PayloadIngestionFailed",
+        EventSeverity::Error,
+        None,
+        None,
+        Some(raw_message.id),
+        Some(message.clone()),
+        event_metadata,
+    )?;
+
+    Err(ApiError::bad_request(message))
 }
 
 fn payload_to_bytes(payload: &Value) -> Vec<u8> {
@@ -3783,6 +4144,15 @@ fn ensure_connector_secret_exists(
         .get_connector_secret(state.tenant_id, secret_id)?
         .map(|_| ())
         .ok_or_else(ApiError::not_found)
+}
+
+fn ensure_ttn_connector(connector: &IngestionConnector) -> Result<(), ApiError> {
+    if connector.connector_profile != ConnectorProfile::TtnV3 {
+        return Err(ApiError::bad_request(
+            "TTN device mappings require connector_profile ttn-v3",
+        ));
+    }
+    Ok(())
 }
 
 fn get_connector(state: &AppState, connector_id: Uuid) -> Result<IngestionConnector, ApiError> {
@@ -4809,6 +5179,34 @@ fn connector_secret_event_metadata(secret: &ConnectorSecret) -> Value {
     })
 }
 
+fn ttn_device_mapping_response(mapping: TtnDeviceMapping) -> TtnDeviceMappingResponse {
+    TtnDeviceMappingResponse {
+        id: mapping.id,
+        tenant_id: mapping.tenant_id,
+        connector_id: mapping.connector_id,
+        ttn_application_id: mapping.ttn_application_id,
+        ttn_device_id: mapping.ttn_device_id,
+        producer_entity_id: mapping.producer_entity_id,
+        feature_of_interest_id: mapping.feature_of_interest_id,
+        enabled: mapping.enabled,
+        metadata: mapping.metadata,
+        created_at: mapping.created_at,
+        updated_at: mapping.updated_at,
+    }
+}
+
+fn ttn_device_mapping_event_metadata(mapping: &TtnDeviceMapping) -> Value {
+    json!({
+        "mapping_id": mapping.id,
+        "connector_id": mapping.connector_id,
+        "ttn_application_id": mapping.ttn_application_id,
+        "ttn_device_id": mapping.ttn_device_id,
+        "producer_entity_id": mapping.producer_entity_id,
+        "feature_of_interest_id": mapping.feature_of_interest_id,
+        "enabled": mapping.enabled
+    })
+}
+
 fn metadata_with_connector(mut metadata: Value, connector_metadata: Option<Value>) -> Value {
     let Some(connector_metadata) = connector_metadata else {
         return metadata;
@@ -5448,6 +5846,33 @@ fn record_connector_secret_event(
             action_id: None,
             action_result_id: None,
             metadata: Some(connector_secret_event_metadata(secret)),
+        },
+    )
+}
+
+fn record_ttn_device_mapping_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    mapping: &TtnDeviceMapping,
+    message: Option<String>,
+) -> Result<Event, ApiError> {
+    record_event(
+        state,
+        EventDraft {
+            event_type: event_type.into(),
+            severity: EventSeverity::Info,
+            source_entity_id: Some(mapping.producer_entity_id),
+            target_entity_id: mapping.feature_of_interest_id,
+            message,
+            occurred_at: Utc::now(),
+            observed_at: None,
+            correlation_id: None,
+            raw_message_id: None,
+            observation_id: None,
+            command_id: None,
+            action_id: None,
+            action_result_id: None,
+            metadata: Some(ttn_device_mapping_event_metadata(mapping)),
         },
     )
 }
@@ -8781,6 +9206,346 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_lists_and_toggles_ttn_device_mapping() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-map-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-map-plot-01", "aion:Plot").await;
+        let connector = create_ttn_connector_with_defaults(&app, "ttn-map-api", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let mapping = create_ttn_device_mapping(
+            &app,
+            connector_id,
+            Some("farm-app"),
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+        let mapping_id = mapping["id"].as_str().unwrap();
+        assert_eq!(mapping["ttn_application_id"], "farm-app");
+        assert!(mapping["enabled"].as_bool().unwrap());
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/ingestion/connectors/{connector_id}/ttn-device-mappings"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let mappings = to_json(list_response).await;
+        assert_eq!(mappings.as_array().unwrap().len(), 1);
+
+        let disable_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/disable"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disable_response.status(), StatusCode::OK);
+        assert!(!to_json(disable_response).await["enabled"]
+            .as_bool()
+            .unwrap());
+
+        let enable_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/enable"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enable_response.status(), StatusCode::OK);
+        assert!(to_json(enable_response).await["enabled"].as_bool().unwrap());
+
+        let events = query_events_by_type(&app, "aion:TtnDeviceMappingCreated").await;
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["metadata"]["ttn_device_id"], "soil-node-01");
+    }
+
+    #[tokio::test]
+    async fn ttn_ingestion_without_producer_resolves_via_mapping() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-map-resolve-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-map-resolve-plot-01", "aion:Plot").await;
+        let connector =
+            create_ttn_connector_with_defaults(&app, "ttn-map-resolve", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        let mapping = create_ttn_device_mapping(
+            &app,
+            connector_id,
+            Some("farm-app"),
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+        let mapping_id = mapping["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        let observations = ingest["observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 3);
+        assert!(observations.iter().all(|observation| {
+            observation["producer_entity_id"] == sensor_id
+                && observation["feature_of_interest_id"] == plot_id
+        }));
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+        let events = query_events_by_raw_message(&app, raw_message_id).await;
+        let ingested = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "aion:PayloadIngested")
+            .unwrap();
+        assert_eq!(ingested["metadata"]["ttn_mapping_id"], mapping_id);
+        assert_eq!(ingested["metadata"]["ttn_device_id"], "soil-node-01");
+        assert_eq!(ingested["metadata"]["ttn_application_id"], "farm-app");
+        let resolved = query_events_by_type(&app, "aion:TtnDeviceMappingResolved").await;
+        assert_eq!(resolved.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ttn_ingestion_explicit_producer_still_works_without_mapping() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-explicit-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-explicit-plot-01", "aion:Plot").await;
+        let connector = create_ttn_connector_with_defaults(&app, "ttn-explicit", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        assert_eq!(ingest["observations"].as_array().unwrap().len(), 3);
+        assert!(ingest["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|observation| observation["producer_entity_id"] == sensor_id));
+    }
+
+    #[tokio::test]
+    async fn ttn_mapping_feature_is_used_when_request_omits_feature() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-feature-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-feature-plot-01", "aion:Plot").await;
+        let connector =
+            create_ttn_connector_with_defaults(&app, "ttn-feature-map", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        create_ttn_device_mapping(
+            &app,
+            connector_id,
+            Some("farm-app"),
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        assert!(ingest["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|observation| observation["feature_of_interest_id"] == plot_id));
+    }
+
+    #[tokio::test]
+    async fn ttn_ingestion_without_mapping_preserves_failed_raw_message() {
+        let app = app();
+        let connector =
+            create_ttn_connector_with_defaults(&app, "ttn-map-missing", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let raw_messages = query_raw_messages(&app).await;
+        assert_eq!(raw_messages.as_array().unwrap().len(), 1);
+        assert_eq!(raw_messages[0]["normalization_status"], "failed");
+        assert_eq!(raw_messages[0]["connector_id"], connector_id);
+        let missing = query_events_by_type(&app, "aion:TtnDeviceMappingMissing").await;
+        assert_eq!(missing.as_array().unwrap().len(), 1);
+        assert_eq!(missing[0]["metadata"]["ttn_device_id"], "soil-node-01");
+        let observations = query_observations_by_feature(&app, &Uuid::new_v4().to_string()).await;
+        assert!(observations.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_ttn_mapping_is_ignored() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-disabled-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-disabled-plot-01", "aion:Plot").await;
+        let connector =
+            create_ttn_connector_with_defaults(&app, "ttn-disabled-map", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        let mapping = create_ttn_device_mapping(
+            &app,
+            connector_id,
+            Some("farm-app"),
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+        let mapping_id = mapping["id"].as_str().unwrap();
+        let disable_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/disable"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disable_response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let missing = query_events_by_type(&app, "aion:TtnDeviceMappingMissing").await;
+        assert_eq!(missing.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ttn_mapping_with_application_id_is_preferred() {
+        let app = app();
+        let generic_sensor = create_test_entity(&app, "ttn-generic-sensor-01", "aion:Sensor").await;
+        let app_sensor = create_test_entity(&app, "ttn-app-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-pref-plot-01", "aion:Plot").await;
+        let connector = create_ttn_connector_with_defaults(&app, "ttn-pref-map", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        create_ttn_device_mapping(
+            &app,
+            connector_id,
+            None,
+            "soil-node-01",
+            &generic_sensor,
+            Some(&plot_id),
+        )
+        .await;
+        let app_mapping = create_ttn_device_mapping(
+            &app,
+            connector_id,
+            Some("farm-app"),
+            "soil-node-01",
+            &app_sensor,
+            Some(&plot_id),
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        assert!(ingest["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|observation| observation["producer_entity_id"] == app_sensor));
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+        let events = query_events_by_raw_message(&app, raw_message_id).await;
+        let ingested = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "aion:PayloadIngested")
+            .unwrap();
+        assert_eq!(ingested["metadata"]["ttn_mapping_id"], app_mapping["id"]);
+    }
+
+    #[tokio::test]
     async fn creates_ttn_v3_connector() {
         let app = app();
         let response = app
@@ -10349,6 +11114,38 @@ mod tests {
         to_json(response).await
     }
 
+    async fn query_raw_messages(app: &Router) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/raw-messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn query_observations_by_feature(app: &Router, feature_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/observations?feature_of_interest_id={feature_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
     async fn put_start_pump_policy(app: &Router, pump_id: &str, requires_approval: bool) -> Value {
         let response = app
             .clone()
@@ -10762,6 +11559,21 @@ mod tests {
         producer_entity_id: &str,
         feature_of_interest_id: &str,
     ) -> Value {
+        create_ttn_connector_with_defaults(
+            app,
+            connector_key,
+            Some(producer_entity_id),
+            Some(feature_of_interest_id),
+        )
+        .await
+    }
+
+    async fn create_ttn_connector_with_defaults(
+        app: &Router,
+        connector_key: &str,
+        producer_entity_id: Option<&str>,
+        feature_of_interest_id: Option<&str>,
+    ) -> Value {
         let response = app
             .clone()
             .oneshot(json_request(
@@ -10784,6 +11596,36 @@ mod tests {
                             "temperature": "Cel",
                             "soil_moisture": "%"
                         }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn create_ttn_device_mapping(
+        app: &Router,
+        connector_id: &str,
+        ttn_application_id: Option<&str>,
+        ttn_device_id: &str,
+        producer_entity_id: &str,
+        feature_of_interest_id: Option<&str>,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings"),
+                json!({
+                    "ttn_application_id": ttn_application_id,
+                    "ttn_device_id": ttn_device_id,
+                    "producer_entity_id": producer_entity_id,
+                    "feature_of_interest_id": feature_of_interest_id,
+                    "metadata": {
+                        "source": "test"
                     }
                 }),
             ))
