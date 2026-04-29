@@ -480,6 +480,46 @@ $livePlan.checks | Select-Object check_key,status,reason,future_live_check
 
 The dry-run plan always includes `no_network_call_performed`. Missing `broker_url`, `topic_filter`, `payload_format = "ttn-uplink-json"`, `secret_ref_id`, a compatible `mqtt_basic_auth` connector secret, or an enabled TTN device mapping appear as blockers before AionCore would allow future live validation.
 
+Run the same preflight endpoint in dry-run-only mode. This uses the live-validation response shape but still does not open a network connection:
+
+```powershell
+$preflightDryRun = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-live-validate" `
+  -ContentType "application/json" `
+  -Body (@{
+    dry_run_only = $true
+    timeout_seconds = 5
+  } | ConvertTo-Json -Depth 8)
+
+$preflightDryRun.result
+$preflightDryRun.attempted_live_connection
+$preflightDryRun.dry_run_plan_summary
+$preflightDryRun.secret_exposed
+```
+
+Optional live TTN MQTT preflight, only when you intentionally want AionCore to connect to the configured broker and subscribe to the uplink topic:
+
+```powershell
+$livePreflight = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-live-validate" `
+  -ContentType "application/json" `
+  -Body (@{
+    timeout_seconds = 5
+    expect_message = $false
+    client_id_suffix = "manual-preflight"
+  } | ConvertTo-Json -Depth 8)
+
+$livePreflight.result
+$livePreflight.connected
+$livePreflight.subscribed
+$livePreflight.message_received
+$livePreflight.errors
+```
+
+When `expect_message = $false`, success means the MQTT connection and subscription completed. When `expect_message = $true`, success also requires at least one matching message before the timeout. Preflight messages are not ingested, raw payloads are not returned, and secret values remain write-only.
+
 Update and delete mappings explicitly:
 
 ```powershell

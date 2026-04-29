@@ -34,7 +34,9 @@ use std::{
     env,
     str::FromStr,
     sync::{Arc, RwLock},
+    time::Instant,
 };
+use tokio::time;
 use uuid::Uuid;
 
 mod mqtt_ingest;
@@ -561,6 +563,52 @@ pub struct TtnLiveReadinessPlan {
     pub required_operator_steps: Vec<String>,
     pub safe_to_connect: bool,
     pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TtnLiveValidationRequest {
+    pub timeout_seconds: Option<u64>,
+    pub expect_message: Option<bool>,
+    pub client_id_suffix: Option<String>,
+    pub dry_run_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtnLiveValidationResultStatus {
+    Success,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TtnLiveValidationPlanSummary {
+    pub safe_to_connect: bool,
+    pub can_attempt_live_validation: bool,
+    pub readiness: TtnConnectorReadiness,
+    pub blocker_count: usize,
+    pub warning_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TtnLiveValidationResponse {
+    pub connector_id: Uuid,
+    pub connector_key: String,
+    pub attempted_live_connection: bool,
+    pub dry_run_passed: bool,
+    pub connected: bool,
+    pub subscribed: bool,
+    pub message_received: bool,
+    pub broker_url_redacted_or_safe: Option<String>,
+    pub topic_filter: Option<String>,
+    pub duration_ms: u128,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub result: TtnLiveValidationResultStatus,
+    pub errors: Vec<TtnConnectorValidationIssue>,
+    pub warnings: Vec<TtnConnectorValidationIssue>,
+    pub dry_run_plan_summary: TtnLiveValidationPlanSummary,
+    pub secret_exposed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1187,6 +1235,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/ingestion/connectors/:connector_id/ttn-live-readiness-plan",
             get(get_ttn_live_readiness_plan),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/ttn-live-validate",
+            post(ttn_live_validate_connector),
         )
         .route(
             "/ingestion/connectors/:connector_id/ttn-device-mappings",
@@ -3542,6 +3594,23 @@ async fn get_ttn_live_readiness_plan(
     Ok(Json(ttn_live_readiness_plan(&state, &connector)?))
 }
 
+async fn ttn_live_validate_connector(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+    Json(request): Json<TtnLiveValidationRequest>,
+) -> Result<Json<TtnLiveValidationResponse>, ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    if connector.connector_profile != ConnectorProfile::TtnV3 {
+        return Err(ApiError::bad_request(
+            "TTN live validation applies only to ttn-v3 connectors",
+        ));
+    }
+
+    Ok(Json(
+        ttn_live_validation_preflight(&state, &connector, request).await?,
+    ))
+}
+
 async fn create_ttn_device_mapping(
     State(state): State<AppState>,
     Path(connector_id): Path<Uuid>,
@@ -5090,6 +5159,476 @@ fn ttn_live_readiness_plan(
         safe_to_connect,
         generated_at: Utc::now(),
     })
+}
+
+async fn ttn_live_validation_preflight(
+    state: &AppState,
+    connector: &IngestionConnector,
+    request: TtnLiveValidationRequest,
+) -> Result<TtnLiveValidationResponse, ApiError> {
+    let started_at = Utc::now();
+    let timer = Instant::now();
+    let requested_timeout_seconds = request.timeout_seconds.unwrap_or(5);
+    let timeout_seconds = requested_timeout_seconds.clamp(1, 60);
+    let expect_message = request.expect_message.unwrap_or(false);
+    let dry_run_only = request.dry_run_only.unwrap_or(false);
+    let plan = ttn_live_readiness_plan(state, connector)?;
+    let plan_summary = ttn_live_validation_plan_summary(&plan);
+    let mut response_warnings = plan.warnings.clone();
+    if requested_timeout_seconds > 60 {
+        response_warnings.push(ttn_validation_issue(
+            "timeout_seconds_capped",
+            "timeout_seconds was capped at 60 seconds",
+        ));
+    }
+    let broker_url_redacted_or_safe = connector
+        .broker_url
+        .as_deref()
+        .map(redact_broker_url_for_response);
+    let topic_filter = connector.topic_filter.clone();
+
+    if dry_run_only {
+        let response = ttn_live_validation_response(
+            connector,
+            false,
+            plan.safe_to_connect,
+            false,
+            false,
+            false,
+            broker_url_redacted_or_safe,
+            topic_filter,
+            timer.elapsed().as_millis(),
+            started_at,
+            TtnLiveValidationResultStatus::Skipped,
+            Vec::new(),
+            response_warnings.clone(),
+            plan_summary,
+        );
+        record_ttn_live_validation_event(
+            state,
+            "aion:TtnLiveValidationSkipped",
+            connector,
+            &response,
+            Some("TTN live validation skipped because dry_run_only=true".to_string()),
+        )?;
+        return Ok(response);
+    }
+
+    if !plan.safe_to_connect {
+        let response = ttn_live_validation_response(
+            connector,
+            false,
+            false,
+            false,
+            false,
+            false,
+            broker_url_redacted_or_safe,
+            topic_filter,
+            timer.elapsed().as_millis(),
+            started_at,
+            TtnLiveValidationResultStatus::Skipped,
+            plan.blockers.clone(),
+            response_warnings.clone(),
+            plan_summary,
+        );
+        record_ttn_live_validation_event(
+            state,
+            "aion:TtnLiveValidationSkipped",
+            connector,
+            &response,
+            Some("TTN live validation skipped because dry-run blockers remain".to_string()),
+        )?;
+        return Ok(response);
+    }
+
+    record_ttn_live_validation_started_event(state, connector, timeout_seconds, expect_message)?;
+
+    let Some(secret_ref_id) = connector.secret_ref_id else {
+        let response = ttn_live_validation_response(
+            connector,
+            false,
+            true,
+            false,
+            false,
+            false,
+            broker_url_redacted_or_safe,
+            topic_filter,
+            timer.elapsed().as_millis(),
+            started_at,
+            TtnLiveValidationResultStatus::Failed,
+            vec![ttn_validation_issue(
+                "missing_secret_ref",
+                "connector has no secret_ref_id for TTN MQTT authentication",
+            )],
+            response_warnings.clone(),
+            plan_summary,
+        );
+        record_ttn_live_validation_event(
+            state,
+            "aion:TtnLiveValidationFailed",
+            connector,
+            &response,
+            Some("TTN live validation failed before connection".to_string()),
+        )?;
+        return Ok(response);
+    };
+
+    let secret = state
+        .storage
+        .get_connector_secret(state.tenant_id, secret_ref_id)?
+        .ok_or_else(|| ApiError::bad_request("connector secret_ref_id does not resolve"))?;
+    if secret.secret_type != ConnectorSecretType::MqttBasicAuth {
+        return Err(ApiError::bad_request(
+            "TTN live validation requires a mqtt_basic_auth connector secret",
+        ));
+    }
+
+    let broker_url = connector
+        .broker_url
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("broker_url is required"))?;
+    let topic_filter_value = connector
+        .topic_filter
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("topic_filter is required"))?;
+
+    let live_result = run_ttn_mqtt_live_preflight(
+        connector,
+        &secret,
+        broker_url,
+        topic_filter_value,
+        timeout_seconds,
+        expect_message,
+        request.client_id_suffix.as_deref(),
+    )
+    .await;
+
+    let duration_ms = timer.elapsed().as_millis();
+    let response = match live_result {
+        Ok(result) => {
+            let succeeded = result.connected
+                && result.subscribed
+                && (!expect_message || result.message_received);
+            ttn_live_validation_response(
+                connector,
+                true,
+                true,
+                result.connected,
+                result.subscribed,
+                result.message_received,
+                broker_url_redacted_or_safe,
+                topic_filter,
+                duration_ms,
+                started_at,
+                if succeeded {
+                    TtnLiveValidationResultStatus::Success
+                } else {
+                    TtnLiveValidationResultStatus::Failed
+                },
+                result.errors,
+                response_warnings.clone(),
+                plan_summary,
+            )
+        }
+        Err(error) => ttn_live_validation_response(
+            connector,
+            true,
+            true,
+            false,
+            false,
+            false,
+            broker_url_redacted_or_safe,
+            topic_filter,
+            duration_ms,
+            started_at,
+            TtnLiveValidationResultStatus::Failed,
+            vec![ttn_validation_issue(
+                "live_validation_failed",
+                sanitize_live_validation_error(error, &secret.secret_value),
+            )],
+            response_warnings.clone(),
+            plan_summary,
+        ),
+    };
+
+    let event_type = if response.result == TtnLiveValidationResultStatus::Success {
+        "aion:TtnLiveValidationSucceeded"
+    } else {
+        "aion:TtnLiveValidationFailed"
+    };
+    record_ttn_live_validation_event(
+        state,
+        event_type,
+        connector,
+        &response,
+        Some("TTN live validation preflight completed".to_string()),
+    )?;
+
+    Ok(response)
+}
+
+struct TtnMqttLivePreflightResult {
+    connected: bool,
+    subscribed: bool,
+    message_received: bool,
+    errors: Vec<TtnConnectorValidationIssue>,
+}
+
+async fn run_ttn_mqtt_live_preflight(
+    connector: &IngestionConnector,
+    secret: &ConnectorSecret,
+    broker_url: &str,
+    topic_filter: &str,
+    timeout_seconds: u64,
+    expect_message: bool,
+    client_id_suffix: Option<&str>,
+) -> Result<TtnMqttLivePreflightResult, String> {
+    let (host, port) = parse_mqtt_broker_url_for_live_preflight(broker_url)?;
+    let client_id = ttn_live_validation_client_id(connector, client_id_suffix);
+    let mut options = rumqttc::MqttOptions::new(client_id, host, port);
+    options.set_keep_alive(std::time::Duration::from_secs(timeout_seconds.max(5)));
+    if let Some(username) = secret.username.as_deref() {
+        options.set_credentials(username, &secret.secret_value);
+    }
+
+    let (client, mut eventloop) = rumqttc::AsyncClient::new(options, 10);
+    client
+        .subscribe(topic_filter, rumqttc::QoS::AtLeastOnce)
+        .await
+        .map_err(|err| format!("failed to send MQTT subscribe request: {err}"))?;
+
+    let deadline = std::time::Duration::from_secs(timeout_seconds);
+    let mut connected = false;
+    let mut subscribed = false;
+    let mut message_received = false;
+    let mut errors = Vec::new();
+
+    let poll_result = time::timeout(deadline, async {
+        loop {
+            match eventloop.poll().await {
+                Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
+                    connected = true;
+                }
+                Ok(rumqttc::Event::Incoming(rumqttc::Packet::SubAck(_))) => {
+                    subscribed = true;
+                    if !expect_message {
+                        break;
+                    }
+                }
+                Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(_publish))) => {
+                    message_received = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    errors.push(ttn_validation_issue(
+                        "mqtt_event_loop_error",
+                        format!("MQTT event loop failed: {err}"),
+                    ));
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+
+    if poll_result.is_err() {
+        let code = if expect_message {
+            "message_wait_timeout"
+        } else {
+            "subscribe_timeout"
+        };
+        let message = if expect_message {
+            format!(
+                "MQTT connection/subscription did not receive a matching message within {timeout_seconds} seconds"
+            )
+        } else {
+            format!(
+                "MQTT connection/subscription did not complete within {timeout_seconds} seconds"
+            )
+        };
+        errors.push(ttn_validation_issue(code, message));
+    }
+
+    let _ = client.disconnect().await;
+
+    Ok(TtnMqttLivePreflightResult {
+        connected,
+        subscribed,
+        message_received,
+        errors,
+    })
+}
+
+fn parse_mqtt_broker_url_for_live_preflight(value: &str) -> Result<(String, u16), String> {
+    let trimmed = value.trim();
+    let without_scheme = trimmed
+        .strip_prefix("mqtt://")
+        .ok_or_else(|| "unsupported MQTT broker URL; expected mqtt://host:port".to_string())?;
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host_port = host_port.split('@').next_back().unwrap_or(host_port);
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|err| format!("invalid MQTT broker port: {err}"))?;
+            (host.to_string(), port)
+        }
+        None => (host_port.to_string(), 1883),
+    };
+
+    if host.trim().is_empty() {
+        return Err("invalid MQTT broker URL: host is empty".to_string());
+    }
+
+    Ok((host, port))
+}
+
+fn ttn_live_validation_client_id(
+    connector: &IngestionConnector,
+    client_id_suffix: Option<&str>,
+) -> String {
+    let base = connector
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("aioncore-ttn-live-{}", connector.connector_key));
+    match client_id_suffix
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(suffix) => format!("{base}-{suffix}"),
+        None => base,
+    }
+}
+
+fn ttn_live_validation_response(
+    connector: &IngestionConnector,
+    attempted_live_connection: bool,
+    dry_run_passed: bool,
+    connected: bool,
+    subscribed: bool,
+    message_received: bool,
+    broker_url_redacted_or_safe: Option<String>,
+    topic_filter: Option<String>,
+    duration_ms: u128,
+    started_at: DateTime<Utc>,
+    result: TtnLiveValidationResultStatus,
+    errors: Vec<TtnConnectorValidationIssue>,
+    warnings: Vec<TtnConnectorValidationIssue>,
+    dry_run_plan_summary: TtnLiveValidationPlanSummary,
+) -> TtnLiveValidationResponse {
+    TtnLiveValidationResponse {
+        connector_id: connector.id,
+        connector_key: connector.connector_key.clone(),
+        attempted_live_connection,
+        dry_run_passed,
+        connected,
+        subscribed,
+        message_received,
+        broker_url_redacted_or_safe,
+        topic_filter,
+        duration_ms,
+        started_at,
+        finished_at: Utc::now(),
+        result,
+        errors,
+        warnings,
+        dry_run_plan_summary,
+        secret_exposed: false,
+    }
+}
+
+fn ttn_live_validation_plan_summary(plan: &TtnLiveReadinessPlan) -> TtnLiveValidationPlanSummary {
+    TtnLiveValidationPlanSummary {
+        safe_to_connect: plan.safe_to_connect,
+        can_attempt_live_validation: plan.can_attempt_live_validation,
+        readiness: plan.readiness.clone(),
+        blocker_count: plan.blockers.len(),
+        warning_count: plan.warnings.len(),
+    }
+}
+
+fn redact_broker_url_for_response(value: &str) -> String {
+    let trimmed = value.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return trimmed.to_string();
+    };
+    if let Some((_, after_userinfo)) = rest.rsplit_once('@') {
+        format!("{scheme}://***REDACTED***@{after_userinfo}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_live_validation_error(error: String, secret_value: &str) -> String {
+    if secret_value.is_empty() {
+        return error;
+    }
+    error.replace(secret_value, "***REDACTED***")
+}
+
+fn record_ttn_live_validation_started_event(
+    state: &AppState,
+    connector: &IngestionConnector,
+    timeout_seconds: u64,
+    expect_message: bool,
+) -> Result<Event, ApiError> {
+    record_connector_worker_event(
+        state,
+        "aion:TtnLiveValidationStarted",
+        EventSeverity::Info,
+        Some("TTN live validation preflight started".to_string()),
+        json!({
+            "connector_id": connector.id,
+            "connector_key": connector.connector_key,
+            "connector_profile": connector.connector_profile,
+            "broker_url": connector.broker_url.as_deref().map(redact_broker_url_for_response),
+            "topic_filter": connector.topic_filter,
+            "timeout_seconds": timeout_seconds,
+            "expect_message": expect_message,
+            "secret_exposed": false
+        }),
+    )
+}
+
+fn record_ttn_live_validation_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    connector: &IngestionConnector,
+    response: &TtnLiveValidationResponse,
+    message: Option<String>,
+) -> Result<Event, ApiError> {
+    record_connector_worker_event(
+        state,
+        event_type,
+        match response.result {
+            TtnLiveValidationResultStatus::Success | TtnLiveValidationResultStatus::Skipped => {
+                EventSeverity::Info
+            }
+            TtnLiveValidationResultStatus::Failed => EventSeverity::Error,
+        },
+        message,
+        json!({
+            "connector_id": connector.id,
+            "connector_key": connector.connector_key,
+            "connector_profile": connector.connector_profile,
+            "attempted_live_connection": response.attempted_live_connection,
+            "dry_run_passed": response.dry_run_passed,
+            "connected": response.connected,
+            "subscribed": response.subscribed,
+            "message_received": response.message_received,
+            "broker_url": response.broker_url_redacted_or_safe,
+            "topic_filter": response.topic_filter,
+            "duration_ms": response.duration_ms,
+            "result": response.result,
+            "error_codes": response.errors.iter().map(|issue| issue.code.clone()).collect::<Vec<_>>(),
+            "warning_codes": response.warnings.iter().map(|issue| issue.code.clone()).collect::<Vec<_>>(),
+            "secret_exposed": false
+        }),
+    )
 }
 
 fn ttn_validation_has_issue(validation: &TtnConnectorValidation, code: &str) -> bool {
@@ -11227,6 +11766,281 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ttn_live_validate_rejects_non_ttn_connector() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "generic-live-validate",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!(
+                    "/ingestion/connectors/{}/ttn-live-validate",
+                    connector["id"].as_str().unwrap()
+                ),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_json(response).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("ttn-v3 connectors"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_ttn_live_validate_is_blocked_by_dry_run_plan() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-live-validate-unsafe",
+            "ttn-v3",
+            true,
+            None,
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let response = post_ttn_live_validate(
+            &app,
+            connector["id"].as_str().unwrap(),
+            json!({"timeout_seconds": 60}),
+        )
+        .await;
+
+        assert_eq!(response["result"], "skipped");
+        assert_eq!(response["attempted_live_connection"], false);
+        assert_eq!(response["dry_run_passed"], false);
+        assert_eq!(response["dry_run_plan_summary"]["safe_to_connect"], false);
+        assert!(validation_issue_codes(&response, "errors").contains(&"missing_broker_url"));
+    }
+
+    #[tokio::test]
+    async fn ttn_live_validate_dry_run_only_returns_without_network_attempt() {
+        let app = app();
+        let sensor_id =
+            create_test_entity(&app, "ttn-preflight-dry-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-preflight-dry-plot-01", "aion:Plot").await;
+        let secret = create_connector_secret_with_type(
+            &app,
+            "ttn-preflight-dry-secret",
+            "mqtt_basic_auth",
+            Some("farm-app@tenant"),
+            "secret-pass",
+        )
+        .await;
+        let connector = create_ttn_connector_with_secret(
+            &app,
+            "ttn-preflight-dry",
+            secret["id"].as_str().unwrap(),
+        )
+        .await;
+        create_ttn_device_mapping(
+            &app,
+            connector["id"].as_str().unwrap(),
+            Some("farm-app"),
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+
+        let response = post_ttn_live_validate(
+            &app,
+            connector["id"].as_str().unwrap(),
+            json!({"dry_run_only": true, "timeout_seconds": 60}),
+        )
+        .await;
+
+        assert_eq!(response["result"], "skipped");
+        assert_eq!(response["attempted_live_connection"], false);
+        assert_eq!(response["dry_run_passed"], true);
+        assert_eq!(response["dry_run_plan_summary"]["safe_to_connect"], true);
+        assert_eq!(response["secret_exposed"], false);
+        assert!(!response.to_string().contains("secret-pass"));
+    }
+
+    #[tokio::test]
+    async fn ttn_live_validate_response_never_exposes_secret_value() {
+        let app = app();
+        let sensor_id =
+            create_test_entity(&app, "ttn-preflight-secret-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-preflight-secret-plot-01", "aion:Plot").await;
+        let secret = create_connector_secret_with_type(
+            &app,
+            "ttn-preflight-redacted-secret",
+            "mqtt_basic_auth",
+            Some("farm-app@tenant"),
+            "do-not-return-this-secret",
+        )
+        .await;
+        let connector = create_ttn_connector_with_secret(
+            &app,
+            "ttn-preflight-redacted",
+            secret["id"].as_str().unwrap(),
+        )
+        .await;
+        create_ttn_device_mapping(
+            &app,
+            connector["id"].as_str().unwrap(),
+            Some("farm-app"),
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+
+        let response = post_ttn_live_validate(
+            &app,
+            connector["id"].as_str().unwrap(),
+            json!({"dry_run_only": true}),
+        )
+        .await;
+
+        assert_eq!(response["secret_exposed"], false);
+        assert!(!response.to_string().contains("do-not-return-this-secret"));
+    }
+
+    #[tokio::test]
+    async fn ttn_live_validate_caps_timeout_seconds() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-live-validate-timeout-cap",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let response = post_ttn_live_validate(
+            &app,
+            connector["id"].as_str().unwrap(),
+            json!({"timeout_seconds": 999}),
+        )
+        .await;
+
+        assert_eq!(response["result"], "skipped");
+        assert!(validation_issue_codes(&response, "warnings").contains(&"timeout_seconds_capped"));
+    }
+
+    #[tokio::test]
+    async fn ttn_live_validate_missing_secret_prevents_connection() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-live-validate-missing-secret",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let response =
+            post_ttn_live_validate(&app, connector["id"].as_str().unwrap(), json!({})).await;
+
+        assert_eq!(response["result"], "skipped");
+        assert_eq!(response["attempted_live_connection"], false);
+        assert!(validation_issue_codes(&response, "errors").contains(&"missing_secret_ref"));
+    }
+
+    #[tokio::test]
+    async fn ttn_live_validate_invalid_connector_returns_clear_error() {
+        let response = app()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{}/ttn-live-validate", Uuid::new_v4()),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_json(response).await;
+        assert_eq!(body["error"], "record was not found");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AIONCORE_TEST_TTN_LIVE=1 and live TTN MQTT credentials"]
+    async fn opt_in_ttn_live_validate_can_connect_when_env_is_configured() {
+        if env::var("AIONCORE_TEST_TTN_LIVE").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let broker_url = env::var("AIONCORE_TEST_TTN_BROKER_URL")
+            .expect("AIONCORE_TEST_TTN_BROKER_URL is required");
+        let topic_filter = env::var("AIONCORE_TEST_TTN_TOPIC_FILTER")
+            .expect("AIONCORE_TEST_TTN_TOPIC_FILTER is required");
+        let username =
+            env::var("AIONCORE_TEST_TTN_USERNAME").expect("AIONCORE_TEST_TTN_USERNAME is required");
+        let password =
+            env::var("AIONCORE_TEST_TTN_PASSWORD").expect("AIONCORE_TEST_TTN_PASSWORD is required");
+        let application_id =
+            env::var("AIONCORE_TEST_TTN_APPLICATION_ID").unwrap_or_else(|_| "test-app".to_string());
+        let device_id =
+            env::var("AIONCORE_TEST_TTN_DEVICE_ID").unwrap_or_else(|_| "test-device".to_string());
+
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-live-env-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-live-env-plot-01", "aion:Plot").await;
+        let secret =
+            create_connector_secret(&app, "ttn-live-env-secret", &username, &password).await;
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-live-env",
+            "ttn-v3",
+            true,
+            Some(&broker_url),
+            Some(&topic_filter),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+        patch_connector_secret_ref(
+            &app,
+            connector["id"].as_str().unwrap(),
+            secret["id"].as_str().unwrap(),
+        )
+        .await;
+        create_ttn_device_mapping(
+            &app,
+            connector["id"].as_str().unwrap(),
+            Some(&application_id),
+            &device_id,
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+
+        let response = post_ttn_live_validate(
+            &app,
+            connector["id"].as_str().unwrap(),
+            json!({"timeout_seconds": 5, "expect_message": false}),
+        )
+        .await;
+
+        assert_eq!(response["attempted_live_connection"], true);
+        assert_eq!(response["secret_exposed"], false);
+        assert!(!response.to_string().contains(&password));
+    }
+
+    #[tokio::test]
     async fn existing_http_ingestion_without_connector_still_works() {
         let app = app();
         let sensor_id = create_test_entity(&app, "no-connector-sensor-01", "aion:Sensor").await;
@@ -13570,6 +14384,42 @@ mod tests {
                     .body(Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn post_ttn_live_validate(app: &Router, connector_id: &str, body: Value) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ttn-live-validate"),
+                body,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn patch_connector_secret_ref(
+        app: &Router,
+        connector_id: &str,
+        secret_id: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/ingestion/connectors/{connector_id}"),
+                json!({
+                    "secret_ref_id": secret_id
+                }),
+            ))
             .await
             .unwrap();
 

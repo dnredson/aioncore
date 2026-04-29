@@ -124,6 +124,7 @@ Connector validation is exposed through:
 ```text
 GET /ingestion/connectors/{connector_id}/validate
 GET /ingestion/connectors/{connector_id}/ttn-live-readiness-plan
+POST /ingestion/connectors/{connector_id}/ttn-live-validate
 ```
 
 For `connector_profile = "ttn-v3"`, validation is deterministic and non-network. It does not connect to TTN, authenticate to a broker, subscribe to topics, verify accounts, or validate TLS/mTLS. The response includes:
@@ -217,6 +218,64 @@ Dry-run checks include:
 - `no_network_call_performed`
 
 For live-readiness planning, missing broker URL, topic filter, compatible `mqtt_basic_auth` connector secret, `secret_ref_id`, `payload_format = "ttn-uplink-json"`, and enabled TTN device mappings are blockers. A disabled TTN connector is not safe to connect and returns an operator step to enable it. Non-TTN connectors return a not-applicable plan with `safe_to_connect = false`.
+
+TTN live validation preflight is explicit opt-in through `POST /ingestion/connectors/{connector_id}/ttn-live-validate`. It is not called by `/ready`, worker planning, connector reconciliation, startup, or normal tests. The handler first runs the dry-run readiness plan. If `safe_to_connect = false`, it returns `result = "skipped"`, includes dry-run blockers in `errors`, and does not open a network connection.
+
+The live validation request body supports:
+
+- `timeout_seconds`: optional, defaults to 5, capped at 60.
+- `expect_message`: optional, defaults to `false`.
+- `client_id_suffix`: optional suffix appended to the configured or generated MQTT client ID.
+- `dry_run_only`: optional, defaults to `false`.
+
+When `dry_run_only = true`, the endpoint returns the live-validation response shape without a network attempt. When `expect_message = false`, live preflight success means AionCore connected to the configured MQTT broker and completed the subscription request. When `expect_message = true`, success also requires at least one matching MQTT publish before the timeout. Any received publish is used only to set `message_received = true`; it is not stored as a raw message, not decoded, not normalized into observations, and not returned as raw payload.
+
+The live validation response includes:
+
+- connector identity;
+- `attempted_live_connection`;
+- `dry_run_passed`;
+- `connected`;
+- `subscribed`;
+- `message_received`;
+- redacted or safe broker URL;
+- topic filter;
+- duration and timestamps;
+- `result`: `success`, `failed`, or `skipped`;
+- `errors`;
+- `warnings`;
+- dry-run plan summary;
+- `secret_exposed = false`.
+
+Security behavior:
+
+- `secret_value` is never returned.
+- Passwords/tokens are resolved internally only after the dry-run plan passes.
+- Error text is sanitized before being returned.
+- Preflight payloads are not persisted and are not sent to the normal ingestion pipeline.
+- Events, when emitted, include only connector IDs, safe broker/topic metadata, result flags, and issue codes.
+
+TTN live preflight events are:
+
+- `aion:TtnLiveValidationStarted`
+- `aion:TtnLiveValidationSucceeded`
+- `aion:TtnLiveValidationFailed`
+- `aion:TtnLiveValidationSkipped`
+
+Optional live tests are ignored by default. Run them only when explicitly configured:
+
+```powershell
+$env:AIONCORE_TEST_TTN_LIVE = "1"
+$env:AIONCORE_TEST_TTN_BROKER_URL = "mqtt://example:1883"
+$env:AIONCORE_TEST_TTN_TOPIC_FILTER = "v3/demo-app/devices/+/up"
+$env:AIONCORE_TEST_TTN_USERNAME = "demo-app@tenant"
+$env:AIONCORE_TEST_TTN_PASSWORD = "replace-with-token"
+$env:AIONCORE_TEST_TTN_APPLICATION_ID = "demo-app"
+$env:AIONCORE_TEST_TTN_DEVICE_ID = "soil-node-01"
+cargo test -p aion-api opt_in_ttn_live_validate_can_connect_when_env_is_configured -- --ignored
+```
+
+The current preflight supports the same plain `mqtt://host:port` URL shape as the local MQTT worker foundation. Production TLS/mTLS hardening remains future work.
 
 ## Worker Planner
 
@@ -527,7 +586,7 @@ TTN connector validation in this milestone is deliberately limited to local conf
 
 - Connector registry persistence is available for in-memory and PostgreSQL storage.
 - Dynamic MQTT workers are implemented for `generic-aion-mqtt`, `generic-mqtt`, and `ttn-v3` connector profiles and must be explicitly enabled.
-- TTN/The Things Stack live account validation and full adapter behavior are not implemented yet.
+- TTN/The Things Stack live validation is limited to an explicit MQTT connection/subscription preflight. It does not validate account semantics beyond broker authentication/subscription behavior and does not ingest messages.
 - Connector secret references are local-development friendly and are not a production secret manager.
 - Connector secret values are persisted by the configured storage backend, but encryption, KMS, and Vault integration are not implemented yet.
 - Dynamic MQTT connector authentication supports only `mqtt_basic_auth` secrets.
