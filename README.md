@@ -244,6 +244,81 @@ $raw.connector_key
 $raw.connector_profile
 ```
 
+TTN v3 uplink JSON can be tested locally through connector-aware HTTP ingestion without a live TTN broker. Create a TTN connector with default AionCore entity IDs:
+
+```powershell
+$ttnConnector = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors" `
+  -ContentType "application/json" `
+  -Body (@{
+    connector_key = "ttn-http-demo"
+    connector_type = "mqtt"
+    connector_profile = "ttn-v3"
+    enabled = $true
+    broker_url = "mqtt://eu1.cloud.thethings.network:1883"
+    topic_filter = "v3/demo-application/devices/+/up"
+    payload_format = "ttn-uplink-json"
+    content_type = "application/json"
+    default_producer_entity_id = "11111111-1111-1111-1111-111111111111"
+    default_feature_of_interest_id = "22222222-2222-2222-2222-222222222222"
+    metadata = @{
+      unit_mapping = @{
+        temperature = "Cel"
+        soil_moisture = "%"
+      }
+    }
+  } | ConvertTo-Json -Depth 10)
+```
+
+Ingest a sample TTN uplink:
+
+```powershell
+$ttnIngest = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ingest" `
+  -ContentType "application/json" `
+  -Body (@{
+    payload = @{
+      end_device_ids = @{
+        device_id = "soil-node-01"
+        application_ids = @{
+          application_id = "farm-app"
+        }
+      }
+      received_at = "2026-04-29T12:00:00Z"
+      uplink_message = @{
+        received_at = "2026-04-29T12:01:02Z"
+        f_port = 1
+        f_cnt = 42
+        frm_payload = "AQID"
+        decoded_payload = @{
+          temperature = 21.5
+          soil_moisture = 44
+          state = "ok"
+          battery_low = $false
+        }
+      }
+    }
+  } | ConvertTo-Json -Depth 12)
+
+$observations = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/observations?raw_message_id=$($ttnIngest.raw_message_id)"
+
+$raw = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/raw-messages/$($ttnIngest.raw_message_id)"
+
+$events = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/events?raw_message_id=$($ttnIngest.raw_message_id)"
+
+$observations | Select-Object observed_property,unit,metadata
+$raw.connector_profile
+$events.metadata
+```
+
 Plan ingestion workers without starting them:
 
 ```powershell
@@ -263,13 +338,14 @@ Planner behavior:
 - disabled connectors appear as `skipped`
 - valid HTTP connectors plan `http_listener`
 - valid MQTT connectors plan `mqtt_subscriber`
-- TTN v3 connectors plan `mqtt_subscriber` and note that TTN decoding is future work when `payload_format = "ttn-uplink-json"`
+- TTN v3 connectors with `payload_format = "ttn-uplink-json"` plan `mqtt_subscriber`
+- TTN v3 connectors with another payload format are marked invalid with a validation issue
 - missing `broker_url` or `topic_filter` makes MQTT specs `invalid`
 - future connector types are `unsupported`
 
 `GET /ingestion/workers/plan` is read-only. It does not connect to brokers or start dynamic workers.
 
-The connector registry is available in memory and through the PostgreSQL backend. Existing env-var MQTT config remains the default runtime MQTT connector behavior. Dynamic MQTT workers per connector are opt-in and TTN uplink decoding is future work.
+The connector registry is available in memory and through the PostgreSQL backend. Existing env-var MQTT config remains the default runtime MQTT connector behavior. Dynamic MQTT workers per connector are opt-in. TTN uplink decoding is local and sample-payload testable; live TTN broker validation, downlinks, and entity auto-provisioning are future work.
 
 Dynamic connector workers are disabled unless explicitly enabled:
 

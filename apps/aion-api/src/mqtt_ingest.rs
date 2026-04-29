@@ -901,6 +901,7 @@ async fn handle_publish(
     };
 
     let received_at = Utc::now();
+    let ingest_metadata = decoded_ingest_metadata(&decoded);
     let mut observations = Vec::with_capacity(decoded.len());
     for measurement in decoded {
         let observation = Observation::new(
@@ -933,6 +934,13 @@ async fn handle_publish(
     state
         .storage
         .mark_raw_message_normalized(state.tenant_id, raw_message.id)?;
+    let mut payload_event_metadata = json!({
+        "topic": topic,
+        "payload_format": context.payload_format,
+        "observation_count": observations.len(),
+        "ingest_source": "mqtt"
+    });
+    merge_json_object(&mut payload_event_metadata, ingest_metadata);
     record_ingest_event_optional(
         state,
         "aion:PayloadIngested",
@@ -941,15 +949,7 @@ async fn handle_publish(
         feature_of_interest_id,
         Some(raw_message.id),
         Some("Payload ingested and normalized".to_string()),
-        metadata_with_connector(
-            json!({
-                "topic": topic,
-                "payload_format": context.payload_format,
-                "observation_count": observations.len(),
-                "ingest_source": "mqtt"
-            }),
-            config.connector.as_ref(),
-        ),
+        metadata_with_connector(payload_event_metadata, config.connector.as_ref()),
     )?;
     mark_worker_ingest_success(state, config.connector.is_some());
     if let Some(connector) = config.connector.as_ref() {
@@ -967,7 +967,7 @@ fn resolve_mqtt_payload_format(configured: Option<&str>) -> Result<String, Strin
         .unwrap_or_else(|| "canonical-json".to_string());
     let normalized = payload_format.to_ascii_lowercase().replace('-', "_");
     match normalized.as_str() {
-        "senml_json" | "ultralight" | "canonical_json" => Ok(payload_format),
+        "senml_json" | "ultralight" | "canonical_json" | "ttn_uplink_json" => Ok(payload_format),
         _ => Err(format!("unsupported MQTT payload format: {payload_format}")),
     }
 }

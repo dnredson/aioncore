@@ -7,8 +7,8 @@ use aion_event::{Event, EventSeverity};
 use aion_mcp::{ToolDefinition, ToolRequest, ToolResponse};
 use aion_observation::{Observation, ObservationValue};
 use aion_payload::{
-    CanonicalJsonDecoder, DecodeInput, PayloadDecoder, PayloadFormat, SenMlJsonDecoder,
-    UltraLightDecoder,
+    CanonicalJsonDecoder, DecodeInput, DecodedMeasurement, PayloadDecoder, PayloadFormat,
+    SenMlJsonDecoder, TtnUplinkJsonDecoder, UltraLightDecoder,
 };
 use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
@@ -3504,7 +3504,16 @@ async fn ingest_http_resolved(
 
     let decoder_config = request
         .mapping
-        .or_else(|| profile.and_then(|profile| profile.attribute_mapping));
+        .or_else(|| profile.and_then(|profile| profile.attribute_mapping))
+        .or_else(|| {
+            if is_ttn_uplink_payload_format(&request.payload_format) {
+                connector
+                    .as_ref()
+                    .and_then(|connector| connector.metadata.clone())
+            } else {
+                None
+            }
+        });
     if payload_format_requires_mapping(&request.payload_format) && decoder_config.is_none() {
         let message = format!(
             "{} payloads require request mapping or producer PayloadProfile attribute_mapping",
@@ -3595,6 +3604,7 @@ async fn ingest_http_resolved(
         }
     };
 
+    let ingest_metadata = decoded_ingest_metadata(&decoded);
     let mut observations = Vec::with_capacity(decoded.len());
     for measurement in decoded {
         let observation = Observation::new(
@@ -3621,6 +3631,11 @@ async fn ingest_http_resolved(
     state
         .storage
         .mark_raw_message_normalized(state.tenant_id, raw_message.id)?;
+    let mut payload_event_metadata = json!({
+        "payload_format": request.payload_format,
+        "observation_count": observations.len()
+    });
+    merge_json_object(&mut payload_event_metadata, ingest_metadata);
     record_ingest_event(
         &state,
         "aion:PayloadIngested",
@@ -3629,13 +3644,7 @@ async fn ingest_http_resolved(
         request.feature_of_interest_id,
         raw_message.id,
         Some("Payload ingested and normalized".to_string()),
-        metadata_with_connector(
-            json!({
-                "payload_format": request.payload_format,
-                "observation_count": observations.len()
-            }),
-            connector_metadata,
-        ),
+        metadata_with_connector(payload_event_metadata, connector_metadata),
     )?;
 
     Ok((
@@ -3653,6 +3662,7 @@ fn decoder_for_format(payload_format: &str) -> Result<Box<dyn PayloadDecoder>, A
         "senml" | "senml_json" => Ok(Box::new(SenMlJsonDecoder)),
         "ultralight" | "ultra_light" => Ok(Box::new(UltraLightDecoder)),
         "canonical_json" | "canonical" => Ok(Box::new(CanonicalJsonDecoder)),
+        "ttn_uplink_json" => Ok(Box::new(TtnUplinkJsonDecoder)),
         _ => Err(ApiError::bad_request(format!(
             "unsupported payload_format: {payload_format}"
         ))),
@@ -3667,6 +3677,17 @@ fn payload_format_requires_mapping(payload_format: &str) -> bool {
             .replace('-', "_")
             .as_str(),
         "ultralight" | "ultra_light"
+    )
+}
+
+fn is_ttn_uplink_payload_format(payload_format: &str) -> bool {
+    matches!(
+        payload_format
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .as_str(),
+        "ttn_uplink_json"
     )
 }
 
@@ -3918,11 +3939,9 @@ fn connector_worker_start_decision(spec: &IngestionWorkerSpec) -> ConnectorWorke
         IngestionWorkerSpecStatus::Unsupported => ConnectorWorkerStartDecision::Unsupported,
         IngestionWorkerSpecStatus::Planned => match (&spec.worker_kind, &spec.connector_profile) {
             (IngestionWorkerKind::MqttSubscriber, ConnectorProfile::GenericAionMqtt)
-            | (IngestionWorkerKind::MqttSubscriber, ConnectorProfile::GenericMqtt) => {
+            | (IngestionWorkerKind::MqttSubscriber, ConnectorProfile::GenericMqtt)
+            | (IngestionWorkerKind::MqttSubscriber, ConnectorProfile::TtnV3) => {
                 ConnectorWorkerStartDecision::StartMqtt
-            }
-            (IngestionWorkerKind::MqttSubscriber, ConnectorProfile::TtnV3) => {
-                ConnectorWorkerStartDecision::Skip
             }
             (IngestionWorkerKind::Unsupported, _) => ConnectorWorkerStartDecision::Unsupported,
             _ => ConnectorWorkerStartDecision::PlannedOnly,
@@ -4105,18 +4124,6 @@ async fn reconcile_connector_worker_spec(
             }
             status.last_reconciled_at = Some(reconciled_at);
             set_connector_worker_runtime_status(state, status);
-            if spec.enabled && spec.connector_profile == ConnectorProfile::TtnV3 {
-                record_connector_worker_event(
-                    state,
-                    "aion:ConnectorWorkerSkipped",
-                    EventSeverity::Warning,
-                    Some(
-                        "TTN v3 connector worker skipped because TTN decoding is future work"
-                            .to_string(),
-                    ),
-                    connector_worker_event_metadata(spec, Some("ttn_decoding_not_implemented")),
-                )?;
-            }
             actions.push(connector_worker_action(spec, "skipped", None));
         }
         ConnectorWorkerStartDecision::Invalid | ConnectorWorkerStartDecision::Unsupported => {
@@ -4470,13 +4477,7 @@ fn connector_runtime_status_from_spec(spec: &IngestionWorkerSpec) -> ConnectorWo
         ConnectorWorkerStartDecision::Unsupported => ConnectorWorkerRuntimeState::Unsupported,
         ConnectorWorkerStartDecision::PlannedOnly => ConnectorWorkerRuntimeState::Planned,
     };
-    let last_error = if spec.connector_profile == ConnectorProfile::TtnV3
-        && status == ConnectorWorkerRuntimeState::Skipped
-    {
-        Some(
-            "TTN v3 connector workers are not started yet; TTN decoding is future work".to_string(),
-        )
-    } else if matches!(
+    let last_error = if matches!(
         status,
         ConnectorWorkerRuntimeState::Invalid | ConnectorWorkerRuntimeState::Unsupported
     ) {
@@ -4712,12 +4713,12 @@ fn connector_worker_spec(
                     && !connector
                         .payload_format
                         .as_deref()
-                        .map(payload_format_is_supported)
+                        .map(is_ttn_uplink_payload_format)
                         .unwrap_or(false)
                 {
                     validation_issues.push(worker_issue(
-                        "ttn_decoding_not_implemented",
-                        "TTN v3 connector planning is supported, but ttn-uplink-json decoding is not implemented yet",
+                        "unsupported_ttn_payload_format",
+                        "TTN v3 connector workers require payload_format = ttn-uplink-json in this milestone",
                     ));
                 }
                 if validation_issues.iter().any(|issue| {
@@ -4727,6 +4728,7 @@ fn connector_worker_spec(
                             | "missing_topic_filter"
                             | "missing_secret_ref"
                             | "unsupported_secret_type"
+                            | "unsupported_ttn_payload_format"
                     )
                 }) {
                     IngestionWorkerSpecStatus::Invalid
@@ -4772,10 +4774,6 @@ fn worker_issue(
         code: code.into(),
         message: message.into(),
     }
-}
-
-fn payload_format_is_supported(payload_format: &str) -> bool {
-    decoder_for_format(payload_format).is_ok()
 }
 
 fn connector_event_metadata(connector: &IngestionConnector) -> Value {
@@ -4826,6 +4824,32 @@ fn metadata_with_connector(mut metadata: Value, connector_metadata: Option<Value
     }
 
     metadata
+}
+
+fn decoded_ingest_metadata(decoded: &[DecodedMeasurement]) -> Value {
+    let Some(first) = decoded.first() else {
+        return json!({});
+    };
+    let mut metadata = json!({});
+    if let Some(value) = first.metadata.get("decoded_payload_keys") {
+        metadata["decoded_payload_keys"] = value.clone();
+    }
+    if let Some(value) = first.metadata.get("ttn_device_id") {
+        metadata["ttn_device_id"] = value.clone();
+    }
+    if let Some(value) = first.metadata.get("ttn_application_id") {
+        metadata["ttn_application_id"] = value.clone();
+    }
+    metadata
+}
+
+fn merge_json_object(target: &mut Value, source: Value) {
+    let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) else {
+        return;
+    };
+    for (key, value) in source {
+        target.insert(key.clone(), value.clone());
+    }
 }
 
 fn parse_bool_env_value(
@@ -8683,6 +8707,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_http_ingestion_decodes_ttn_v3_uplink_json() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-http-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-http-plot-01", "aion:Plot").await;
+        let connector = create_ttn_connector(&app, "ttn-http-ingest", &sensor_id, &plot_id).await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+        let observations = ingest["observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 3);
+        assert!(observations
+            .iter()
+            .any(|observation| observation["observed_property"] == "ttn:temperature"));
+        assert!(observations
+            .iter()
+            .any(|observation| observation["observed_property"] == "ttn:state"));
+        assert!(observations
+            .iter()
+            .any(|observation| observation["observed_property"] == "ttn:battery_low"));
+        let temperature = observations
+            .iter()
+            .find(|observation| observation["observed_property"] == "ttn:temperature")
+            .unwrap();
+        assert_eq!(temperature["unit"], "Cel");
+        assert_eq!(temperature["metadata"]["ttn_device_id"], "soil-node-01");
+        assert_eq!(temperature["metadata"]["ttn_application_id"], "farm-app");
+
+        let raw_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/raw-messages/{raw_message_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_response.status(), StatusCode::OK);
+        let raw_message = to_json(raw_response).await;
+        assert_eq!(raw_message["connector_id"], connector_id);
+        assert_eq!(raw_message["connector_profile"], "ttn-v3");
+        assert_eq!(raw_message["payload_format"], "ttn-uplink-json");
+
+        let events = query_events_by_raw_message(&app, raw_message_id).await;
+        let ingested = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "aion:PayloadIngested")
+            .expect("payload ingested event should exist");
+        assert_eq!(ingested["metadata"]["connector_profile"], "ttn-v3");
+        assert_eq!(ingested["metadata"]["ttn_device_id"], "soil-node-01");
+        assert_eq!(ingested["metadata"]["ttn_application_id"], "farm-app");
+        assert_eq!(
+            ingested["metadata"]["decoded_payload_keys"],
+            json!(["battery_low", "location", "state", "temperature"])
+        );
+    }
+
+    #[tokio::test]
     async fn creates_ttn_v3_connector() {
         let app = app();
         let response = app
@@ -8779,7 +8877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_ttn_v3_connector_produces_mqtt_spec_with_limitation_note() {
+    async fn ttn_v3_uplink_json_connector_produces_valid_mqtt_spec() {
         let app = app();
         create_mqtt_connector(
             &app,
@@ -8796,9 +8894,32 @@ mod tests {
         assert_eq!(plan["planned_workers"], 1);
         assert_eq!(plan["specs"][0]["worker_kind"], "mqtt_subscriber");
         assert_eq!(plan["specs"][0]["status"], "planned");
+        assert!(plan["specs"][0]["validation_issues"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn ttn_v3_unsupported_payload_format_is_invalid() {
+        let app = app();
+        create_mqtt_connector(
+            &app,
+            "ttn-plan-unsupported",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let plan = get_worker_plan(&app).await;
+        assert_eq!(plan["invalid_workers"], 1);
+        assert_eq!(plan["specs"][0]["status"], "invalid");
         assert_eq!(
             plan["specs"][0]["validation_issues"][0]["code"],
-            "ttn_decoding_not_implemented"
+            "unsupported_ttn_payload_format"
         );
     }
 
@@ -9466,7 +9587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ttn_v3_connector_worker_is_skipped_when_runtime_enabled() {
+    async fn ttn_v3_connector_worker_is_startable_when_runtime_enabled() {
         let state = AppState::local();
         let app = app_with_state(state.clone());
         create_mqtt_connector(
@@ -9480,7 +9601,8 @@ mod tests {
         )
         .await;
 
-        start_connector_workers(state.clone(), ConnectorWorkerConfig { enabled: true })
+        set_connector_workers_enabled(&state, true);
+        reconcile_connector_workers(state.clone(), false)
             .await
             .unwrap();
 
@@ -9488,13 +9610,8 @@ mod tests {
         assert!(status.connector_workers.enabled);
         assert_eq!(
             status.workers[0].status,
-            ConnectorWorkerRuntimeState::Skipped
+            ConnectorWorkerRuntimeState::Planned
         );
-        assert!(status.workers[0]
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("TTN v3"));
     }
 
     #[tokio::test]
@@ -10216,6 +10333,22 @@ mod tests {
         to_json(response).await
     }
 
+    async fn query_events_by_raw_message(app: &Router, raw_message_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/events?raw_message_id={raw_message_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
     async fn put_start_pump_policy(app: &Router, pump_id: &str, requires_approval: bool) -> Value {
         let response = app
             .clone()
@@ -10621,6 +10754,86 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CREATED);
         to_json(response).await
+    }
+
+    async fn create_ttn_connector(
+        app: &Router,
+        connector_key: &str,
+        producer_entity_id: &str,
+        feature_of_interest_id: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": connector_key,
+                    "connector_type": "mqtt",
+                    "connector_profile": "ttn-v3",
+                    "enabled": true,
+                    "broker_url": "mqtt://eu1.cloud.thethings.network:1883",
+                    "client_id": format!("{connector_key}-client"),
+                    "topic_filter": "v3/demo-app/devices/+/up",
+                    "payload_format": "ttn-uplink-json",
+                    "content_type": "application/json",
+                    "default_producer_entity_id": producer_entity_id,
+                    "default_feature_of_interest_id": feature_of_interest_id,
+                    "metadata": {
+                        "unit_mapping": {
+                            "temperature": "Cel",
+                            "soil_moisture": "%"
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    fn ttn_uplink_payload() -> Value {
+        json!({
+            "end_device_ids": {
+                "device_id": "soil-node-01",
+                "application_ids": {
+                    "application_id": "farm-app"
+                }
+            },
+            "received_at": "2026-04-29T12:00:00Z",
+            "uplink_message": {
+                "received_at": "2026-04-29T12:01:02Z",
+                "f_port": 1,
+                "f_cnt": 42,
+                "frm_payload": "AQID",
+                "decoded_payload": {
+                    "temperature": 21.5,
+                    "state": "ok",
+                    "battery_low": false,
+                    "location": {
+                        "lat": -23.5,
+                        "lon": -46.6
+                    }
+                },
+                "rx_metadata": [
+                    {
+                        "gateway_ids": {
+                            "gateway_id": "gw-1"
+                        },
+                        "rssi": -71
+                    }
+                ],
+                "settings": {
+                    "data_rate": {
+                        "lora": {
+                            "spreading_factor": 7
+                        }
+                    }
+                }
+            }
+        })
     }
 
     async fn create_mqtt_connector(

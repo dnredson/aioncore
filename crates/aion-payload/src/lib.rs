@@ -12,6 +12,7 @@ pub enum PayloadFormat {
     UltraLight,
     JsonMapping,
     CanonicalJson,
+    TtnUplinkJson,
     Unknown(String),
 }
 
@@ -22,6 +23,7 @@ impl fmt::Display for PayloadFormat {
             Self::UltraLight => f.write_str("ultralight"),
             Self::JsonMapping => f.write_str("json_mapping"),
             Self::CanonicalJson => f.write_str("canonical_json"),
+            Self::TtnUplinkJson => f.write_str("ttn_uplink_json"),
             Self::Unknown(value) => f.write_str(value),
         }
     }
@@ -37,6 +39,7 @@ impl FromStr for PayloadFormat {
             "ultralight" | "ultra_light" | "text/plain" => Self::UltraLight,
             "json_mapping" | "mapping" | "application/json" => Self::JsonMapping,
             "canonical_json" | "canonical" => Self::CanonicalJson,
+            "ttn_uplink_json" | "application/vnd.thethings.uplink+json" => Self::TtnUplinkJson,
             _ => Self::Unknown(value.to_string()),
         };
         Ok(format)
@@ -310,6 +313,105 @@ impl PayloadDecoder for CanonicalJsonDecoder {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TtnUplinkJsonDecoder;
+
+impl PayloadDecoder for TtnUplinkJsonDecoder {
+    fn name(&self) -> &'static str {
+        "ttn-uplink-json"
+    }
+
+    fn decode(&self, input: DecodeInput) -> Result<Vec<DecodedMeasurement>, DecodeError> {
+        let value: Value = serde_json::from_slice(&input.payload)
+            .map_err(|err| DecodeError::new(format!("invalid TTN uplink JSON payload: {err}")))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| DecodeError::new("TTN uplink JSON payload must be an object"))?;
+        let uplink = object
+            .get("uplink_message")
+            .and_then(Value::as_object)
+            .ok_or_else(|| DecodeError::new("TTN uplink JSON missing uplink_message object"))?;
+        let decoded_payload = uplink
+            .get("decoded_payload")
+            .and_then(Value::as_object)
+            .ok_or_else(|| DecodeError::new("TTN uplink JSON missing decoded_payload object"))?;
+
+        let end_device_ids = object.get("end_device_ids").and_then(Value::as_object);
+        let device_id = end_device_ids
+            .and_then(|value| value.get("device_id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let application_id = end_device_ids
+            .and_then(|value| value.get("application_ids"))
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("application_id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let observed_at = uplink
+            .get("received_at")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("received_at").and_then(Value::as_str))
+            .map(parse_rfc3339_utc)
+            .transpose()?
+            .unwrap_or(input.received_at);
+        let decoded_payload_keys = decoded_payload.keys().cloned().collect::<Vec<_>>();
+        let skipped_decoded_payload_keys = decoded_payload
+            .iter()
+            .filter(|(_, value)| !(value.is_number() || value.is_string() || value.is_boolean()))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+
+        let mut measurements = Vec::new();
+        for (key, value) in decoded_payload {
+            let observation_value = if let Some(value) = value.as_f64() {
+                ObservationValue::Number { value }
+            } else if let Some(value) = value.as_str() {
+                ObservationValue::Text {
+                    value: value.to_string(),
+                }
+            } else if let Some(value) = value.as_bool() {
+                ObservationValue::Bool { value }
+            } else {
+                continue;
+            };
+            let unit = ttn_unit_for_key(input.config.as_ref(), key);
+
+            measurements.push(DecodedMeasurement {
+                entity_key: input
+                    .device_key
+                    .clone()
+                    .or_else(|| device_id.clone())
+                    .unwrap_or_default(),
+                observed_property: format!("ttn:{key}"),
+                time: observed_at,
+                value: observation_value,
+                unit,
+                metadata: serde_json::json!({
+                    "decoder": self.name(),
+                    "ttn_device_id": device_id,
+                    "ttn_application_id": application_id,
+                    "ttn_f_port": uplink.get("f_port").cloned(),
+                    "ttn_f_cnt": uplink.get("f_cnt").cloned(),
+                    "ttn_frm_payload": uplink.get("frm_payload").cloned(),
+                    "ttn_rx_metadata": uplink.get("rx_metadata").cloned(),
+                    "ttn_settings": uplink.get("settings").cloned(),
+                    "decoded_payload_key": key,
+                    "decoded_payload_keys": decoded_payload_keys,
+                    "skipped_decoded_payload_keys": skipped_decoded_payload_keys
+                }),
+            });
+        }
+
+        if measurements.is_empty() {
+            return Err(DecodeError::new(
+                "TTN uplink JSON decoded_payload produced no primitive measurements",
+            ));
+        }
+
+        Ok(measurements)
+    }
+}
+
 fn senml_value(object: &serde_json::Map<String, Value>) -> Result<ObservationValue, DecodeError> {
     if let Some(value) = object.get("v").and_then(Value::as_f64) {
         return Ok(ObservationValue::Number { value });
@@ -386,6 +488,22 @@ fn json_value_to_observation_value(value: &Value) -> Result<ObservationValue, De
     })
 }
 
+fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>, DecodeError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|err| DecodeError::new(format!("invalid TTN received_at timestamp: {err}")))
+}
+
+fn ttn_unit_for_key(config: Option<&Value>, key: &str) -> Option<String> {
+    let config = config?;
+    config
+        .get("unit_mapping")
+        .or_else(|| config.get("units"))
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn epoch_seconds_to_utc(value: f64) -> Result<DateTime<Utc>, DecodeError> {
     let seconds = value.trunc() as i64;
     let nanos = ((value.fract().abs()) * 1_000_000_000.0) as u32;
@@ -449,6 +567,10 @@ mod tests {
             "canonical-json".parse::<PayloadFormat>().unwrap(),
             PayloadFormat::CanonicalJson
         );
+        assert_eq!(
+            "ttn-uplink-json".parse::<PayloadFormat>().unwrap(),
+            PayloadFormat::TtnUplinkJson
+        );
     }
 
     #[test]
@@ -471,5 +593,150 @@ mod tests {
         assert_eq!(measurements[0].entity_key, "device-01");
         assert_eq!(measurements[0].observed_property, "payload_size");
         assert_eq!(measurements[0].time, received_at);
+    }
+
+    fn ttn_sample(decoded_payload: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "end_device_ids": {
+                "device_id": "soil-node-01",
+                "application_ids": {
+                    "application_id": "farm-app"
+                }
+            },
+            "received_at": "2026-04-29T12:00:00Z",
+            "uplink_message": {
+                "received_at": "2026-04-29T12:01:02Z",
+                "f_port": 1,
+                "f_cnt": 42,
+                "frm_payload": "AQID",
+                "decoded_payload": decoded_payload,
+                "rx_metadata": [{"gateway_ids": {"gateway_id": "gw-1"}, "rssi": -71}],
+                "settings": {"data_rate": {"lora": {"spreading_factor": 7}}}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn ttn_decoder_creates_numeric_observations() {
+        let decoder = TtnUplinkJsonDecoder;
+        let input = DecodeInput {
+            tenant_id: Uuid::new_v4(),
+            device_key: Some("producer".to_string()),
+            format: PayloadFormat::TtnUplinkJson,
+            content_type: Some("application/json".to_string()),
+            payload: ttn_sample(json!({"temperature": 21.5, "soil_moisture": 44})),
+            received_at: Utc.with_ymd_and_hms(2026, 4, 29, 11, 0, 0).unwrap(),
+            config: Some(json!({"unit_mapping": {"temperature": "Cel", "soil_moisture": "%"}})),
+        };
+
+        let decoded = decoder.decode(input).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].observed_property, "ttn:soil_moisture");
+        assert_eq!(decoded[0].unit.as_deref(), Some("%"));
+        assert_eq!(decoded[1].observed_property, "ttn:temperature");
+        assert_eq!(decoded[1].unit.as_deref(), Some("Cel"));
+    }
+
+    #[test]
+    fn ttn_decoder_creates_string_and_bool_observations() {
+        let decoder = TtnUplinkJsonDecoder;
+        let input = DecodeInput {
+            tenant_id: Uuid::new_v4(),
+            device_key: None,
+            format: PayloadFormat::TtnUplinkJson,
+            content_type: None,
+            payload: ttn_sample(json!({"state": "ok", "battery_low": false})),
+            received_at: Utc.with_ymd_and_hms(2026, 4, 29, 11, 0, 0).unwrap(),
+            config: None,
+        };
+
+        let decoded = decoder.decode(input).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded.iter().any(|measurement| {
+            measurement.observed_property == "ttn:battery_low"
+                && measurement.value == ObservationValue::Bool { value: false }
+        }));
+        assert!(decoded.iter().any(|measurement| {
+            measurement.observed_property == "ttn:state"
+                && measurement.value
+                    == ObservationValue::Text {
+                        value: "ok".to_string(),
+                    }
+        }));
+    }
+
+    #[test]
+    fn ttn_decoder_errors_when_decoded_payload_is_missing() {
+        let decoder = TtnUplinkJsonDecoder;
+        let payload = serde_json::to_vec(&json!({"uplink_message": {}})).unwrap();
+        let input = DecodeInput {
+            tenant_id: Uuid::new_v4(),
+            device_key: None,
+            format: PayloadFormat::TtnUplinkJson,
+            content_type: None,
+            payload,
+            received_at: Utc.with_ymd_and_hms(2026, 4, 29, 11, 0, 0).unwrap(),
+            config: None,
+        };
+
+        let error = decoder.decode(input).unwrap_err();
+
+        assert!(error.message().contains("decoded_payload"));
+    }
+
+    #[test]
+    fn ttn_decoder_skips_nested_values_and_preserves_keys() {
+        let decoder = TtnUplinkJsonDecoder;
+        let input = DecodeInput {
+            tenant_id: Uuid::new_v4(),
+            device_key: None,
+            format: PayloadFormat::TtnUplinkJson,
+            content_type: None,
+            payload: ttn_sample(json!({
+                "temperature": 21.5,
+                "location": {"lat": 1},
+                "samples": [1, 2]
+            })),
+            received_at: Utc.with_ymd_and_hms(2026, 4, 29, 11, 0, 0).unwrap(),
+            config: None,
+        };
+
+        let decoded = decoder.decode(input).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].metadata["skipped_decoded_payload_keys"],
+            json!(["location", "samples"])
+        );
+    }
+
+    #[test]
+    fn ttn_decoder_prefers_uplink_received_at_and_preserves_device_metadata() {
+        let decoder = TtnUplinkJsonDecoder;
+        let input = DecodeInput {
+            tenant_id: Uuid::new_v4(),
+            device_key: None,
+            format: PayloadFormat::TtnUplinkJson,
+            content_type: None,
+            payload: ttn_sample(json!({"temperature": 21.5})),
+            received_at: Utc.with_ymd_and_hms(2026, 4, 29, 11, 0, 0).unwrap(),
+            config: None,
+        };
+
+        let decoded = decoder.decode(input).unwrap();
+
+        assert_eq!(
+            decoded[0].time,
+            Utc.with_ymd_and_hms(2026, 4, 29, 12, 1, 2).unwrap()
+        );
+        assert_eq!(decoded[0].metadata["ttn_device_id"], "soil-node-01");
+        assert_eq!(decoded[0].metadata["ttn_application_id"], "farm-app");
+        assert_eq!(
+            decoded[0].metadata["decoded_payload_keys"],
+            json!(["temperature"])
+        );
     }
 }

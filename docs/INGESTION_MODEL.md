@@ -264,6 +264,7 @@ MQTT payload formats supported by this milestone:
 - `senml-json`
 - `ultralight`
 - `canonical-json`
+- `ttn-uplink-json`
 
 MQTT format selection:
 
@@ -309,7 +310,7 @@ Broker receives message
   -> worker emits ingestion events
 ```
 
-Connector-based MQTT workers support one worker per enabled generic MQTT connector so multiple controlled brokers can run side by side. Provider-specific profiles such as TTN v3 are modeled but not dynamically consumed yet.
+Connector-based MQTT workers support one worker per enabled MQTT connector for `generic-aion-mqtt`, `generic-mqtt`, and `ttn-v3` profiles when the connector has valid broker and topic settings. TTN v3 workers remain local-runtime plumbing only in this milestone; tests use sample JSON payloads and do not require a live TTN account or public broker.
 
 ## The Things Stack Profile
 
@@ -321,12 +322,48 @@ Example TTN connector semantics:
 - `topic_filter`: `v3/{application_id}/devices/+/up`
 - `payload_format`: `ttn-uplink-json`
 
-Full TTN uplink decoding is not implemented yet. Future TTN adapter behavior should:
+`payload_format = "ttn-uplink-json"` decodes common The Things Stack v3 uplink JSON. The decoder reads:
+
+- `end_device_ids.device_id`
+- `end_device_ids.application_ids.application_id`
+- `uplink_message.decoded_payload`
+- `uplink_message.received_at`
+- `uplink_message.f_port`
+- `uplink_message.f_cnt`
+- `uplink_message.frm_payload`
+- `uplink_message.rx_metadata`
+- `uplink_message.settings`
+- root `received_at`
+
+When `uplink_message.decoded_payload` is an object, each primitive top-level key becomes one canonical observation:
+
+- number values become numeric observations;
+- string values become text observations;
+- boolean values become boolean observations;
+- nested objects and arrays are skipped for now and listed in measurement metadata.
+
+Observed properties use the `ttn:` prefix. For example, `decoded_payload.temperature` becomes `ttn:temperature`.
+
+Observation time prefers `uplink_message.received_at`, then root `received_at`, then the ingestion time. Unit mapping can be supplied in connector metadata:
+
+```json
+{
+  "unit_mapping": {
+    "temperature": "Cel",
+    "soil_moisture": "%"
+  }
+}
+```
+
+The decoder does not auto-create entities. The ingestion context must still provide `producer_entity_id` and `feature_of_interest_id`, either in the request or through connector defaults. TTN device and application IDs are preserved in observation and `PayloadIngested` event metadata.
+
+Future TTN adapter behavior should:
 
 - map TTN `device_id` to producer entities;
 - map `decoded_payload` fields to canonical observations;
 - preserve uplink metadata such as RSSI, SNR, gateway IDs, frame counters, and timestamps;
 - support topic differences across tenant, application, and regional endpoint conventions.
+- validate live TTN broker details and support production TLS/mTLS where required.
 
 ## Limitations
 
@@ -336,6 +373,9 @@ Full TTN uplink decoding is not implemented yet. Future TTN adapter behavior sho
 - Connector secret references are local-development friendly and are not a production secret manager.
 - Connector secret values are persisted by the configured storage backend, but encryption, KMS, and Vault integration are not implemented yet.
 - Dynamic MQTT connector authentication supports only `mqtt_basic_auth` secrets.
+- TTN v3 uplink JSON decoding is local and sample-payload based; live TTN account integration is not implemented.
+- TTN entity auto-provisioning is not implemented yet.
+- TTN downlinks are not implemented yet.
 - MQTT broker username/password authentication is supported for the worker only.
 - Per-device MQTT authorization is not implemented yet.
 - TLS/mTLS is not implemented yet.
