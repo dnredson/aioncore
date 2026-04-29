@@ -40,6 +40,8 @@ pub const MIGRATION_0008_CREATE_CONNECTOR_SECRETS: &str =
     include_str!("../../../migrations/0008_create_connector_secrets.sql");
 pub const MIGRATION_0009_CREATE_TTN_DEVICE_MAPPINGS: &str =
     include_str!("../../../migrations/0009_create_ttn_device_mappings.sql");
+pub const MIGRATION_0010_HARDEN_TTN_DEVICE_MAPPING_UNIQUENESS: &str =
+    include_str!("../../../migrations/0010_harden_ttn_device_mapping_uniqueness.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -71,6 +73,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0009_create_ttn_device_mappings.sql",
         MIGRATION_0009_CREATE_TTN_DEVICE_MAPPINGS,
+    ),
+    (
+        "0010_harden_ttn_device_mapping_uniqueness.sql",
+        MIGRATION_0010_HARDEN_TTN_DEVICE_MAPPING_UNIQUENESS,
     ),
 ];
 
@@ -327,10 +333,88 @@ impl TtnDeviceMapping {
         })
     }
 
+    pub fn update_fields(
+        &mut self,
+        ttn_application_id: Option<Option<String>>,
+        ttn_device_id: Option<String>,
+        producer_entity_id: Option<Uuid>,
+        feature_of_interest_id: Option<Option<Uuid>>,
+        enabled: Option<bool>,
+        metadata: Option<Option<Value>>,
+        now: DateTime<Utc>,
+    ) -> StorageResult<()> {
+        if let Some(application_id) = ttn_application_id {
+            self.ttn_application_id = application_id.and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            });
+        }
+        if let Some(device_id) = ttn_device_id {
+            if device_id.trim().is_empty() {
+                return Err(StorageError::InvalidInput(
+                    "ttn_device_id must not be empty".to_string(),
+                ));
+            }
+            self.ttn_device_id = device_id;
+        }
+        if let Some(producer_entity_id) = producer_entity_id {
+            self.producer_entity_id = producer_entity_id;
+        }
+        if let Some(feature_of_interest_id) = feature_of_interest_id {
+            self.feature_of_interest_id = feature_of_interest_id;
+        }
+        if let Some(enabled) = enabled {
+            self.enabled = enabled;
+        }
+        if let Some(metadata) = metadata {
+            self.metadata = metadata;
+        }
+        self.updated_at = now;
+        Ok(())
+    }
+
     pub fn set_enabled(&mut self, enabled: bool, now: DateTime<Utc>) {
         self.enabled = enabled;
         self.updated_at = now;
     }
+}
+
+fn validate_ttn_device_mapping_conflict<'a>(
+    mappings: impl Iterator<Item = &'a TtnDeviceMapping>,
+    candidate: &TtnDeviceMapping,
+) -> StorageResult<()> {
+    if !candidate.enabled {
+        return Ok(());
+    }
+
+    for mapping in mappings {
+        if mapping.id == candidate.id
+            || mapping.tenant_id != candidate.tenant_id
+            || mapping.connector_id != candidate.connector_id
+            || !mapping.enabled
+            || mapping.ttn_device_id != candidate.ttn_device_id
+        {
+            continue;
+        }
+
+        if mapping.ttn_application_id == candidate.ttn_application_id {
+            let scope = candidate
+                .ttn_application_id
+                .as_deref()
+                .map(|application_id| format!("application '{application_id}'"))
+                .unwrap_or_else(|| "fallback device".to_string());
+            return Err(StorageError::ConflictWithMessage(format!(
+                "enabled TTN mapping conflict for connector {}, device '{}', {scope}",
+                candidate.connector_id, candidate.ttn_device_id
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 impl PayloadProfile {
@@ -364,6 +448,7 @@ impl PayloadProfile {
 pub enum StorageError {
     NotFound,
     Conflict,
+    ConflictWithMessage(String),
     InvalidInput(String),
     Backend(String),
 }
@@ -373,6 +458,7 @@ impl fmt::Display for StorageError {
         match self {
             Self::NotFound => f.write_str("record was not found"),
             Self::Conflict => f.write_str("record conflicts with existing data"),
+            Self::ConflictWithMessage(message) => f.write_str(message),
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Backend(message) => write!(f, "storage backend error: {message}"),
         }
@@ -514,6 +600,12 @@ pub trait TtnDeviceMappingStore {
         &self,
         mapping: TtnDeviceMapping,
     ) -> StorageResult<TtnDeviceMapping>;
+    fn delete_ttn_device_mapping(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        mapping_id: Uuid,
+    ) -> StorageResult<()>;
     fn find_ttn_device_mapping(
         &self,
         tenant_id: Uuid,
@@ -1246,6 +1338,7 @@ impl TtnDeviceMappingStore for InMemoryStorage {
         if state.ttn_device_mappings.contains_key(&mapping.id) {
             return Err(StorageError::Conflict);
         }
+        validate_ttn_device_mapping_conflict(state.ttn_device_mappings.values(), &mapping)?;
         state
             .ttn_device_mappings
             .insert(mapping.id, mapping.clone());
@@ -1295,6 +1388,7 @@ impl TtnDeviceMappingStore for InMemoryStorage {
         mapping: TtnDeviceMapping,
     ) -> StorageResult<TtnDeviceMapping> {
         let mut state = self.write_state()?;
+        validate_ttn_device_mapping_conflict(state.ttn_device_mappings.values(), &mapping)?;
         let stored = state
             .ttn_device_mappings
             .get_mut(&mapping.id)
@@ -1304,6 +1398,25 @@ impl TtnDeviceMappingStore for InMemoryStorage {
             .ok_or(StorageError::NotFound)?;
         *stored = mapping.clone();
         Ok(mapping)
+    }
+
+    fn delete_ttn_device_mapping(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        mapping_id: Uuid,
+    ) -> StorageResult<()> {
+        let mut state = self.write_state()?;
+        let exists = state
+            .ttn_device_mappings
+            .get(&mapping_id)
+            .map(|mapping| mapping.tenant_id == tenant_id && mapping.connector_id == connector_id)
+            .unwrap_or(false);
+        if !exists {
+            return Err(StorageError::NotFound);
+        }
+        state.ttn_device_mappings.remove(&mapping_id);
+        Ok(())
     }
 
     fn find_ttn_device_mapping(
@@ -1892,7 +2005,7 @@ mod tests {
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 9);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 10);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
@@ -1907,6 +2020,10 @@ mod tests {
         assert_eq!(
             ORDERED_MIGRATIONS[8].0,
             "0009_create_ttn_device_mappings.sql"
+        );
+        assert_eq!(
+            ORDERED_MIGRATIONS[9].0,
+            "0010_harden_ttn_device_mapping_uniqueness.sql"
         );
     }
 
@@ -2336,6 +2453,30 @@ mod tests {
                 .id,
             generic.id
         );
+        assert!(matches!(
+            storage.create_ttn_device_mapping(
+                TtnDeviceMapping::new(
+                    tenant_id,
+                    connector_id,
+                    None,
+                    "soil-node-01",
+                    producer_entity_id,
+                    Some(feature_of_interest_id),
+                    true,
+                    None,
+                    Utc::now(),
+                )
+                .unwrap()
+            ),
+            Err(StorageError::ConflictWithMessage(_))
+        ));
+        storage
+            .delete_ttn_device_mapping(tenant_id, connector_id, generic.id)
+            .unwrap();
+        assert!(storage
+            .find_ttn_device_mapping(tenant_id, connector_id, Some("other-app"), "soil-node-01")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2551,6 +2692,23 @@ mod tests {
             "idx_ttn_device_mappings_connector",
             "idx_ttn_device_mappings_device",
             "idx_ttn_device_mappings_enabled",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing migration item: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn ttn_device_mapping_hardening_migration_defines_enabled_uniqueness() {
+        let migration = MIGRATION_0010_HARDEN_TTN_DEVICE_MAPPING_UNIQUENESS;
+        for required in [
+            "DROP INDEX IF EXISTS idx_ttn_device_mappings_unique_no_application",
+            "idx_ttn_device_mappings_unique_enabled_application",
+            "idx_ttn_device_mappings_unique_enabled_no_application",
+            "WHERE enabled = TRUE AND ttn_application_id IS NOT NULL",
+            "WHERE enabled = TRUE AND ttn_application_id IS NULL",
         ] {
             assert!(
                 migration.contains(required),

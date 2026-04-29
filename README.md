@@ -300,6 +300,19 @@ $ttnConnector = Invoke-RestMethod `
     }
   } | ConvertTo-Json -Depth 10)
 
+$ttnFallbackMapping = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings" `
+  -ContentType "application/json" `
+  -Body (@{
+    ttn_device_id = "soil-node-01"
+    producer_entity_id = $ttnProducer.id
+    feature_of_interest_id = $ttnFeature.id
+    metadata = @{
+      source = "fallback-local-demo"
+    }
+  } | ConvertTo-Json -Depth 8)
+
 $ttnMapping = Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings" `
@@ -315,7 +328,9 @@ $ttnMapping = Invoke-RestMethod `
   } | ConvertTo-Json -Depth 8)
 ```
 
-Ingest a sample TTN uplink without passing `producer_entity_id`; AionCore resolves it through the mapping:
+The fallback mapping applies to the connector/device when no application-specific mapping exists. The `farm-app` mapping above can coexist with the fallback and is preferred for uplinks whose TTN `application_id` is `farm-app`.
+
+Ingest a sample TTN uplink without passing `producer_entity_id`; AionCore resolves it through the application-specific mapping:
 
 ```powershell
 $ttnIngest = Invoke-RestMethod `
@@ -363,7 +378,41 @@ $raw.connector_profile
 $events.metadata
 ```
 
-If no enabled mapping matches and the request does not provide a producer entity, AionCore preserves the raw message, marks it failed, emits `aion:TtnDeviceMappingMissing`, and creates no observations. Application-specific mappings are preferred over connector/device fallback mappings without `ttn_application_id`.
+Update and delete mappings explicitly:
+
+```powershell
+$updatedMapping = Invoke-RestMethod `
+  -Method Patch `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings/$($ttnMapping.id)" `
+  -ContentType "application/json" `
+  -Body (@{
+    enabled = $true
+    metadata = @{
+      source = "updated-local-demo"
+    }
+  } | ConvertTo-Json -Depth 8)
+
+Invoke-RestMethod `
+  -Method Delete `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings/$($ttnMapping.id)"
+```
+
+Duplicate enabled mappings for the same connector, device, and application are rejected with a conflict. Duplicate enabled fallback mappings for the same connector/device are also rejected:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings" `
+  -ContentType "application/json" `
+  -Body (@{
+    ttn_application_id = "farm-app"
+    ttn_device_id = "soil-node-01"
+    producer_entity_id = $ttnProducer.id
+    feature_of_interest_id = $ttnFeature.id
+  } | ConvertTo-Json -Depth 8)
+```
+
+If no enabled mapping matches and the request does not provide a producer entity, AionCore preserves the raw message, marks it failed, emits `aion:TtnDeviceMappingMissing`, and creates no observations. Failure event metadata includes `ttn_device_id`, `ttn_application_id`, `connector_id`, and `mapping_resolution_error`. Successful `aion:PayloadIngested` metadata includes `ttn_mapping_id` and `mapping_resolution`, with values `exact_application_match` or `fallback_device_match`.
 
 Plan ingestion workers without starting them:
 

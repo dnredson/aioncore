@@ -226,6 +226,10 @@ Rows include tenant and connector IDs, optional `ttn_application_id`, required `
 
 Mapping lookup is scoped to tenant and connector, requires an enabled row, and prefers an exact application ID match over a connector/device fallback row with no application ID.
 
+Mappings can be updated or deleted through the storage interface and API. Updates can change TTN application/device IDs, target entity IDs, enabled state, and metadata; they cannot change mapping ID, tenant ID, or connector ID. Deletes remove the mapping row only.
+
+Conflict handling is enforced in storage logic and by PostgreSQL enabled-row uniqueness indexes. Enabled exact mappings are unique by tenant, connector, application ID, and device ID. Enabled fallback mappings are unique by tenant, connector, and device ID where `ttn_application_id IS NULL`. This allows one application-specific mapping and one fallback mapping to coexist while preventing ambiguous enabled fallback resolution.
+
 ## Future Adapter Expectations
 
 The future PostgreSQL repository adapter should preserve the same behavior as the in-memory stores before becoming the default runtime. It should:

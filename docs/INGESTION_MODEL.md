@@ -84,11 +84,15 @@ TTN device mapping endpoints:
 POST /ingestion/connectors/{connector_id}/ttn-device-mappings
 GET /ingestion/connectors/{connector_id}/ttn-device-mappings
 GET /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}
+PATCH /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}
+DELETE /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}
 PUT /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/enable
 PUT /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/disable
 ```
 
 TTN device mappings are explicit tenant-scoped rules for `ttn-v3` connectors. A mapping links a connector, optional TTN application ID, and TTN device ID to an existing `producer_entity_id` and optional `feature_of_interest_id`. They do not create entities.
+
+Mapping updates can change `ttn_application_id`, `ttn_device_id`, `producer_entity_id`, `feature_of_interest_id`, `enabled`, and `metadata`. Mapping identity fields are immutable: `id`, `tenant_id`, and `connector_id`. Deletes remove the mapping rule from future resolution and do not delete entities, raw messages, observations, or events.
 
 Connector-aware HTTP ingestion:
 
@@ -370,20 +374,42 @@ Observation time prefers `uplink_message.received_at`, then root `received_at`, 
 The decoder does not auto-create entities. Producer and feature resolution order for connector-aware TTN ingestion is:
 
 1. Explicit request `producer_entity_id` / `feature_of_interest_id`.
-2. Enabled TTN device mapping for connector + device ID, preferring a mapping with matching application ID over a connector/device fallback without application ID.
-3. Connector default producer/feature IDs.
+2. Connector default producer/feature IDs.
+3. Enabled TTN device mapping for connector + device ID fills any producer or feature ID that is still missing.
 
-If no producer entity can be resolved for a TTN uplink, AionCore still stores the raw message, marks it failed, emits `aion:TtnDeviceMappingMissing` and `aion:PayloadIngestionFailed`, and creates no observations. If a mapping resolves successfully, `aion:TtnDeviceMappingResolved` is emitted and `ttn_mapping_id` is included in the successful `PayloadIngested` event metadata.
+Mapping resolution within step 3 is deterministic:
+
+1. If the uplink has `end_device_ids.application_ids.application_id`, AionCore first looks for one enabled mapping with matching connector ID, device ID, and application ID.
+2. If no exact application match exists, AionCore looks for one enabled fallback mapping with matching connector ID and device ID where `ttn_application_id` is absent.
+
+An application-specific mapping and a fallback mapping can coexist for the same connector/device. The application-specific mapping is preferred when the uplink application ID matches. Duplicate enabled exact mappings for the same connector/device/application are rejected. Duplicate enabled fallback mappings for the same connector/device are rejected so fallback resolution cannot become ambiguous. Disabled mappings are ignored by resolution.
+
+If no producer entity can be resolved for a TTN uplink, AionCore still stores the raw message, marks it failed, emits `aion:TtnDeviceMappingMissing` and `aion:PayloadIngestionFailed`, and creates no observations. If mapping data is ambiguous, AionCore stores the raw message, marks it failed, emits `aion:TtnDeviceMappingAmbiguous` and `aion:PayloadIngestionFailed`, and creates no observations. If a mapping resolves successfully, `aion:TtnDeviceMappingResolved` is emitted and the successful `PayloadIngested` event metadata includes:
+
+- `ttn_mapping_id`
+- `mapping_resolution`: `exact_application_match` or `fallback_device_match`
+- `ttn_device_id`
+- `ttn_application_id`
 
 TTN device and application IDs are preserved in observation and `PayloadIngested` event metadata.
+
+Missing or ambiguous mapping failure event metadata includes:
+
+- `ttn_device_id`
+- `ttn_application_id`
+- `connector_id`
+- `mapping_resolution_error`
 
 TTN mapping events include:
 
 - `aion:TtnDeviceMappingCreated`
+- `aion:TtnDeviceMappingUpdated`
+- `aion:TtnDeviceMappingDeleted`
 - `aion:TtnDeviceMappingEnabled`
 - `aion:TtnDeviceMappingDisabled`
 - `aion:TtnDeviceMappingResolved`
 - `aion:TtnDeviceMappingMissing`
+- `aion:TtnDeviceMappingAmbiguous`
 
 Future TTN adapter behavior should:
 

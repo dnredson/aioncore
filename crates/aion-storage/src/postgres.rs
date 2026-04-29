@@ -232,6 +232,57 @@ fn row_to_ttn_device_mapping(row: Row) -> TtnDeviceMapping {
     }
 }
 
+fn validate_ttn_device_mapping_conflict_postgres(
+    client: &mut Client,
+    mapping: &TtnDeviceMapping,
+) -> StorageResult<()> {
+    if !mapping.enabled {
+        return Ok(());
+    }
+
+    let row = client
+        .query_opt(
+            "
+            SELECT id, tenant_id, connector_id, ttn_application_id, ttn_device_id,
+                producer_entity_id, feature_of_interest_id, enabled, metadata,
+                created_at, updated_at
+            FROM ttn_device_mappings
+            WHERE tenant_id = $1
+                AND connector_id = $2
+                AND id <> $3
+                AND enabled = TRUE
+                AND ttn_device_id = $4
+                AND (
+                    (ttn_application_id IS NULL AND $5::TEXT IS NULL)
+                    OR ttn_application_id = $5
+                )
+            LIMIT 1
+            ",
+            &[
+                &mapping.tenant_id,
+                &mapping.connector_id,
+                &mapping.id,
+                &mapping.ttn_device_id,
+                &mapping.ttn_application_id,
+            ],
+        )
+        .map_err(map_postgres_error)?;
+
+    if row.is_some() {
+        let scope = mapping
+            .ttn_application_id
+            .as_deref()
+            .map(|application_id| format!("application '{application_id}'"))
+            .unwrap_or_else(|| "fallback device".to_string());
+        return Err(StorageError::ConflictWithMessage(format!(
+            "enabled TTN mapping conflict for connector {}, device '{}', {scope}",
+            mapping.connector_id, mapping.ttn_device_id
+        )));
+    }
+
+    Ok(())
+}
+
 fn ingestion_connector_type_to_db(connector_type: &IngestionConnectorType) -> &'static str {
     match connector_type {
         IngestionConnectorType::Http => "http",
@@ -2404,6 +2455,7 @@ impl TtnDeviceMappingStore for PostgresStorage {
         mapping: TtnDeviceMapping,
     ) -> StorageResult<TtnDeviceMapping> {
         self.with_client(|client| {
+            validate_ttn_device_mapping_conflict_postgres(client, &mapping)?;
             let row = client
                 .query_one(
                     "
@@ -2486,6 +2538,7 @@ impl TtnDeviceMappingStore for PostgresStorage {
         mapping: TtnDeviceMapping,
     ) -> StorageResult<TtnDeviceMapping> {
         self.with_client(|client| {
+            validate_ttn_device_mapping_conflict_postgres(client, &mapping)?;
             let row = client
                 .query_opt(
                     "
@@ -2520,6 +2573,29 @@ impl TtnDeviceMappingStore for PostgresStorage {
                 .map_err(map_postgres_error)?;
             row.map(row_to_ttn_device_mapping)
                 .ok_or(StorageError::NotFound)
+        })
+    }
+
+    fn delete_ttn_device_mapping(
+        &self,
+        tenant_id: Uuid,
+        connector_id: Uuid,
+        mapping_id: Uuid,
+    ) -> StorageResult<()> {
+        self.with_client(|client| {
+            let deleted = client
+                .execute(
+                    "
+                    DELETE FROM ttn_device_mappings
+                    WHERE tenant_id = $1 AND connector_id = $2 AND id = $3
+                    ",
+                    &[&tenant_id, &connector_id, &mapping_id],
+                )
+                .map_err(map_postgres_error)?;
+            if deleted == 0 {
+                return Err(StorageError::NotFound);
+            }
+            Ok(())
         })
     }
 
@@ -3726,6 +3802,24 @@ mod tests {
                     .id,
                 generic.id
             );
+            assert!(matches!(
+                store.create_ttn_device_mapping(build_ttn_device_mapping(
+                    tenant.id,
+                    connector.id,
+                    producer.id,
+                    Some(feature.id),
+                    &suffix,
+                    None,
+                )),
+                Err(StorageError::ConflictWithMessage(_))
+            ));
+            store
+                .delete_ttn_device_mapping(tenant.id, connector.id, generic.id)
+                .expect("delete generic mapping");
+            assert!(store
+                .get_ttn_device_mapping(tenant.id, connector.id, generic.id)
+                .expect("get deleted mapping")
+                .is_none());
         }
     }
 

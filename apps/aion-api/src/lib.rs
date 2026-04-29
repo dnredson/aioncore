@@ -27,7 +27,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -355,12 +355,22 @@ struct ResolvedTtnDeviceMapping {
     mapping_id: Uuid,
     ttn_device_id: String,
     ttn_application_id: Option<String>,
+    mapping_resolution: &'static str,
 }
 
 #[derive(Debug, Clone)]
 struct TtnUplinkIds {
     device_id: String,
     application_id: Option<String>,
+}
+
+enum TtnDeviceMappingResolution {
+    Resolved {
+        mapping: TtnDeviceMapping,
+        resolution: &'static str,
+    },
+    Missing,
+    Ambiguous(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,6 +445,20 @@ pub struct CreateTtnDeviceMappingRequest {
     pub metadata: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateTtnDeviceMappingRequest {
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub ttn_application_id: Option<Option<String>>,
+    pub ttn_device_id: Option<String>,
+    pub producer_entity_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub feature_of_interest_id: Option<Option<Uuid>>,
+    pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub metadata: Option<Option<Value>>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TtnDeviceMappingResponse {
     pub id: Uuid,
@@ -448,6 +472,14 @@ pub struct TtnDeviceMappingResponse {
     pub metadata: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Serialize)]
@@ -1087,7 +1119,9 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route(
             "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id",
-            get(get_ttn_device_mapping),
+            get(get_ttn_device_mapping)
+                .patch(update_ttn_device_mapping)
+                .delete(delete_ttn_device_mapping),
         )
         .route(
             "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id/enable",
@@ -2139,6 +2173,11 @@ impl McpToolFailure {
                 status: StatusCode::CONFLICT,
                 code: "conflict".to_string(),
                 message: "record conflicts with existing data".to_string(),
+            },
+            StorageError::ConflictWithMessage(message) => Self {
+                status: StatusCode::CONFLICT,
+                code: "conflict".to_string(),
+                message,
             },
             StorageError::Backend(message) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -3479,6 +3518,68 @@ async fn get_ttn_device_mapping(
     Ok(Json(ttn_device_mapping_response(mapping)))
 }
 
+async fn update_ttn_device_mapping(
+    State(state): State<AppState>,
+    Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateTtnDeviceMappingRequest>,
+) -> Result<Json<TtnDeviceMappingResponse>, ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    ensure_ttn_connector(&connector)?;
+    let mut mapping = state
+        .storage
+        .get_ttn_device_mapping(state.tenant_id, connector_id, mapping_id)?
+        .ok_or_else(ApiError::not_found)?;
+
+    if let Some(producer_entity_id) = request.producer_entity_id {
+        ensure_entity_exists(&state, producer_entity_id)?;
+    }
+    if let Some(Some(feature_of_interest_id)) = request.feature_of_interest_id {
+        ensure_entity_exists(&state, feature_of_interest_id)?;
+    }
+
+    mapping
+        .update_fields(
+            request.ttn_application_id,
+            request.ttn_device_id,
+            request.producer_entity_id,
+            request.feature_of_interest_id,
+            request.enabled,
+            request.metadata,
+            Utc::now(),
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let mapping = state.storage.update_ttn_device_mapping(mapping)?;
+    record_ttn_device_mapping_event(
+        &state,
+        "aion:TtnDeviceMappingUpdated",
+        &mapping,
+        Some("TTN device mapping updated".to_string()),
+    )?;
+    Ok(Json(ttn_device_mapping_response(mapping)))
+}
+
+async fn delete_ttn_device_mapping(
+    State(state): State<AppState>,
+    Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    ensure_ttn_connector(&connector)?;
+    let mapping = state
+        .storage
+        .get_ttn_device_mapping(state.tenant_id, connector_id, mapping_id)?
+        .ok_or_else(ApiError::not_found)?;
+    state
+        .storage
+        .delete_ttn_device_mapping(state.tenant_id, connector_id, mapping_id)?;
+    record_ttn_device_mapping_event(
+        &state,
+        "aion:TtnDeviceMappingDeleted",
+        &mapping,
+        Some("TTN device mapping deleted".to_string()),
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn enable_ttn_device_mapping(
     State(state): State<AppState>,
     Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
@@ -3577,39 +3678,57 @@ async fn ingest_http_for_connector(
         && (producer_entity_id.is_none() || feature_of_interest_id.is_none())
     {
         let ttn_ids = extract_ttn_uplink_ids(&request.payload)?;
-        if let Some(mapping) = state.storage.find_ttn_device_mapping(
-            state.tenant_id,
-            connector.id,
-            ttn_ids.application_id.as_deref(),
-            &ttn_ids.device_id,
-        )? {
-            if producer_entity_id.is_none() {
-                producer_entity_id = Some(mapping.producer_entity_id);
+        match resolve_ttn_device_mapping(&state, connector.id, &ttn_ids)? {
+            TtnDeviceMappingResolution::Resolved {
+                mapping,
+                resolution,
+            } => {
+                if producer_entity_id.is_none() {
+                    producer_entity_id = Some(mapping.producer_entity_id);
+                }
+                if feature_of_interest_id.is_none() {
+                    feature_of_interest_id = mapping.feature_of_interest_id;
+                }
+                resolved_ttn_mapping = Some(ResolvedTtnDeviceMapping {
+                    mapping_id: mapping.id,
+                    ttn_device_id: mapping.ttn_device_id.clone(),
+                    ttn_application_id: mapping.ttn_application_id.clone(),
+                    mapping_resolution: resolution,
+                });
+                record_ttn_device_mapping_event(
+                    &state,
+                    "aion:TtnDeviceMappingResolved",
+                    &mapping,
+                    Some("TTN device mapping resolved".to_string()),
+                )?;
             }
-            if feature_of_interest_id.is_none() {
-                feature_of_interest_id = mapping.feature_of_interest_id;
+            TtnDeviceMappingResolution::Missing if producer_entity_id.is_none() => {
+                return fail_ttn_device_mapping_resolution(
+                    &state,
+                    &connector,
+                    &payload_format,
+                    &protocol,
+                    content_type.clone(),
+                    &request.payload,
+                    &ttn_ids,
+                    "ttn_device_mapping_missing",
+                    "aion:TtnDeviceMappingMissing",
+                );
             }
-            resolved_ttn_mapping = Some(ResolvedTtnDeviceMapping {
-                mapping_id: mapping.id,
-                ttn_device_id: mapping.ttn_device_id.clone(),
-                ttn_application_id: mapping.ttn_application_id.clone(),
-            });
-            record_ttn_device_mapping_event(
-                &state,
-                "aion:TtnDeviceMappingResolved",
-                &mapping,
-                Some("TTN device mapping resolved".to_string()),
-            )?;
-        } else if producer_entity_id.is_none() {
-            return fail_ttn_device_mapping_missing(
-                &state,
-                &connector,
-                &payload_format,
-                &protocol,
-                content_type.clone(),
-                &request.payload,
-                &ttn_ids,
-            );
+            TtnDeviceMappingResolution::Ambiguous(error) if producer_entity_id.is_none() => {
+                return fail_ttn_device_mapping_resolution(
+                    &state,
+                    &connector,
+                    &payload_format,
+                    &protocol,
+                    content_type.clone(),
+                    &request.payload,
+                    &ttn_ids,
+                    &error,
+                    "aion:TtnDeviceMappingAmbiguous",
+                );
+            }
+            TtnDeviceMappingResolution::Missing | TtnDeviceMappingResolution::Ambiguous(_) => {}
         }
     }
 
@@ -3854,6 +3973,7 @@ async fn ingest_http_resolved(
             &mut payload_event_metadata,
             json!({
                 "ttn_mapping_id": mapping.mapping_id,
+                "mapping_resolution": mapping.mapping_resolution,
                 "ttn_device_id": mapping.ttn_device_id,
                 "ttn_application_id": mapping.ttn_application_id
             }),
@@ -3951,7 +4071,60 @@ fn payload_as_json_value(payload: &Value) -> Result<Value, ApiError> {
     }
 }
 
-fn fail_ttn_device_mapping_missing(
+fn resolve_ttn_device_mapping(
+    state: &AppState,
+    connector_id: Uuid,
+    ttn_ids: &TtnUplinkIds,
+) -> Result<TtnDeviceMappingResolution, ApiError> {
+    let mappings = state
+        .storage
+        .list_ttn_device_mappings(state.tenant_id, connector_id)?;
+    let enabled_matches = mappings
+        .into_iter()
+        .filter(|mapping| mapping.enabled && mapping.ttn_device_id == ttn_ids.device_id)
+        .collect::<Vec<_>>();
+
+    if let Some(application_id) = ttn_ids.application_id.as_deref() {
+        let exact = enabled_matches
+            .iter()
+            .filter(|mapping| mapping.ttn_application_id.as_deref() == Some(application_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if exact.len() > 1 {
+            return Ok(TtnDeviceMappingResolution::Ambiguous(format!(
+                "ambiguous_exact_application_mapping: multiple enabled TTN mappings found for connector {connector_id}, device '{}', application '{}'",
+                ttn_ids.device_id, application_id
+            )));
+        }
+        if let Some(mapping) = exact.into_iter().next() {
+            return Ok(TtnDeviceMappingResolution::Resolved {
+                mapping,
+                resolution: "exact_application_match",
+            });
+        }
+    }
+
+    let fallback = enabled_matches
+        .into_iter()
+        .filter(|mapping| mapping.ttn_application_id.is_none())
+        .collect::<Vec<_>>();
+    if fallback.len() > 1 {
+        return Ok(TtnDeviceMappingResolution::Ambiguous(format!(
+            "ambiguous_fallback_device_mapping: multiple enabled fallback TTN mappings found for connector {connector_id}, device '{}'",
+            ttn_ids.device_id
+        )));
+    }
+    if let Some(mapping) = fallback.into_iter().next() {
+        return Ok(TtnDeviceMappingResolution::Resolved {
+            mapping,
+            resolution: "fallback_device_match",
+        });
+    }
+
+    Ok(TtnDeviceMappingResolution::Missing)
+}
+
+fn fail_ttn_device_mapping_resolution(
     state: &AppState,
     connector: &IngestionConnector,
     payload_format: &str,
@@ -3959,6 +4132,8 @@ fn fail_ttn_device_mapping_missing(
     content_type: Option<String>,
     payload: &Value,
     ttn_ids: &TtnUplinkIds,
+    mapping_resolution_error: &str,
+    event_type: &'static str,
 ) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
     let received_at = Utc::now();
     let source_ref = connector
@@ -3976,7 +4151,7 @@ fn fail_ttn_device_mapping_missing(
         "decoder_metadata": {
             "decoder": payload_format,
             "mapping_source": "ttn_device_mapping",
-            "reason": "ttn_device_mapping_missing"
+            "reason": mapping_resolution_error
         },
         "ttn_device_id": ttn_ids.device_id,
         "ttn_application_id": ttn_ids.application_id
@@ -4013,8 +4188,8 @@ fn fail_ttn_device_mapping_missing(
     raw_message = state.storage.store_raw_message(raw_message)?;
 
     let message = format!(
-        "no enabled TTN device mapping found for connector {} and device {}",
-        connector.id, ttn_ids.device_id
+        "TTN device mapping resolution failed for connector {} and device {}: {}",
+        connector.id, ttn_ids.device_id, mapping_resolution_error
     );
     state
         .storage
@@ -4022,15 +4197,17 @@ fn fail_ttn_device_mapping_missing(
     let event_metadata = metadata_with_connector(
         json!({
             "payload_format": payload_format,
-            "reason": "ttn_device_mapping_missing",
+            "reason": mapping_resolution_error,
             "ttn_device_id": ttn_ids.device_id,
-            "ttn_application_id": ttn_ids.application_id
+            "ttn_application_id": ttn_ids.application_id,
+            "connector_id": connector.id,
+            "mapping_resolution_error": mapping_resolution_error
         }),
         connector_metadata,
     );
     record_ingest_event_optional(
         state,
-        "aion:TtnDeviceMappingMissing",
+        event_type,
         EventSeverity::Error,
         None,
         None,
@@ -6515,6 +6692,10 @@ impl From<StorageError> for ApiError {
             StorageError::Conflict => Self {
                 status: StatusCode::CONFLICT,
                 message: value.to_string(),
+            },
+            StorageError::ConflictWithMessage(message) => Self {
+                status: StatusCode::CONFLICT,
+                message,
             },
             StorageError::InvalidInput(message) => Self::bad_request(message),
             StorageError::Backend(message) => Self {
@@ -9282,6 +9463,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_enabled_ttn_mapping_is_rejected() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-dup-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-dup-plot-01", "aion:Plot").await;
+        let connector = create_ttn_connector_with_defaults(&app, "ttn-dup-map", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        create_ttn_device_mapping(
+            &app,
+            connector_id,
+            Some("farm-app"),
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings"),
+                json!({
+                    "ttn_application_id": "farm-app",
+                    "ttn_device_id": "soil-node-01",
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = to_json(response).await;
+        assert!(error["error"]
+            .as_str()
+            .unwrap()
+            .contains("enabled TTN mapping conflict"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_enabled_fallback_ttn_mapping_is_rejected() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-dup-fallback-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-dup-fallback-plot-01", "aion:Plot").await;
+        let connector =
+            create_ttn_connector_with_defaults(&app, "ttn-dup-fallback-map", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        create_ttn_device_mapping(
+            &app,
+            connector_id,
+            None,
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings"),
+                json!({
+                    "ttn_device_id": "soil-node-01",
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = to_json(response).await;
+        assert!(error["error"].as_str().unwrap().contains("fallback device"));
+    }
+
+    #[tokio::test]
     async fn ttn_ingestion_without_producer_resolves_via_mapping() {
         let app = app();
         let sensor_id = create_test_entity(&app, "ttn-map-resolve-sensor-01", "aion:Sensor").await;
@@ -9329,6 +9587,10 @@ mod tests {
             .find(|event| event["event_type"] == "aion:PayloadIngested")
             .unwrap();
         assert_eq!(ingested["metadata"]["ttn_mapping_id"], mapping_id);
+        assert_eq!(
+            ingested["metadata"]["mapping_resolution"],
+            "exact_application_match"
+        );
         assert_eq!(ingested["metadata"]["ttn_device_id"], "soil-node-01");
         assert_eq!(ingested["metadata"]["ttn_application_id"], "farm-app");
         let resolved = query_events_by_type(&app, "aion:TtnDeviceMappingResolved").await;
@@ -9434,6 +9696,12 @@ mod tests {
         let missing = query_events_by_type(&app, "aion:TtnDeviceMappingMissing").await;
         assert_eq!(missing.as_array().unwrap().len(), 1);
         assert_eq!(missing[0]["metadata"]["ttn_device_id"], "soil-node-01");
+        assert_eq!(missing[0]["metadata"]["ttn_application_id"], "farm-app");
+        assert_eq!(missing[0]["metadata"]["connector_id"], connector_id);
+        assert_eq!(
+            missing[0]["metadata"]["mapping_resolution_error"],
+            "ttn_device_mapping_missing"
+        );
         let observations = query_observations_by_feature(&app, &Uuid::new_v4().to_string()).await;
         assert!(observations.as_array().unwrap().is_empty());
     }
@@ -9543,6 +9811,144 @@ mod tests {
             .find(|event| event["event_type"] == "aion:PayloadIngested")
             .unwrap();
         assert_eq!(ingested["metadata"]["ttn_mapping_id"], app_mapping["id"]);
+        assert_eq!(
+            ingested["metadata"]["mapping_resolution"],
+            "exact_application_match"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_ttn_mapping_resolves_when_application_does_not_match() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-fallback-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-fallback-plot-01", "aion:Plot").await;
+        let connector =
+            create_ttn_connector_with_defaults(&app, "ttn-fallback-map", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        let mapping = create_ttn_device_mapping(
+            &app,
+            connector_id,
+            None,
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+        let events = query_events_by_raw_message(&app, raw_message_id).await;
+        let ingested = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "aion:PayloadIngested")
+            .unwrap();
+        assert_eq!(ingested["metadata"]["ttn_mapping_id"], mapping["id"]);
+        assert_eq!(
+            ingested["metadata"]["mapping_resolution"],
+            "fallback_device_match"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_ttn_mapping_change_resolution() {
+        let app = app();
+        let first_sensor = create_test_entity(&app, "ttn-update-sensor-01", "aion:Sensor").await;
+        let second_sensor = create_test_entity(&app, "ttn-update-sensor-02", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-update-plot-01", "aion:Plot").await;
+        let connector =
+            create_ttn_connector_with_defaults(&app, "ttn-update-map", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        let mapping = create_ttn_device_mapping(
+            &app,
+            connector_id,
+            Some("farm-app"),
+            "soil-node-01",
+            &first_sensor,
+            Some(&plot_id),
+        )
+        .await;
+        let mapping_id = mapping["id"].as_str().unwrap();
+
+        let update_response = app
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}"),
+                json!({
+                    "producer_entity_id": second_sensor,
+                    "metadata": {
+                        "source": "updated"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let updated = to_json(update_response).await;
+        assert_eq!(updated["producer_entity_id"], second_sensor);
+        assert_eq!(updated["metadata"]["source"], "updated");
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ingest = to_json(response).await;
+        assert!(ingest["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|observation| observation["producer_entity_id"] == second_sensor));
+
+        let delete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": ttn_uplink_payload()
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
