@@ -212,9 +212,11 @@ Connector secret rows include:
 - optional JSONB metadata
 - timestamps
 
-The API treats `secret_value` as write-only and never returns it in create/get/list responses. Event metadata, worker status, readiness, connector responses, raw-message headers, and debug output must not include secret values.
+The API treats `secret_value` as write-only and never returns it in create/get/list responses. Event metadata, worker status, readiness, connector validation responses, raw-message headers, and debug output must not include secret values.
 
 This milestone deliberately does not implement encryption, KMS, Vault, rotation, access policy, TLS/mTLS, or per-device MQTT authorization. The stored value is suitable for local-development and adapter-plumbing validation only. Production deployments should replace or harden this with an external secret manager and encrypted-at-rest behavior.
+
+TTN credential validation can report non-secret diagnostics such as `secret_type`, username presence, and whether an internal secret value exists, but it must not expose the value itself. Connector secrets remain a local-development friendly reference mechanism, not a production secret manager.
 
 The `ttn-v3` connector profile configuration is persisted, including broker URL, topic filter, payload format, and metadata. Full TTN adapter behavior remains future work.
 

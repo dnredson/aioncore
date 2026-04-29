@@ -138,7 +138,10 @@ For `connector_profile = "ttn-v3"`, validation is deterministic and non-network.
 - `mapping_count`
 - `enabled_mapping_count`
 - `has_secret_ref`
+- `secret_configured`
+- `secret_type`
 - `payload_format_supported`
+- `operator_hints`
 - `generated_at`
 
 Blocking TTN validation issues include:
@@ -148,6 +151,10 @@ Blocking TTN validation issues include:
 - `missing_topic_filter`: no topic filter is configured.
 - `implausible_ttn_topic_filter`: topic filter does not look like a The Things Stack uplink topic.
 - `unsupported_ttn_payload_format`: payload format is not `ttn-uplink-json`.
+- `secret_ref_not_found`: `secret_ref_id` does not reference an existing connector secret.
+- `incompatible_secret_type`: referenced secret is not compatible with TTN MQTT basic auth.
+- `missing_secret_username`: referenced `mqtt_basic_auth` secret does not include a username.
+- `missing_secret_value`: referenced secret has no internal secret value.
 
 The accepted TTN topic shape is intentionally simple and non-network: the topic filter should contain `v3/`, `/devices/`, and `/up`, such as `v3/{application_id}/devices/+/up`.
 
@@ -155,8 +162,18 @@ TTN validation warnings include:
 
 - `missing_ttn_device_mappings`: no TTN device mappings exist for the connector.
 - `no_enabled_ttn_device_mappings`: mappings exist, but none are enabled.
-- `missing_secret_ref_for_public_ttn_broker`: broker URL looks like a public TTN/The Things Stack endpoint and no connector secret reference is set.
+- `missing_secret_ref`: broker URL looks like a public TTN/The Things Stack endpoint and no connector secret reference is set.
 - `connector_disabled`: the connector is disabled.
+
+TTN credential diagnostics are redacted. Validation may report `secret_configured`, `secret_type`, and whether username/type/value shape is usable, but it never returns `secret_value`. Public TTN/The Things Stack MQTT endpoints commonly require credentials. AionCore expects those credentials to be stored through connector secrets, typically with `secret_type = "mqtt_basic_auth"`, a deployment/application-specific MQTT username, and a password or API token stored as the write-only `secret_value`.
+
+TTN validation responses include generic `operator_hints`:
+
+- public TTN/The Things Stack MQTT brokers typically require authentication;
+- usernames are usually application-specific and may include tenant or deployment context;
+- passwords or API tokens should be stored as connector secrets;
+- topic filters should match the application/device uplink topic shape;
+- this milestone performs no live credential or broker verification.
 
 Validation readiness is derived from issues and warnings:
 

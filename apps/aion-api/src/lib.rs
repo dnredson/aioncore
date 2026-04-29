@@ -523,7 +523,10 @@ pub struct TtnConnectorValidation {
     pub mapping_count: usize,
     pub enabled_mapping_count: usize,
     pub has_secret_ref: bool,
+    pub secret_configured: bool,
+    pub secret_type: Option<ConnectorSecretType>,
     pub payload_format_supported: bool,
+    pub operator_hints: Vec<String>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -4475,6 +4478,9 @@ fn connector_validation(
         .as_deref()
         .map(is_ttn_uplink_payload_format)
         .unwrap_or(false);
+    let mut secret_configured = false;
+    let mut secret_type = None;
+    let mut operator_hints = Vec::new();
 
     if connector.connector_profile != ConnectorProfile::TtnV3 {
         warnings.push(ttn_validation_issue(
@@ -4482,6 +4488,7 @@ fn connector_validation(
             "profile-specific validation is currently available only for ttn-v3 connectors",
         ));
     } else {
+        operator_hints.extend(ttn_operator_hints());
         if connector.connector_type != IngestionConnectorType::Mqtt {
             issues.push(ttn_validation_issue(
                 "invalid_connector_type",
@@ -4539,9 +4546,57 @@ fn connector_validation(
             && connector.secret_ref_id.is_none()
         {
             warnings.push(ttn_validation_issue(
-                "missing_secret_ref_for_public_ttn_broker",
+                "missing_secret_ref",
                 "public TTN/The Things Stack brokers usually require MQTT authentication; configure secret_ref_id before live operation",
             ));
+        }
+        if let Some(secret_ref_id) = connector.secret_ref_id {
+            match state
+                .storage
+                .get_connector_secret(state.tenant_id, secret_ref_id)?
+            {
+                Some(secret) => {
+                    secret_type = Some(secret.secret_type.clone());
+                    let has_secret_value = !secret.secret_value.is_empty();
+                    if secret.secret_type != ConnectorSecretType::MqttBasicAuth {
+                        issues.push(ttn_validation_issue(
+                            "incompatible_secret_type",
+                            "TTN v3 MQTT authentication currently expects a mqtt_basic_auth connector secret",
+                        ));
+                    }
+                    if secret.secret_type == ConnectorSecretType::MqttBasicAuth
+                        && secret
+                            .username
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_none()
+                    {
+                        issues.push(ttn_validation_issue(
+                            "missing_secret_username",
+                            "TTN v3 mqtt_basic_auth secrets should include the MQTT username/application identifier",
+                        ));
+                    }
+                    if !has_secret_value {
+                        issues.push(ttn_validation_issue(
+                            "missing_secret_value",
+                            "referenced connector secret does not contain an internal secret value",
+                        ));
+                    }
+                    secret_configured = secret.secret_type == ConnectorSecretType::MqttBasicAuth
+                        && secret
+                            .username
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_some()
+                        && has_secret_value;
+                }
+                None => issues.push(ttn_validation_issue(
+                    "secret_ref_not_found",
+                    "connector secret_ref_id does not reference an existing connector secret",
+                )),
+            }
         }
         if !connector.enabled {
             warnings.push(ttn_validation_issue(
@@ -4575,7 +4630,10 @@ fn connector_validation(
         mapping_count,
         enabled_mapping_count,
         has_secret_ref: connector.secret_ref_id.is_some(),
+        secret_configured,
+        secret_type,
         payload_format_supported,
+        operator_hints,
         generated_at: Utc::now(),
     })
 }
@@ -4588,6 +4646,16 @@ fn ttn_validation_issue(
         code: code.into(),
         message: message.into(),
     }
+}
+
+fn ttn_operator_hints() -> Vec<String> {
+    vec![
+        "Public TTN/The Things Stack MQTT brokers typically require authentication.".to_string(),
+        "The MQTT username is usually application-specific and may include tenant or deployment context.".to_string(),
+        "Store the MQTT password or API token as a connector secret; validation never returns secret_value.".to_string(),
+        "Use a topic_filter shaped like v3/{application_id}/devices/{device_id}/up or v3/{application_id}/devices/+/up.".to_string(),
+        "No live credential or broker verification is performed by this validation endpoint.".to_string(),
+    ]
 }
 
 fn is_plausible_ttn_topic_filter(topic_filter: &str) -> bool {
@@ -10318,9 +10386,123 @@ mod tests {
         .await;
 
         let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
-        assert!(validation_issue_codes(&validation, "warnings")
-            .contains(&"missing_secret_ref_for_public_ttn_broker"));
+        assert!(validation_issue_codes(&validation, "warnings").contains(&"missing_secret_ref"));
         assert_eq!(validation["has_secret_ref"], false);
+        assert_eq!(validation["secret_configured"], false);
+    }
+
+    #[tokio::test]
+    async fn ttn_connector_validation_reports_missing_secret_reference() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        let mut connector = IngestionConnector::new(
+            state.tenant_id,
+            "ttn-missing-secret-ref",
+            IngestionConnectorType::Mqtt,
+            ConnectorProfile::TtnV3,
+            true,
+            None,
+            None,
+            None,
+            Some("mqtt://eu1.cloud.thethings.network:1883".to_string()),
+            Some("ttn-missing-secret-ref-client".to_string()),
+            Some("v3/demo-app/devices/+/up".to_string()),
+            None,
+            Some("ttn-uplink-json".to_string()),
+            None,
+            None,
+            None,
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+        connector.secret_ref_id = Some(Uuid::new_v4());
+        let connector = state
+            .storage
+            .create_ingestion_connector(connector)
+            .expect("create connector with missing secret ref");
+
+        let validation = validate_connector(&app, &connector.id.to_string()).await;
+        assert_eq!(validation["valid"], false);
+        assert_eq!(validation["readiness"], "invalid");
+        assert!(validation_issue_codes(&validation, "issues").contains(&"secret_ref_not_found"));
+        assert_eq!(validation["secret_configured"], false);
+    }
+
+    #[tokio::test]
+    async fn ttn_connector_validation_reports_incompatible_secret_type() {
+        let app = app();
+        let secret = create_connector_secret_with_type(
+            &app,
+            "ttn-token-secret",
+            "token",
+            Some("token-user"),
+            "secret-pass",
+        )
+        .await;
+        let connector = create_ttn_connector_with_secret(
+            &app,
+            "ttn-incompatible-secret",
+            secret["id"].as_str().unwrap(),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["secret_type"], "token");
+        assert_eq!(validation["secret_configured"], false);
+        assert!(validation_issue_codes(&validation, "issues").contains(&"incompatible_secret_type"));
+        assert!(!validation.to_string().contains("secret-pass"));
+    }
+
+    #[tokio::test]
+    async fn ttn_connector_validation_reports_missing_secret_username() {
+        let app = app();
+        let secret = create_connector_secret_with_type(
+            &app,
+            "ttn-no-username-secret",
+            "mqtt_basic_auth",
+            None,
+            "secret-pass",
+        )
+        .await;
+        let connector = create_ttn_connector_with_secret(
+            &app,
+            "ttn-missing-secret-username",
+            secret["id"].as_str().unwrap(),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["secret_type"], "mqtt_basic_auth");
+        assert_eq!(validation["secret_configured"], false);
+        assert!(validation_issue_codes(&validation, "issues").contains(&"missing_secret_username"));
+        assert!(!validation.to_string().contains("secret-pass"));
+    }
+
+    #[tokio::test]
+    async fn ttn_connector_validation_reports_configured_basic_auth_secret_without_value_leak() {
+        let app = app();
+        let secret = create_connector_secret_with_type(
+            &app,
+            "ttn-basic-auth-secret",
+            "mqtt_basic_auth",
+            Some("farm-app@tenant"),
+            "secret-pass",
+        )
+        .await;
+        let connector = create_ttn_connector_with_secret(
+            &app,
+            "ttn-valid-secret",
+            secret["id"].as_str().unwrap(),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["has_secret_ref"], true);
+        assert_eq!(validation["secret_configured"], true);
+        assert_eq!(validation["secret_type"], "mqtt_basic_auth");
+        assert!(!validation.to_string().contains("secret-pass"));
+        assert!(!validation["operator_hints"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -10360,6 +10542,7 @@ mod tests {
         let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
         assert_eq!(validation["valid"], true);
         assert_eq!(validation["detected_profile"], "generic-mqtt");
+        assert!(validation["operator_hints"].as_array().unwrap().is_empty());
         assert!(validation_issue_codes(&validation, "warnings")
             .contains(&"profile_specific_validation_unavailable"));
     }
@@ -10872,6 +11055,41 @@ mod tests {
         let connector = to_json(response).await;
         assert_eq!(connector["secret_ref_id"], secret_id);
         assert_ne!(connector.to_string().contains("secret-pass"), true);
+    }
+
+    #[tokio::test]
+    async fn worker_status_and_readiness_do_not_expose_secret_value() {
+        let app = app();
+        let secret =
+            create_connector_secret(&app, "status-broker-secret", "mqtt-user", "secret-pass").await;
+        let secret_id = secret["id"].as_str().unwrap();
+        create_mqtt_connector_with_secret(
+            &app,
+            "mqtt-status-secret-ref",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+            Some(secret_id),
+        )
+        .await;
+
+        let status = get_worker_status(&app).await;
+        let ready_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_response.status(), StatusCode::OK);
+        let ready = to_json(ready_response).await;
+
+        assert!(!status.to_string().contains("secret-pass"));
+        assert!(!ready.to_string().contains("secret-pass"));
     }
 
     #[tokio::test]
@@ -12421,6 +12639,35 @@ mod tests {
         to_json(response).await
     }
 
+    async fn create_ttn_connector_with_secret(
+        app: &Router,
+        connector_key: &str,
+        secret_ref_id: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": connector_key,
+                    "connector_type": "mqtt",
+                    "connector_profile": "ttn-v3",
+                    "enabled": true,
+                    "broker_url": "mqtt://eu1.cloud.thethings.network:1883",
+                    "client_id": format!("{connector_key}-client"),
+                    "topic_filter": "v3/demo-app/devices/+/up",
+                    "payload_format": "ttn-uplink-json",
+                    "secret_ref_id": secret_ref_id
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
     async fn create_ttn_device_mapping(
         app: &Router,
         connector_id: &str,
@@ -12564,6 +12811,23 @@ mod tests {
         username: &str,
         secret_value: &str,
     ) -> Value {
+        create_connector_secret_with_type(
+            app,
+            secret_key,
+            "mqtt_basic_auth",
+            Some(username),
+            secret_value,
+        )
+        .await
+    }
+
+    async fn create_connector_secret_with_type(
+        app: &Router,
+        secret_key: &str,
+        secret_type: &str,
+        username: Option<&str>,
+        secret_value: &str,
+    ) -> Value {
         let response = app
             .clone()
             .oneshot(json_request(
@@ -12571,7 +12835,7 @@ mod tests {
                 "/secrets/connectors",
                 json!({
                     "secret_key": secret_key,
-                    "secret_type": "mqtt_basic_auth",
+                    "secret_type": secret_type,
                     "username": username,
                     "secret_value": secret_value,
                     "metadata": {"suite": "api"}

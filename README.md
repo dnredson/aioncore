@@ -391,6 +391,9 @@ $validation.issues
 $validation.warnings
 $validation.mapping_count
 $validation.enabled_mapping_count
+$validation.secret_configured
+$validation.secret_type
+$validation.operator_hints
 ```
 
 Validation readiness is configuration-oriented:
@@ -420,6 +423,45 @@ Invoke-RestMethod `
   -Method Get `
   -Uri "http://localhost:8080/ingestion/connectors/$($ttnNoMappings.id)/validate"
 ```
+
+Create a connector secret for TTN MQTT basic auth, attach it to the TTN connector, and validate again:
+
+```powershell
+$ttnSecret = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/secrets/connectors" `
+  -ContentType "application/json" `
+  -Body (@{
+    secret_key = "ttn-demo-mqtt-auth"
+    secret_type = "mqtt_basic_auth"
+    username = "demo-application@tenant"
+    secret_value = "replace-with-ttn-api-key-or-password"
+    metadata = @{
+      purpose = "ttn-mqtt-auth"
+    }
+  } | ConvertTo-Json -Depth 8)
+
+$ttnSecret.secret_value
+
+$ttnConnector = Invoke-RestMethod `
+  -Method Patch `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)" `
+  -ContentType "application/json" `
+  -Body (@{
+    secret_ref_id = $ttnSecret.id
+  } | ConvertTo-Json -Depth 8)
+
+$credentialValidation = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/validate"
+
+$credentialValidation.secret_configured
+$credentialValidation.secret_type
+$credentialValidation.operator_hints
+$credentialValidation | ConvertTo-Json -Depth 8
+```
+
+`$ttnSecret.secret_value` is empty because secret values are write-only in API responses. Validation reports whether a secret is configured and its non-secret type, but never returns the stored password/token.
 
 Update and delete mappings explicitly:
 
