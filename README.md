@@ -305,9 +305,37 @@ $reconcile = Invoke-RestMethod `
 $reconcile.actions
 ```
 
-Startup reconciliation loads persisted enabled connectors. Runtime reconciliation handles connector lifecycle changes after startup. There is not yet a general connector update endpoint, so config-change restarts are limited to future update support and internal reconciliation comparisons.
+Startup reconciliation loads persisted enabled connectors. Runtime reconciliation handles connector lifecycle changes after startup. Connector configuration can be updated with `PATCH /ingestion/connectors/{connector_id}`; immutable identity fields such as `id`, `tenant_id`, `connector_key`, `connector_type`, and `connector_profile` are not accepted by the update body.
 
-`/ingestion/workers/status` reports `planned`, `starting`, `running`, `stopped`, `degraded`, `skipped`, `invalid`, `error`, or `unsupported` per connector. Status entries include `started_at`, `stopped_at`, `restart_count`, and `last_reconciled_at`. `/ready` includes `connector_workers.total`, `running`, `stopped`, `degraded`, `skipped`, `invalid`, and `errors`; connector worker issues do not replace the existing storage/env-var MQTT readiness rules.
+Update a dynamic MQTT connector and inspect the runtime restart/status fields:
+
+```powershell
+$updated = Invoke-RestMethod `
+  -Method Patch `
+  -Uri "http://localhost:8080/ingestion/connectors/$($genericMqttConnector.id)" `
+  -ContentType "application/json" `
+  -Body (@{
+    topic_filter = "farm/+/telemetry"
+    broker_url = "mqtt://127.0.0.1:1883"
+    payload_format = "senml-json"
+  } | ConvertTo-Json -Depth 8)
+
+$status = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/workers/status"
+
+$status.workers | Select-Object connector_key,status,restart_count,reconnect_attempts,last_disconnect_at,last_reconnect_at,next_reconnect_at,last_error
+```
+
+If a manual refresh is needed, call reconciliation explicitly:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/workers/reconcile"
+```
+
+`/ingestion/workers/status` reports `planned`, `starting`, `running`, `reconnecting`, `stopped`, `degraded`, `skipped`, `invalid`, `error`, or `unsupported` per connector. Status entries include `started_at`, `stopped_at`, `restart_count`, `reconnect_attempts`, `last_disconnect_at`, `last_reconnect_at`, `next_reconnect_at`, `last_error`, and `last_reconciled_at`. Connector MQTT workers retry broker disconnects and event-loop failures with bounded exponential backoff from 1 second up to 60 seconds. `/ready` includes `connector_workers.total`, `running`, `stopped`, `degraded`, `skipped`, `invalid`, and `errors`; connector worker issues do not replace the existing storage/env-var MQTT readiness rules.
 
 Example test publish for a connector using the generic AionCore MQTT topic convention:
 

@@ -25,7 +25,7 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -369,6 +369,24 @@ pub struct CreateIngestionConnectorRequest {
     pub metadata: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateIngestionConnectorRequest {
+    pub display_name: Option<String>,
+    pub enabled: Option<bool>,
+    pub protocol: Option<String>,
+    pub endpoint: Option<String>,
+    pub broker_url: Option<String>,
+    pub client_id: Option<String>,
+    pub topic_filter: Option<String>,
+    pub http_path: Option<String>,
+    pub payload_format: Option<String>,
+    pub content_type: Option<String>,
+    pub default_producer_entity_id: Option<Uuid>,
+    pub default_feature_of_interest_id: Option<Uuid>,
+    pub metadata: Option<Value>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IngestionConnectorStatusResponse {
     pub connector_id: Uuid,
@@ -450,6 +468,7 @@ pub enum ConnectorWorkerRuntimeState {
     Planned,
     Starting,
     Running,
+    Reconnecting,
     Degraded,
     Stopped,
     Skipped,
@@ -482,6 +501,10 @@ pub struct ConnectorWorkerRuntimeStatus {
     pub started_at: Option<DateTime<Utc>>,
     pub stopped_at: Option<DateTime<Utc>>,
     pub restart_count: u32,
+    pub reconnect_attempts: u32,
+    pub last_disconnect_at: Option<DateTime<Utc>>,
+    pub last_reconnect_at: Option<DateTime<Utc>>,
+    pub next_reconnect_at: Option<DateTime<Utc>>,
     pub last_reconciled_at: Option<DateTime<Utc>>,
     pub validation_issues: Vec<IngestionWorkerValidationIssue>,
     pub metadata: Option<Value>,
@@ -971,7 +994,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route(
             "/ingestion/connectors/:connector_id",
-            get(get_ingestion_connector),
+            get(get_ingestion_connector).patch(update_ingestion_connector),
         )
         .route(
             "/ingestion/connectors/:connector_id/enable",
@@ -3124,6 +3147,66 @@ async fn get_ingestion_connector(
     Ok(Json(get_connector(&state, connector_id)?))
 }
 
+async fn update_ingestion_connector(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+    Json(request): Json<UpdateIngestionConnectorRequest>,
+) -> Result<Json<IngestionConnector>, ApiError> {
+    let mut connector = get_connector(&state, connector_id)?;
+    let now = Utc::now();
+
+    if let Some(display_name) = request.display_name {
+        connector.display_name = Some(display_name);
+    }
+    if let Some(enabled) = request.enabled {
+        connector.enabled = enabled;
+    }
+    if let Some(protocol) = request.protocol {
+        connector.protocol = Some(protocol);
+    }
+    if let Some(endpoint) = request.endpoint {
+        connector.endpoint = Some(endpoint);
+    }
+    if let Some(broker_url) = request.broker_url {
+        connector.broker_url = Some(broker_url);
+    }
+    if let Some(client_id) = request.client_id {
+        connector.client_id = Some(client_id);
+    }
+    if let Some(topic_filter) = request.topic_filter {
+        connector.topic_filter = Some(topic_filter);
+    }
+    if let Some(http_path) = request.http_path {
+        connector.http_path = Some(http_path);
+    }
+    if let Some(payload_format) = request.payload_format {
+        connector.payload_format = Some(payload_format);
+    }
+    if let Some(content_type) = request.content_type {
+        connector.content_type = Some(content_type);
+    }
+    if let Some(default_producer_entity_id) = request.default_producer_entity_id {
+        connector.default_producer_entity_id = Some(default_producer_entity_id);
+    }
+    if let Some(default_feature_of_interest_id) = request.default_feature_of_interest_id {
+        connector.default_feature_of_interest_id = Some(default_feature_of_interest_id);
+    }
+    if let Some(metadata) = request.metadata {
+        connector.metadata = Some(metadata);
+    }
+    connector.updated_at = now;
+
+    let connector = state.storage.update_ingestion_connector(connector)?;
+    record_connector_event(
+        &state,
+        "aion:IngestionConnectorUpdated",
+        &connector,
+        Some("Ingestion connector updated".to_string()),
+    )?;
+    reconcile_connector_workers_after_mutation(&state).await;
+    Ok(Json(connector))
+}
+
 async fn enable_ingestion_connector(
     State(state): State<AppState>,
     Path(connector_id): Path<Uuid>,
@@ -3628,6 +3711,7 @@ fn connector_runtime_state_label(status: &ConnectorWorkerRuntimeState) -> &'stat
         ConnectorWorkerRuntimeState::Planned => "planned",
         ConnectorWorkerRuntimeState::Starting => "starting",
         ConnectorWorkerRuntimeState::Running => "ready",
+        ConnectorWorkerRuntimeState::Reconnecting => "reconnecting",
         ConnectorWorkerRuntimeState::Degraded => "degraded",
         ConnectorWorkerRuntimeState::Stopped => "stopped",
         ConnectorWorkerRuntimeState::Skipped => "skipped",
@@ -4276,6 +4360,10 @@ fn connector_runtime_status_from_spec(spec: &IngestionWorkerSpec) -> ConnectorWo
         started_at: None,
         stopped_at: None,
         restart_count: 0,
+        reconnect_attempts: 0,
+        last_disconnect_at: None,
+        last_reconnect_at: None,
+        next_reconnect_at: None,
         last_reconciled_at: None,
         validation_issues: spec.validation_issues.clone(),
         metadata: spec.metadata.clone(),
@@ -4337,7 +4425,13 @@ fn connector_workers_readiness_from_workers(
             .count(),
         degraded: workers
             .iter()
-            .filter(|worker| worker.status == ConnectorWorkerRuntimeState::Degraded)
+            .filter(|worker| {
+                matches!(
+                    worker.status,
+                    ConnectorWorkerRuntimeState::Degraded
+                        | ConnectorWorkerRuntimeState::Reconnecting
+                )
+            })
             .count(),
         stopped: workers
             .iter()
@@ -4357,6 +4451,7 @@ fn connector_workers_readiness_from_workers(
                 matches!(
                     worker.status,
                     ConnectorWorkerRuntimeState::Degraded
+                        | ConnectorWorkerRuntimeState::Reconnecting
                         | ConnectorWorkerRuntimeState::Invalid
                         | ConnectorWorkerRuntimeState::Error
                 )
@@ -4579,10 +4674,14 @@ fn mark_connector_worker_connected(state: &AppState, connector_id: Uuid) {
 
 fn mark_connector_worker_subscribed(state: &AppState, connector_id: Uuid) {
     update_connector_worker_runtime_status(state, connector_id, |worker| {
+        if worker.reconnect_attempts > 0 {
+            worker.last_reconnect_at = Some(Utc::now());
+        }
         worker.status = ConnectorWorkerRuntimeState::Running;
         worker.connected = true;
         worker.subscribed = true;
         worker.last_error = None;
+        worker.next_reconnect_at = None;
     });
 }
 
@@ -4592,8 +4691,28 @@ fn mark_connector_worker_failure(state: &AppState, connector_id: Uuid, message: 
         worker.connected = false;
         worker.subscribed = false;
         worker.last_error = Some(message);
+        worker.last_disconnect_at = Some(Utc::now());
         worker.last_failed_ingest_at = Some(Utc::now());
     });
+}
+
+fn mark_connector_worker_reconnect_scheduled(
+    state: &AppState,
+    connector_id: Uuid,
+    message: String,
+    delay: std::time::Duration,
+) -> DateTime<Utc> {
+    let next_reconnect_at =
+        Utc::now() + Duration::from_std(delay).unwrap_or_else(|_| Duration::seconds(60));
+    update_connector_worker_runtime_status(state, connector_id, |worker| {
+        worker.status = ConnectorWorkerRuntimeState::Reconnecting;
+        worker.connected = false;
+        worker.subscribed = false;
+        worker.reconnect_attempts = worker.reconnect_attempts.saturating_add(1);
+        worker.last_error = Some(message);
+        worker.next_reconnect_at = Some(next_reconnect_at);
+    });
+    next_reconnect_at
 }
 
 fn mark_connector_worker_message(state: &AppState, connector_id: Uuid) {
@@ -8745,6 +8864,239 @@ mod tests {
             ConnectorWorkerRuntimeState::Invalid
         );
         assert!(status.workers[0].last_reconciled_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn patch_connector_updates_runtime_fields() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "mqtt-update-fields",
+            "generic-mqtt",
+            false,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/ingestion/connectors/{connector_id}"),
+                json!({
+                    "display_name": "Updated MQTT",
+                    "enabled": true,
+                    "broker_url": "mqtt://127.0.0.1:1884",
+                    "topic_filter": "farm/+/telemetry",
+                    "payload_format": "senml-json",
+                    "metadata": {"site": "north"}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body["display_name"], "Updated MQTT");
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["broker_url"], "mqtt://127.0.0.1:1884");
+        assert_eq!(body["topic_filter"], "farm/+/telemetry");
+        assert_eq!(body["payload_format"], "senml-json");
+        assert_eq!(body["metadata"]["site"], "north");
+    }
+
+    #[tokio::test]
+    async fn patch_connector_rejects_immutable_identity_fields() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "mqtt-update-immutable",
+            "generic-mqtt",
+            false,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/ingestion/connectors/{connector_id}"),
+                json!({
+                    "connector_key": "changed"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn patch_invalid_connector_triggers_reconciliation_status() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        let connector = create_mqtt_connector(
+            &app,
+            "mqtt-update-invalid",
+            "generic-mqtt",
+            false,
+            None,
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+        let connector_id = connector["id"].as_str().unwrap();
+        set_connector_workers_enabled(&state, true);
+
+        let response = app
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/ingestion/connectors/{connector_id}"),
+                json!({
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let status = connector_workers_status(&state).unwrap();
+        assert_eq!(
+            status.workers[0].status,
+            ConnectorWorkerRuntimeState::Invalid
+        );
+        assert!(status.workers[0].last_reconciled_at.is_some());
+        assert!(status.workers[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("broker_url"));
+    }
+
+    #[tokio::test]
+    async fn patch_disabling_connector_stops_running_worker_status() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        let connector = create_mqtt_connector(
+            &app,
+            "mqtt-update-stop",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+        let connector_id = Uuid::parse_str(connector["id"].as_str().unwrap()).unwrap();
+        set_connector_workers_enabled(&state, true);
+        let mut plan = build_ingestion_worker_plan(&state).unwrap();
+        let spec = plan.specs.remove(0);
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        state.connector_worker_handles.write().unwrap().insert(
+            connector_id,
+            ConnectorWorkerHandle {
+                signature: connector_worker_signature(&spec),
+                task,
+            },
+        );
+        let mut status = connector_runtime_status_from_spec(&spec);
+        status.status = ConnectorWorkerRuntimeState::Running;
+        status.connected = true;
+        status.subscribed = true;
+        status.started_at = Some(Utc::now());
+        set_connector_worker_runtime_status(&state, status);
+
+        let response = app
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/ingestion/connectors/{connector_id}"),
+                json!({
+                    "enabled": false
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let status = connector_workers_status(&state).unwrap();
+        assert_eq!(
+            status.workers[0].status,
+            ConnectorWorkerRuntimeState::Stopped
+        );
+        assert!(state.connector_worker_handles.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connector_worker_signature_changes_for_runtime_config_fields() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        let connector = create_mqtt_connector(
+            &app,
+            "mqtt-signature-change",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+        let connector_id = Uuid::parse_str(connector["id"].as_str().unwrap()).unwrap();
+        let original =
+            connector_worker_signature(&build_ingestion_worker_plan(&state).unwrap().specs[0]);
+
+        let mut stored = get_connector(&state, connector_id).unwrap();
+        stored.broker_url = Some("mqtt://127.0.0.1:1884".to_string());
+        stored.topic_filter = Some("farm/+/telemetry".to_string());
+        stored.payload_format = Some("senml-json".to_string());
+        stored.updated_at = Utc::now();
+        state.storage.update_ingestion_connector(stored).unwrap();
+
+        let changed =
+            connector_worker_signature(&build_ingestion_worker_plan(&state).unwrap().specs[0]);
+        assert_ne!(original, changed);
+    }
+
+    #[tokio::test]
+    async fn connector_worker_backoff_state_can_be_represented() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        let connector = create_mqtt_connector(
+            &app,
+            "mqtt-backoff-state",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+        let connector_id = Uuid::parse_str(connector["id"].as_str().unwrap()).unwrap();
+        let spec = build_ingestion_worker_plan(&state).unwrap().specs.remove(0);
+        set_connector_worker_runtime_status(&state, connector_runtime_status_from_spec(&spec));
+
+        let next_reconnect_at = mark_connector_worker_reconnect_scheduled(
+            &state,
+            connector_id,
+            "test reconnect".to_string(),
+            std::time::Duration::from_secs(2),
+        );
+
+        let status = connector_workers_status(&state).unwrap();
+        assert_eq!(
+            status.workers[0].status,
+            ConnectorWorkerRuntimeState::Reconnecting
+        );
+        assert_eq!(status.workers[0].reconnect_attempts, 1);
+        assert_eq!(status.workers[0].next_reconnect_at, Some(next_reconnect_at));
+        assert_eq!(status.connector_workers.degraded, 1);
     }
 
     #[tokio::test]

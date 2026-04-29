@@ -3173,19 +3173,31 @@ mod tests {
 
             let mut enabled = http_connector.clone();
             enabled.set_enabled(true, Utc.with_ymd_and_hms(2026, 4, 27, 12, 1, 0).unwrap());
+            enabled.display_name = Some("Updated HTTP connector".to_string());
+            enabled.endpoint = Some("/updated".to_string());
+            enabled.payload_format = Some("canonical-json".to_string());
+            enabled.metadata = Some(json!({"updated": true}));
             assert_eq!(
                 store
                     .update_ingestion_connector(enabled.clone())
                     .expect("enable connector"),
                 enabled
             );
-            assert!(
-                store
-                    .get_ingestion_connector(tenant.id, http_connector.id)
-                    .expect("get enabled connector")
-                    .expect("missing enabled connector")
-                    .enabled
+            let updated_connector = store
+                .get_ingestion_connector(tenant.id, http_connector.id)
+                .expect("get updated connector")
+                .expect("missing updated connector");
+            assert!(updated_connector.enabled);
+            assert_eq!(
+                updated_connector.display_name.as_deref(),
+                Some("Updated HTTP connector")
             );
+            assert_eq!(updated_connector.endpoint.as_deref(), Some("/updated"));
+            assert_eq!(
+                updated_connector.payload_format.as_deref(),
+                Some("canonical-json")
+            );
+            assert_eq!(updated_connector.metadata, Some(json!({"updated": true})));
 
             let mut disabled = enabled.clone();
             disabled.set_enabled(false, Utc.with_ymd_and_hms(2026, 4, 27, 12, 2, 0).unwrap());

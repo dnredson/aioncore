@@ -181,9 +181,12 @@ The runtime connector worker manager tracks active connector MQTT worker tasks b
 Reconciliation is triggered after:
 
 - `POST /ingestion/connectors`
+- `PATCH /ingestion/connectors/{connector_id}`
 - `PUT /ingestion/connectors/{connector_id}/enable`
 - `PUT /ingestion/connectors/{connector_id}/disable`
 - `POST /ingestion/workers/reconcile`
+
+Connector updates can change operational fields such as display name, enabled state, protocol, endpoint, broker URL, client ID, topic filter, HTTP path, payload format, content type, default entity IDs, and metadata. Immutable identity fields are not part of the update request: `id`, `tenant_id`, `connector_key`, `connector_type`, and `connector_profile`.
 
 During reconciliation:
 
@@ -193,15 +196,29 @@ During reconciliation:
 - TTN v3 connectors remain skipped until TTN decoding is implemented;
 - if a tracked worker's relevant signature differs from the planned connector configuration, the worker is restarted.
 
-Relevant signature fields are broker URL, client ID, topic filter, payload format, content type, and connector profile. A general connector update endpoint is not implemented yet, so external config updates cannot currently trigger this path through the public API.
+Relevant signature fields are broker URL, client ID, topic filter, payload format, content type, and connector profile. Public connector updates trigger reconciliation, so changing one of those fields restarts the tracked connector worker when dynamic workers are enabled. If an update saves invalid worker configuration, reconciliation stops any tracked worker and reports `invalid` status with validation details.
+
+Connector MQTT workers automatically retry broker disconnects and event-loop failures. The retry policy is a bounded exponential backoff starting at 1 second and capped at 60 seconds. While waiting, worker status is `reconnecting` and includes:
+
+- `reconnect_attempts`
+- `last_disconnect_at`
+- `last_reconnect_at`
+- `next_reconnect_at`
+- `last_error`
+
+Successful resubscription returns the worker to `running`. The environment-variable MQTT worker keeps its existing behavior and is not changed by connector-worker reconnect handling.
 
 Worker lifecycle events include:
 
+- `aion:IngestionConnectorUpdated`
 - `aion:ConnectorWorkerStarted`
 - `aion:ConnectorWorkerStopped`
 - `aion:ConnectorWorkerRestarted`
 - `aion:ConnectorWorkerSkipped`
 - `aion:ConnectorWorkerReconcileFailed`
+- `aion:ConnectorWorkerDisconnected`
+- `aion:ConnectorWorkerReconnectScheduled`
+- `aion:ConnectorWorkerReconnected`
 
 ## MQTT Ingestion
 
@@ -304,5 +321,5 @@ Full TTN uplink decoding is not implemented yet. Future TTN adapter behavior sho
 - TLS/mTLS is not implemented yet.
 - MQTT command publishing is not implemented yet.
 - Production broker scaling is not implemented yet.
-- No MQTT fallback exists; if MQTT is enabled and the broker cannot be reached, readiness reports MQTT as not ready.
+- The env-var MQTT worker still has no reconnect fallback; if it is enabled and the broker cannot be reached, readiness reports MQTT as not ready.
 - HTTP and MQTT ingest into the same canonical-observation model, but the runtime still defaults to in-memory storage unless PostgreSQL is selected explicitly.

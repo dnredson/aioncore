@@ -6,6 +6,8 @@ use std::time::Duration as StdDuration;
 const DEFAULT_MQTT_BROKER_URL: &str = "mqtt://127.0.0.1:1883";
 const DEFAULT_MQTT_CLIENT_ID: &str = "aioncore-ingest";
 const DEFAULT_MQTT_TOPIC_FILTER: &str = "aioncore/+/+/data";
+const CONNECTOR_RECONNECT_INITIAL_DELAY_SECS: u64 = 1;
+const CONNECTOR_RECONNECT_MAX_DELAY_SECS: u64 = 60;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct MqttIngestConfig {
@@ -232,6 +234,10 @@ async fn start_runtime(
         config.payload_format.as_deref().unwrap_or("canonical-json")
     );
 
+    if connector_worker {
+        return start_connector_runtime(state, config).await;
+    }
+
     let (host, port) = parse_broker_url(&config.broker_url)?;
     let mut options = MqttOptions::new(config.client_id.clone(), host, port);
     options.set_keep_alive(StdDuration::from_secs(30));
@@ -402,6 +408,170 @@ async fn start_runtime(
     });
 
     Ok(Some(handle))
+}
+
+async fn start_connector_runtime(
+    state: AppState,
+    config: MqttIngestConfig,
+) -> Result<Option<tokio::task::JoinHandle<()>>, StartupError> {
+    let (host, port) = parse_broker_url(&config.broker_url)?;
+    let handle = tokio::spawn(async move {
+        let _ = record_mqtt_worker_event(
+            &state,
+            "aion:MqttWorkerStarted",
+            EventSeverity::Info,
+            Some("MQTT connector worker started".to_string()),
+            metadata_with_connector(
+                json!({
+                    "broker_url": config.broker_url,
+                    "topic_filter": config.topic_filter,
+                    "payload_format": config.payload_format.as_deref().unwrap_or("canonical-json")
+                }),
+                config.connector.as_ref(),
+            ),
+        );
+
+        let mut reconnects_scheduled = 0_u32;
+        loop {
+            let mut options = MqttOptions::new(config.client_id.clone(), host.clone(), port);
+            options.set_keep_alive(StdDuration::from_secs(30));
+            let (client, mut eventloop) = AsyncClient::new(options, 16);
+            let mut reconnected_event_emitted = false;
+
+            let failure_message = loop {
+                match eventloop.poll().await {
+                    Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => {
+                        if let Some(connector) = config.connector.as_ref() {
+                            mark_connector_worker_connected(&state, connector.connector_id);
+                        }
+                        if let Err(err) = client
+                            .subscribe(config.topic_filter.clone(), QoS::AtLeastOnce)
+                            .await
+                        {
+                            break format!("failed to subscribe to MQTT topic filter: {err}");
+                        }
+                    }
+                    Ok(MqttEvent::Incoming(Incoming::SubAck(_))) => {
+                        if let Some(connector) = config.connector.as_ref() {
+                            mark_connector_worker_subscribed(&state, connector.connector_id);
+                        }
+                        let _ = record_mqtt_worker_event(
+                            &state,
+                            "aion:MqttWorkerSubscribed",
+                            EventSeverity::Info,
+                            Some("MQTT connector worker subscribed".to_string()),
+                            metadata_with_connector(
+                                json!({
+                                    "broker_url": config.broker_url,
+                                    "topic_filter": config.topic_filter
+                                }),
+                                config.connector.as_ref(),
+                            ),
+                        );
+                        if reconnects_scheduled > 0 && !reconnected_event_emitted {
+                            reconnected_event_emitted = true;
+                            let _ = record_mqtt_worker_event(
+                                &state,
+                                "aion:ConnectorWorkerReconnected",
+                                EventSeverity::Info,
+                                Some("Connector worker reconnected".to_string()),
+                                metadata_with_connector(
+                                    json!({
+                                        "broker_url": config.broker_url,
+                                        "topic_filter": config.topic_filter,
+                                        "reconnect_attempts": reconnects_scheduled
+                                    }),
+                                    config.connector.as_ref(),
+                                ),
+                            );
+                        }
+                    }
+                    Ok(MqttEvent::Incoming(Incoming::Publish(publish))) => {
+                        if let Some(connector) = config.connector.as_ref() {
+                            mark_connector_worker_message(&state, connector.connector_id);
+                        }
+                        if let Err(err) = handle_publish(&state, &config, publish).await {
+                            eprintln!("mqtt connector ingest failed: {err:?}");
+                            if let Some(connector) = config.connector.as_ref() {
+                                mark_connector_worker_ingest_failed(
+                                    &state,
+                                    connector.connector_id,
+                                    err.message,
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        break format!(
+                            "failed to connect to MQTT broker at {}: {err}",
+                            config.broker_url
+                        );
+                    }
+                }
+            };
+
+            eprintln!("mqtt connector event loop stopped: {failure_message}");
+            if let Some(connector) = config.connector.as_ref() {
+                mark_connector_worker_failure(
+                    &state,
+                    connector.connector_id,
+                    failure_message.clone(),
+                );
+                let _ = record_mqtt_worker_event(
+                    &state,
+                    "aion:ConnectorWorkerDisconnected",
+                    EventSeverity::Warning,
+                    Some(failure_message.clone()),
+                    metadata_with_connector(
+                        json!({
+                            "broker_url": config.broker_url,
+                            "topic_filter": config.topic_filter,
+                            "error": failure_message
+                        }),
+                        config.connector.as_ref(),
+                    ),
+                );
+
+                let delay = connector_reconnect_delay(reconnects_scheduled);
+                reconnects_scheduled = reconnects_scheduled.saturating_add(1);
+                let next_reconnect_at = mark_connector_worker_reconnect_scheduled(
+                    &state,
+                    connector.connector_id,
+                    "MQTT connector worker reconnect scheduled".to_string(),
+                    delay,
+                );
+                let _ = record_mqtt_worker_event(
+                    &state,
+                    "aion:ConnectorWorkerReconnectScheduled",
+                    EventSeverity::Warning,
+                    Some("Connector worker reconnect scheduled".to_string()),
+                    metadata_with_connector(
+                        json!({
+                            "broker_url": config.broker_url,
+                            "topic_filter": config.topic_filter,
+                            "delay_seconds": delay.as_secs(),
+                            "next_reconnect_at": next_reconnect_at
+                        }),
+                        config.connector.as_ref(),
+                    ),
+                );
+                tokio::time::sleep(delay).await;
+            } else {
+                break;
+            }
+        }
+    });
+
+    Ok(Some(handle))
+}
+
+fn connector_reconnect_delay(previous_attempts: u32) -> StdDuration {
+    let exponent = previous_attempts.min(6);
+    let seconds = CONNECTOR_RECONNECT_INITIAL_DELAY_SECS
+        .saturating_mul(2_u64.saturating_pow(exponent))
+        .min(CONNECTOR_RECONNECT_MAX_DELAY_SECS);
+    StdDuration::from_secs(seconds)
 }
 
 pub fn readiness(state: &AppState) -> MqttReadiness {

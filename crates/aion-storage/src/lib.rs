@@ -1836,8 +1836,14 @@ mod tests {
 
         let mut enabled = connector.clone();
         enabled.set_enabled(true, Utc::now());
+        enabled.display_name = Some("Updated HTTP".to_string());
+        enabled.payload_format = Some("canonical-json".to_string());
+        enabled.metadata = Some(serde_json::json!({"updated": true}));
         let enabled = storage.update_ingestion_connector(enabled).unwrap();
         assert!(enabled.enabled);
+        assert_eq!(enabled.display_name.as_deref(), Some("Updated HTTP"));
+        assert_eq!(enabled.payload_format.as_deref(), Some("canonical-json"));
+        assert_eq!(enabled.metadata, Some(serde_json::json!({"updated": true})));
     }
 
     #[test]
