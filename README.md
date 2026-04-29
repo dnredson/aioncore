@@ -299,6 +299,8 @@ $sentinelIngest = Invoke-RestMethod `
   -Body ($snapshot | ConvertTo-Json -Depth 12)
 
 $sentinelIngest
+$sentinelIngest.relationships_created
+$sentinelIngest.relationships_reused
 ```
 
 Query the materialized records:
@@ -312,6 +314,42 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/observations?feature_of_interest_id=$($service.id)"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?raw_message_id=$($sentinelIngest.raw_message_id)"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ai/context/entity/$($service.id)"
+```
+
+Submit the same snapshot again to verify relationship de-duplication:
+
+```powershell
+$sentinelIngestAgain = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/integrations/smartsentinel/snapshots" `
+  -ContentType "application/json" `
+  -Body ($snapshot | ConvertTo-Json -Depth 12)
+
+$sentinelIngestAgain.relationships_created
+$sentinelIngestAgain.relationships_reused
+$sentinelIngestAgain.entities_reused
+```
+
+Submit an invalid snapshot to inspect structured validation errors:
+
+```powershell
+$invalidSnapshot = @{
+  snapshot_id = "snap-invalid"
+  observed_at = "2026-04-29T12:00:00Z"
+  entities = @()
+}
+
+try {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/integrations/smartsentinel/snapshots" `
+    -ContentType "application/json" `
+    -Body ($invalidSnapshot | ConvertTo-Json -Depth 12)
+} catch {
+  $body = $_.ErrorDetails.Message | ConvertFrom-Json
+  $body.error
+  $body.validation_errors
+}
 ```
 
 TTN v3 uplink JSON can be tested locally through connector-aware HTTP ingestion without a live TTN broker. Create existing AionCore entities, a TTN connector, and an explicit device mapping:

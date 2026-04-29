@@ -477,6 +477,7 @@ pub trait TenantStore {
 
 pub trait EntityStore {
     fn create_entity(&self, entity: Entity) -> StorageResult<Entity>;
+    fn update_entity(&self, entity: Entity) -> StorageResult<Entity>;
     fn get_entity(&self, tenant_id: Uuid, entity_id: Uuid) -> StorageResult<Option<Entity>>;
     fn get_entity_by_key(&self, tenant_id: Uuid, entity_key: &str)
         -> StorageResult<Option<Entity>>;
@@ -917,6 +918,24 @@ impl EntityStore for InMemoryStorage {
         }
 
         state.entity_key_index.insert(index_key, entity.id);
+        state.entities.insert(entity.id, entity.clone());
+        Ok(entity)
+    }
+
+    fn update_entity(&self, entity: Entity) -> StorageResult<Entity> {
+        let mut state = self.write_state()?;
+        let index_key = (entity.tenant_id, entity.entity_key.clone());
+
+        match state.entity_key_index.get(&index_key).copied() {
+            Some(existing_id) if existing_id == entity.id => {}
+            Some(_) => return Err(StorageError::Conflict),
+            None => return Err(StorageError::NotFound),
+        }
+
+        if !state.entities.contains_key(&entity.id) {
+            return Err(StorageError::NotFound);
+        }
+
         state.entities.insert(entity.id, entity.clone());
         Ok(entity)
     }
@@ -2201,6 +2220,29 @@ mod tests {
             entity
         );
         assert_eq!(storage.list_entities(tenant_id).unwrap().len(), 1);
+
+        let mut updated = entity.clone();
+        updated.entity_type = "aion:OperationalSensor".to_string();
+        updated.jsonld = json!({
+            "@context": {"aion": "https://aioncore.org/ns#"},
+            "@id": "urn:aion:sensor:sensor-01",
+            "@type": "aion:OperationalSensor",
+            "name": "Updated"
+        });
+        updated.updated_at = Utc.with_ymd_and_hms(2026, 4, 27, 12, 5, 0).unwrap();
+        let stored = storage.update_entity(updated.clone()).unwrap();
+
+        assert_eq!(stored.entity_key, entity.entity_key);
+        assert_eq!(stored.id, entity.id);
+        assert_eq!(stored.entity_type, "aion:OperationalSensor");
+        assert_eq!(
+            storage
+                .get_entity_by_key(tenant_id, "sensor-01")
+                .unwrap()
+                .unwrap()
+                .jsonld["name"],
+            "Updated"
+        );
     }
 
     #[test]

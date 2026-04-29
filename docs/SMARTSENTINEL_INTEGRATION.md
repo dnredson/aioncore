@@ -49,7 +49,7 @@ Critical remediation must not be automatic by default. AionCore should require e
 
 SmartSentinel snapshots can be ingested through the same payload-agnostic raw message path as other integrations.
 
-Milestone 40 adds the first optional ingestion skeleton:
+Milestone 40 added the first optional ingestion skeleton. Milestone 41 hardens the same endpoint with reconciliation and diagnostics:
 
 ```text
 POST /integrations/smartsentinel/snapshots
@@ -66,7 +66,7 @@ Raw message metadata:
 - `connector_profile`: `smartsentinel` in raw-message headers only; this does not make SmartSentinel a required connector dependency.
 - `received_at`: AionCore receive time.
 
-Raw snapshot payloads should be preserved before normalization.
+Raw snapshot payloads are preserved before validation and mapping. If validation fails, the raw message is marked failed and a failure event is recorded when feasible.
 
 ## Current Snapshot Shape
 
@@ -136,6 +136,91 @@ The current endpoint materializes only entities, relationships, observations, an
 - `aion:SmartSentinelSnapshotReceived`
 - `aion:SmartSentinelSnapshotMapped`
 - `aion:SmartSentinelSnapshotMappingFailed`
+
+Lifecycle event metadata includes snapshot and node identifiers, mapping counts, validation issue counts, and skipped item counts. Raw snapshot content is not copied into lifecycle event metadata.
+
+## Reconciliation Behavior
+
+Entity mapping uses stable keys:
+
+```text
+smartsentinel:{node_id}:{snapshot_entity_id}
+```
+
+When a snapshot entity does not exist, AionCore creates it. When a snapshot entity already exists:
+
+- `id` and `entity_key` are preserved.
+- JSON-LD is rebuilt from the latest snapshot entity.
+- `entity_type`, `sentinel:status`, `sentinel:properties`, and snapshot reference fields are updated.
+- `updated_at` is refreshed only when the materialized entity changes.
+- Existing entities with unchanged materialized JSON-LD are reused.
+
+The response reports:
+
+- `entities_created`
+- `entities_updated`
+- `entities_reused`
+- `entities_skipped`
+
+Relationship mapping de-duplicates by:
+
+- `tenant_id`
+- `source_entity_id`
+- `relationship_type`
+- `target_entity_id`
+
+If the relationship already exists, it is reused instead of inserted again. Self-referential relationships are skipped. The response reports:
+
+- `relationships_created`
+- `relationships_reused`
+- `relationships_skipped`
+
+Missing entities from later snapshots are not deleted.
+
+## Validation and Diagnostics
+
+Validation runs after raw-message preservation and before mapping. Fatal validation errors prevent partial mapping.
+
+Validated snapshot fields:
+
+- `snapshot_id`: required.
+- `node_id`: required.
+- `observed_at`: optional, but must be RFC3339 when present.
+
+Validated entity fields:
+
+- `id`: required.
+- `type`: required.
+- `name`: optional.
+- `properties`: optional object.
+
+Validated relationships:
+
+- `source`: required.
+- `type`: required.
+- `target`: required.
+- `source` and `target` must reference snapshot entities or already existing SmartSentinel-mapped entities for the same node.
+
+Validated observations:
+
+- `entity_id`: required.
+- `observed_property`: required.
+- `value`: required.
+- `observed_at`: optional, but must be RFC3339 when present.
+
+Validated events:
+
+- `event_type`: required.
+- `severity`: optional, defaults to `info`; when present it must be `debug`, `info`, `warning`, `error`, or `critical`.
+- `target_entity_id` and `source_entity_id`: optional; when present they must resolve to snapshot entities or already existing SmartSentinel-mapped entities for the same node.
+
+The snapshot endpoint returns mapping diagnostics:
+
+- `validation_warnings`
+- `validation_errors`
+- `skipped_items`
+
+Validation errors are also returned in the error response body when validation fails.
 
 Materialize as Commands:
 
@@ -216,5 +301,5 @@ The SmartSentinel integration should not:
 - No authentication is implemented for the integration endpoint.
 - No recovery action execution is implemented.
 - No delete or graph reconciliation is performed when later snapshots omit an entity.
-- Relationship de-duplication is not implemented yet.
 - The mapper accepts a simplified snapshot shape only.
+- Relationship de-duplication is limited to exact source/type/target matches.

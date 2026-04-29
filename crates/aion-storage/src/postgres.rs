@@ -862,6 +862,32 @@ impl EntityStore for PostgresStorage {
         })
     }
 
+    fn update_entity(&self, entity: Entity) -> StorageResult<Entity> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE entities
+                    SET entity_type = $4,
+                        jsonld = $5,
+                        updated_at = $6
+                    WHERE tenant_id = $1 AND id = $2 AND entity_key = $3
+                    RETURNING id, tenant_id, entity_key, entity_type, jsonld, created_at, updated_at
+                    ",
+                    &[
+                        &entity.tenant_id,
+                        &entity.id,
+                        &entity.entity_key,
+                        &entity.entity_type,
+                        &json_column(&entity.jsonld),
+                        &entity.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_entity).ok_or(StorageError::NotFound)
+        })
+    }
+
     fn get_entity(&self, tenant_id: Uuid, entity_id: Uuid) -> StorageResult<Option<Entity>> {
         self.with_client(|client| {
             let row = client
@@ -3389,6 +3415,20 @@ mod tests {
             let mut entities = store.list_entities(tenant.id).expect("list entities");
             entities.sort_by(|left, right| left.entity_key.cmp(&right.entity_key));
             assert_eq!(entities, vec![entity_a.clone(), entity_b.clone()]);
+
+            let mut updated = entity_b.clone();
+            updated.entity_type = "aion:OperationalDevice".to_string();
+            updated.jsonld = serde_json::json!({
+                "@context": {"aion": "https://aioncore.org/ns#"},
+                "@id": format!("urn:aion:test:{}", updated.entity_key),
+                "@type": "aion:OperationalDevice",
+                "name": "Updated"
+            });
+            updated.updated_at = chrono::Utc::now();
+            let stored = store.update_entity(updated.clone()).expect("update entity");
+            assert_eq!(stored.id, entity_b.id);
+            assert_eq!(stored.entity_key, entity_b.entity_key);
+            assert_eq!(stored.entity_type, "aion:OperationalDevice");
         }
     }
 

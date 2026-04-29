@@ -30,7 +30,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     str::FromStr,
     sync::{Arc, RwLock},
@@ -358,7 +358,7 @@ const SMARTSENTINEL_PAYLOAD_FORMAT: &str = "smartsentinel-snapshot-json";
 pub struct SmartSentinelSnapshot {
     pub snapshot_id: String,
     pub node_id: String,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub entities: Vec<SmartSentinelSnapshotEntity>,
     #[serde(default)]
@@ -410,12 +410,47 @@ pub struct SmartSentinelSnapshotEvent {
 #[derive(Debug, Serialize)]
 pub struct SmartSentinelSnapshotResponse {
     pub raw_message_id: Uuid,
-    pub entities_created_or_updated: usize,
-    pub relationships_created: usize,
-    pub observations_created: usize,
-    pub events_created: usize,
     pub snapshot_id: String,
     pub node_id: String,
+    pub entities_created: usize,
+    pub entities_updated: usize,
+    pub entities_reused: usize,
+    pub entities_skipped: usize,
+    pub relationships_created: usize,
+    pub relationships_reused: usize,
+    pub relationships_skipped: usize,
+    pub observations_created: usize,
+    pub events_created: usize,
+    pub validation_warnings: Vec<SmartSentinelValidationIssue>,
+    pub validation_errors: Vec<SmartSentinelValidationIssue>,
+    pub skipped_items: Vec<SmartSentinelSkippedItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SmartSentinelValidationIssue {
+    pub path: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SmartSentinelSkippedItem {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct SmartSentinelValidationReport {
+    warnings: Vec<SmartSentinelValidationIssue>,
+    errors: Vec<SmartSentinelValidationIssue>,
+    skipped_items: Vec<SmartSentinelSkippedItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartSentinelEntityMappingStatus {
+    Created,
+    Updated,
+    Reused,
 }
 
 #[derive(Debug, Clone)]
@@ -1133,6 +1168,12 @@ pub struct AiEntityContextResponse {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    validation_errors: Vec<SmartSentinelValidationIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    validation_warnings: Vec<SmartSentinelValidationIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped_items: Vec<SmartSentinelSkippedItem>,
 }
 
 const DEFAULT_COMMAND_LEASE_SECONDS: i64 = 60;
@@ -3890,6 +3931,8 @@ async fn ingest_smartsentinel_snapshot(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let raw_snapshot_id = snapshot_id.clone();
+    let raw_node_id = node_id.clone();
     let mut raw_message = RawMessage::new(
         state.tenant_id,
         RawMessageSource::Http,
@@ -3919,6 +3962,7 @@ async fn ingest_smartsentinel_snapshot(
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
     raw_message = state.storage.store_raw_message(raw_message)?;
+    let validation = validate_smartsentinel_snapshot(&state, &payload)?;
     record_ingest_event_optional(
         &state,
         "aion:SmartSentinelSnapshotReceived",
@@ -3929,39 +3973,16 @@ async fn ingest_smartsentinel_snapshot(
         Some("SmartSentinel snapshot received".to_string()),
         json!({
             "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
-            "snapshot_id": snapshot_id,
-            "node_id": node_id
+            "snapshot_id": raw_snapshot_id,
+            "node_id": raw_node_id,
+            "validation_warning_count": validation.warnings.len(),
+            "validation_error_count": validation.errors.len(),
+            "skipped_item_count": validation.skipped_items.len()
         }),
     )?;
 
-    let snapshot = match serde_json::from_value::<SmartSentinelSnapshot>(payload.clone()) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            let message = format!("invalid SmartSentinel snapshot: {err}");
-            state
-                .storage
-                .mark_raw_message_failed(state.tenant_id, raw_message.id, &message)?;
-            record_ingest_event_optional(
-                &state,
-                "aion:SmartSentinelSnapshotMappingFailed",
-                EventSeverity::Error,
-                None,
-                None,
-                Some(raw_message.id),
-                Some(message.clone()),
-                json!({
-                    "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
-                    "snapshot_id": snapshot_id,
-                    "node_id": node_id,
-                    "reason": "invalid_snapshot"
-                }),
-            )?;
-            return Err(ApiError::bad_request(message));
-        }
-    };
-
-    if snapshot.snapshot_id.trim().is_empty() || snapshot.node_id.trim().is_empty() {
-        let message = "invalid SmartSentinel snapshot: snapshot_id and node_id must not be empty";
+    if !validation.errors.is_empty() {
+        let message = "SmartSentinel snapshot validation failed";
         state
             .storage
             .mark_raw_message_failed(state.tenant_id, raw_message.id, message)?;
@@ -3975,38 +3996,48 @@ async fn ingest_smartsentinel_snapshot(
             Some(message.to_string()),
             json!({
                 "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
-                "snapshot_id": snapshot.snapshot_id,
-                "node_id": snapshot.node_id,
-                "reason": "invalid_snapshot_identity"
+                "snapshot_id": raw_snapshot_id,
+                "node_id": raw_node_id,
+                "reason": "validation_failed",
+                "validation_warning_count": validation.warnings.len(),
+                "validation_error_count": validation.errors.len(),
+                "skipped_item_count": validation.skipped_items.len()
             }),
         )?;
-        return Err(ApiError::bad_request(message));
+        return Err(ApiError::smartsentinel_validation(message, validation));
     }
 
-    let summary = match map_smartsentinel_snapshot(&state, snapshot, raw_message.id, received_at) {
-        Ok(summary) => summary,
-        Err(err) => {
-            state
-                .storage
-                .mark_raw_message_failed(state.tenant_id, raw_message.id, &err.message)?;
-            record_ingest_event_optional(
-                &state,
-                "aion:SmartSentinelSnapshotMappingFailed",
-                EventSeverity::Error,
-                None,
-                None,
-                Some(raw_message.id),
-                Some(err.message.clone()),
-                json!({
-                    "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
-                    "snapshot_id": snapshot_id,
-                    "node_id": node_id,
-                    "reason": "mapping_error"
-                }),
-            )?;
-            return Err(err);
-        }
-    };
+    let snapshot = serde_json::from_value::<SmartSentinelSnapshot>(payload.clone())
+        .map_err(|err| ApiError::bad_request(format!("invalid SmartSentinel snapshot: {err}")))?;
+
+    let summary =
+        match map_smartsentinel_snapshot(&state, snapshot, raw_message.id, received_at, validation)
+        {
+            Ok(summary) => summary,
+            Err(err) => {
+                state.storage.mark_raw_message_failed(
+                    state.tenant_id,
+                    raw_message.id,
+                    &err.message,
+                )?;
+                record_ingest_event_optional(
+                    &state,
+                    "aion:SmartSentinelSnapshotMappingFailed",
+                    EventSeverity::Error,
+                    None,
+                    None,
+                    Some(raw_message.id),
+                    Some(err.message.clone()),
+                    json!({
+                        "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
+                        "snapshot_id": raw_snapshot_id,
+                        "node_id": raw_node_id,
+                        "reason": "mapping_error"
+                    }),
+                )?;
+                return Err(err);
+            }
+        };
     state
         .storage
         .mark_raw_message_normalized(state.tenant_id, raw_message.id)?;
@@ -4022,10 +4053,18 @@ async fn ingest_smartsentinel_snapshot(
             "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
             "snapshot_id": summary.snapshot_id,
             "node_id": summary.node_id,
-            "entities_created_or_updated": summary.entities_created_or_updated,
+            "entities_created": summary.entities_created,
+            "entities_updated": summary.entities_updated,
+            "entities_reused": summary.entities_reused,
+            "entities_skipped": summary.entities_skipped,
             "relationships_created": summary.relationships_created,
+            "relationships_reused": summary.relationships_reused,
+            "relationships_skipped": summary.relationships_skipped,
             "observations_created": summary.observations_created,
-            "events_created": summary.events_created
+            "events_created": summary.events_created,
+            "validation_warning_count": summary.validation_warnings.len(),
+            "validation_error_count": summary.validation_errors.len(),
+            "skipped_item_count": summary.skipped_items.len()
         }),
     )?;
 
@@ -4388,35 +4427,415 @@ async fn ingest_http_resolved(
     ))
 }
 
+fn validate_smartsentinel_snapshot(
+    state: &AppState,
+    payload: &Value,
+) -> Result<SmartSentinelValidationReport, ApiError> {
+    let mut report = SmartSentinelValidationReport {
+        warnings: Vec::new(),
+        errors: Vec::new(),
+        skipped_items: Vec::new(),
+    };
+
+    let Some(object) = payload.as_object() else {
+        report.errors.push(smartsentinel_issue(
+            "$",
+            "snapshot_not_object",
+            "SmartSentinel snapshot must be a JSON object",
+        ));
+        return Ok(report);
+    };
+
+    let node_id = required_string(object.get("node_id"), "$.node_id", "node_id", &mut report);
+    required_string(
+        object.get("snapshot_id"),
+        "$.snapshot_id",
+        "snapshot_id",
+        &mut report,
+    );
+    if let Some(value) = object.get("observed_at") {
+        validate_optional_rfc3339(value, "$.observed_at", "observed_at", &mut report);
+    }
+
+    let mut snapshot_entity_ids = HashSet::new();
+    if let Some(entities) = object.get("entities") {
+        match entities.as_array() {
+            Some(entities) => {
+                for (index, entity) in entities.iter().enumerate() {
+                    let path = format!("$.entities[{index}]");
+                    let Some(entity_object) = entity.as_object() else {
+                        report.errors.push(smartsentinel_issue(
+                            path,
+                            "entity_not_object",
+                            "SmartSentinel entity must be a JSON object",
+                        ));
+                        continue;
+                    };
+                    if let Some(entity_id) = required_string(
+                        entity_object.get("id"),
+                        format!("{path}.id"),
+                        "entity id",
+                        &mut report,
+                    ) {
+                        snapshot_entity_ids.insert(entity_id);
+                    }
+                    required_string(
+                        entity_object.get("type"),
+                        format!("{path}.type"),
+                        "entity type",
+                        &mut report,
+                    );
+                    if let Some(properties) = entity_object.get("properties") {
+                        if !properties.is_object() {
+                            report.errors.push(smartsentinel_issue(
+                                format!("{path}.properties"),
+                                "entity_properties_not_object",
+                                "SmartSentinel entity properties must be a JSON object when present",
+                            ));
+                        }
+                    }
+                }
+            }
+            None => report.errors.push(smartsentinel_issue(
+                "$.entities",
+                "entities_not_array",
+                "entities must be an array when present",
+            )),
+        }
+    }
+
+    let node_id = node_id.unwrap_or_default();
+    let relationships = object.get("relationships").and_then(Value::as_array);
+    if object.get("relationships").is_some() && relationships.is_none() {
+        report.errors.push(smartsentinel_issue(
+            "$.relationships",
+            "relationships_not_array",
+            "relationships must be an array when present",
+        ));
+    }
+    if let Some(relationships) = relationships {
+        for (index, relationship) in relationships.iter().enumerate() {
+            let path = format!("$.relationships[{index}]");
+            let Some(relationship_object) = relationship.as_object() else {
+                report.errors.push(smartsentinel_issue(
+                    path,
+                    "relationship_not_object",
+                    "SmartSentinel relationship must be a JSON object",
+                ));
+                continue;
+            };
+            let source = required_string(
+                relationship_object.get("source"),
+                format!("{path}.source"),
+                "relationship source",
+                &mut report,
+            );
+            let relationship_type = required_string(
+                relationship_object.get("type"),
+                format!("{path}.type"),
+                "relationship type",
+                &mut report,
+            );
+            let target = required_string(
+                relationship_object.get("target"),
+                format!("{path}.target"),
+                "relationship target",
+                &mut report,
+            );
+            if let (Some(source), Some(target)) = (source.as_deref(), target.as_deref()) {
+                if source == target {
+                    report.warnings.push(smartsentinel_issue(
+                        path.clone(),
+                        "relationship_self_reference",
+                        "relationship source and target are the same; item will be skipped",
+                    ));
+                    report.skipped_items.push(SmartSentinelSkippedItem {
+                        path: path.clone(),
+                        reason: "relationship_self_reference".to_string(),
+                    });
+                }
+                if !smartsentinel_entity_ref_resolves(
+                    state,
+                    &node_id,
+                    &snapshot_entity_ids,
+                    source,
+                )? {
+                    report.errors.push(smartsentinel_issue(
+                        format!("{path}.source"),
+                        "relationship_source_unknown",
+                        "relationship source does not reference a snapshot entity or existing mapped entity",
+                    ));
+                }
+                if !smartsentinel_entity_ref_resolves(
+                    state,
+                    &node_id,
+                    &snapshot_entity_ids,
+                    target,
+                )? {
+                    report.errors.push(smartsentinel_issue(
+                        format!("{path}.target"),
+                        "relationship_target_unknown",
+                        "relationship target does not reference a snapshot entity or existing mapped entity",
+                    ));
+                }
+            }
+            if relationship_type.is_none() {
+                report.skipped_items.push(SmartSentinelSkippedItem {
+                    path,
+                    reason: "relationship_missing_type".to_string(),
+                });
+            }
+        }
+    }
+
+    validate_smartsentinel_observation_items(
+        state,
+        object.get("observations"),
+        &node_id,
+        &snapshot_entity_ids,
+        &mut report,
+    )?;
+    validate_smartsentinel_event_items(
+        state,
+        object.get("events"),
+        &node_id,
+        &snapshot_entity_ids,
+        &mut report,
+    )?;
+
+    Ok(report)
+}
+
+fn validate_smartsentinel_observation_items(
+    state: &AppState,
+    value: Option<&Value>,
+    node_id: &str,
+    snapshot_entity_ids: &HashSet<String>,
+    report: &mut SmartSentinelValidationReport,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(observations) = value.as_array() else {
+        report.errors.push(smartsentinel_issue(
+            "$.observations",
+            "observations_not_array",
+            "observations must be an array when present",
+        ));
+        return Ok(());
+    };
+    for (index, observation) in observations.iter().enumerate() {
+        let path = format!("$.observations[{index}]");
+        let Some(observation_object) = observation.as_object() else {
+            report.errors.push(smartsentinel_issue(
+                path,
+                "observation_not_object",
+                "SmartSentinel observation must be a JSON object",
+            ));
+            continue;
+        };
+        let entity_id = required_string(
+            observation_object.get("entity_id"),
+            format!("{path}.entity_id"),
+            "observation entity_id",
+            report,
+        );
+        required_string(
+            observation_object.get("observed_property"),
+            format!("{path}.observed_property"),
+            "observation observed_property",
+            report,
+        );
+        if !observation_object.contains_key("value") {
+            report.errors.push(smartsentinel_issue(
+                format!("{path}.value"),
+                "observation_value_missing",
+                "observation value is required",
+            ));
+        }
+        if let Some(value) = observation_object.get("observed_at") {
+            validate_optional_rfc3339(value, format!("{path}.observed_at"), "observed_at", report);
+        }
+        if let Some(entity_id) = entity_id {
+            if !smartsentinel_entity_ref_resolves(state, node_id, snapshot_entity_ids, &entity_id)?
+            {
+                report.errors.push(smartsentinel_issue(
+                    format!("{path}.entity_id"),
+                    "observation_entity_unknown",
+                    "observation entity_id does not reference a snapshot entity or existing mapped entity",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_smartsentinel_event_items(
+    state: &AppState,
+    value: Option<&Value>,
+    node_id: &str,
+    snapshot_entity_ids: &HashSet<String>,
+    report: &mut SmartSentinelValidationReport,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(events) = value.as_array() else {
+        report.errors.push(smartsentinel_issue(
+            "$.events",
+            "events_not_array",
+            "events must be an array when present",
+        ));
+        return Ok(());
+    };
+    for (index, event) in events.iter().enumerate() {
+        let path = format!("$.events[{index}]");
+        let Some(event_object) = event.as_object() else {
+            report.errors.push(smartsentinel_issue(
+                path,
+                "event_not_object",
+                "SmartSentinel event must be a JSON object",
+            ));
+            continue;
+        };
+        required_string(
+            event_object.get("event_type"),
+            format!("{path}.event_type"),
+            "event_type",
+            report,
+        );
+        if let Some(severity) = event_object.get("severity") {
+            match severity.as_str() {
+                Some("debug" | "info" | "warning" | "error" | "critical") => {}
+                _ => report.errors.push(smartsentinel_issue(
+                    format!("{path}.severity"),
+                    "event_severity_invalid",
+                    "event severity must be debug, info, warning, error, or critical",
+                )),
+            }
+        }
+        for field_name in ["source_entity_id", "target_entity_id"] {
+            if let Some(value) = event_object.get(field_name) {
+                match value.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+                    Some(entity_id)
+                        if smartsentinel_entity_ref_resolves(
+                            state,
+                            node_id,
+                            snapshot_entity_ids,
+                            entity_id,
+                        )? => {}
+                    Some(_) => report.errors.push(smartsentinel_issue(
+                        format!("{path}.{field_name}"),
+                        "event_entity_unknown",
+                        "event entity reference does not reference a snapshot entity or existing mapped entity",
+                    )),
+                    None => report.errors.push(smartsentinel_issue(
+                        format!("{path}.{field_name}"),
+                        "event_entity_invalid",
+                        "event entity reference must be a non-empty string when present",
+                    )),
+                }
+            }
+        }
+        if let Some(value) = event_object.get("occurred_at") {
+            validate_optional_rfc3339(value, format!("{path}.occurred_at"), "occurred_at", report);
+        }
+    }
+    Ok(())
+}
+
+fn required_string(
+    value: Option<&Value>,
+    path: impl Into<String>,
+    label: &str,
+    report: &mut SmartSentinelValidationReport,
+) -> Option<String> {
+    let path = path.into();
+    match value.and_then(Value::as_str).map(str::trim) {
+        Some(value) if !value.is_empty() => Some(value.to_string()),
+        _ => {
+            report.errors.push(smartsentinel_issue(
+                path,
+                format!("{}_missing", label.replace(' ', "_")),
+                format!("{label} is required"),
+            ));
+            None
+        }
+    }
+}
+
+fn validate_optional_rfc3339(
+    value: &Value,
+    path: impl Into<String>,
+    label: &str,
+    report: &mut SmartSentinelValidationReport,
+) {
+    if value
+        .as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_none()
+    {
+        report.errors.push(smartsentinel_issue(
+            path,
+            format!("{label}_invalid"),
+            format!("{label} must be an RFC3339 timestamp when present"),
+        ));
+    }
+}
+
+fn smartsentinel_entity_ref_resolves(
+    state: &AppState,
+    node_id: &str,
+    snapshot_entity_ids: &HashSet<String>,
+    snapshot_entity_id: &str,
+) -> Result<bool, ApiError> {
+    if snapshot_entity_ids.contains(snapshot_entity_id) {
+        return Ok(true);
+    }
+    let entity_key = smartsentinel_entity_key(node_id, snapshot_entity_id);
+    Ok(state
+        .storage
+        .get_entity_by_key(state.tenant_id, &entity_key)?
+        .is_some())
+}
+
+fn smartsentinel_issue(
+    path: impl Into<String>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> SmartSentinelValidationIssue {
+    SmartSentinelValidationIssue {
+        path: path.into(),
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
 fn map_smartsentinel_snapshot(
     state: &AppState,
     snapshot: SmartSentinelSnapshot,
     raw_message_id: Uuid,
     received_at: DateTime<Utc>,
+    validation: SmartSentinelValidationReport,
 ) -> Result<SmartSentinelSnapshotResponse, ApiError> {
     let snapshot_id = snapshot.snapshot_id.clone();
     let node_id = snapshot.node_id.clone();
+    let observed_at = snapshot.observed_at.unwrap_or(received_at);
     let mut entity_ids = HashMap::new();
-    let mut entities_created_or_updated = 0;
+    let mut entities_created = 0;
+    let mut entities_updated = 0;
+    let mut entities_reused = 0;
+    let entities_skipped = 0;
     let mut relationships_created = 0;
+    let mut relationships_reused = 0;
+    let mut relationships_skipped = 0;
     let mut observations_created = 0;
     let mut events_created = 0;
     let observer_raw_id = format!("host:{node_id}");
 
     for snapshot_entity in &snapshot.entities {
-        if snapshot_entity.id.trim().is_empty() {
-            return Err(ApiError::bad_request(
-                "SmartSentinel entity id must not be empty",
-            ));
-        }
-        if snapshot_entity.entity_type.trim().is_empty() {
-            return Err(ApiError::bad_request(
-                "SmartSentinel entity type must not be empty",
-            ));
-        }
-
         let entity_key = smartsentinel_entity_key(&node_id, &snapshot_entity.id);
-        let entity = upsert_smartsentinel_entity(
+        let (entity, status) = upsert_smartsentinel_entity(
             state,
             &entity_key,
             &node_id,
@@ -4425,7 +4844,11 @@ fn map_smartsentinel_snapshot(
             received_at,
         )?;
         entity_ids.insert(snapshot_entity.id.clone(), entity.id);
-        entities_created_or_updated += 1;
+        match status {
+            SmartSentinelEntityMappingStatus::Created => entities_created += 1,
+            SmartSentinelEntityMappingStatus::Updated => entities_updated += 1,
+            SmartSentinelEntityMappingStatus::Reused => entities_reused += 1,
+        }
     }
 
     let observer_entity_id = entity_ids.get(&observer_raw_id).copied().or_else(|| {
@@ -4436,42 +4859,50 @@ fn map_smartsentinel_snapshot(
     });
 
     for relationship in &snapshot.relationships {
-        let source_entity_id = entity_ids
-            .get(&relationship.source)
-            .copied()
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "SmartSentinel relationship source '{}' does not reference a mapped entity",
-                    relationship.source
-                ))
-            })?;
-        let target_entity_id = entity_ids
-            .get(&relationship.target)
-            .copied()
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "SmartSentinel relationship target '{}' does not reference a mapped entity",
-                    relationship.target
-                ))
-            })?;
-        let relationship = Relationship::new(
-            state.tenant_id,
+        let source_entity_id = resolve_smartsentinel_mapped_entity_id(
+            state,
+            &node_id,
+            &entity_ids,
+            &relationship.source,
+        )?;
+        let target_entity_id = resolve_smartsentinel_mapped_entity_id(
+            state,
+            &node_id,
+            &entity_ids,
+            &relationship.target,
+        )?;
+        if relationship.relationship_type.trim().is_empty() || source_entity_id == target_entity_id
+        {
+            relationships_skipped += 1;
+            continue;
+        }
+        if smartsentinel_relationship_exists(
+            state,
             source_entity_id,
-            relationship.relationship_type.clone(),
+            &relationship.relationship_type,
             target_entity_id,
-            json!({
-                "@context": smartsentinel_jsonld_context(),
-                "@type": "aion:Relationship",
-                "sentinel:snapshotId": snapshot_id,
-                "sentinel:nodeId": node_id,
-                "sentinel:source": relationship.source,
-                "sentinel:target": relationship.target
-            }),
-            received_at,
-        )
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        state.storage.create_relationship(relationship)?;
-        relationships_created += 1;
+        )? {
+            relationships_reused += 1;
+        } else {
+            let relationship = Relationship::new(
+                state.tenant_id,
+                source_entity_id,
+                relationship.relationship_type.clone(),
+                target_entity_id,
+                json!({
+                    "@context": smartsentinel_jsonld_context(),
+                    "@type": "aion:Relationship",
+                    "sentinel:snapshotId": snapshot_id,
+                    "sentinel:nodeId": node_id,
+                    "sentinel:source": relationship.source,
+                    "sentinel:target": relationship.target
+                }),
+                received_at,
+            )
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            state.storage.create_relationship(relationship)?;
+            relationships_created += 1;
+        }
     }
 
     for snapshot_entity in &snapshot.entities {
@@ -4492,7 +4923,7 @@ fn map_smartsentinel_snapshot(
                     value: status.to_string(),
                 },
                 None,
-                snapshot.observed_at,
+                observed_at,
                 received_at,
                 "http",
                 SMARTSENTINEL_PAYLOAD_FORMAT,
@@ -4514,15 +4945,12 @@ fn map_smartsentinel_snapshot(
     }
 
     for snapshot_observation in &snapshot.observations {
-        let feature_of_interest_id = entity_ids
-            .get(&snapshot_observation.entity_id)
-            .copied()
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "SmartSentinel observation entity_id '{}' does not reference a mapped entity",
-                    snapshot_observation.entity_id
-                ))
-            })?;
+        let feature_of_interest_id = resolve_smartsentinel_mapped_entity_id(
+            state,
+            &node_id,
+            &entity_ids,
+            &snapshot_observation.entity_id,
+        )?;
         let producer_entity_id = observer_entity_id.unwrap_or(feature_of_interest_id);
         let observation = Observation::new(
             state.tenant_id,
@@ -4531,9 +4959,7 @@ fn map_smartsentinel_snapshot(
             snapshot_observation.observed_property.clone(),
             observation_value_from_json(&snapshot_observation.value),
             snapshot_observation.unit.clone(),
-            snapshot_observation
-                .observed_at
-                .unwrap_or(snapshot.observed_at),
+            snapshot_observation.observed_at.unwrap_or(observed_at),
             received_at,
             "http",
             SMARTSENTINEL_PAYLOAD_FORMAT,
@@ -4558,14 +4984,14 @@ fn map_smartsentinel_snapshot(
             .source_entity_id
             .as_deref()
             .map(|entity_id| {
-                smartsentinel_lookup_entity(&entity_ids, entity_id, "event source_entity_id")
+                resolve_smartsentinel_mapped_entity_id(state, &node_id, &entity_ids, entity_id)
             })
             .transpose()?;
         let target_entity_id = snapshot_event
             .target_entity_id
             .as_deref()
             .map(|entity_id| {
-                smartsentinel_lookup_entity(&entity_ids, entity_id, "event target_entity_id")
+                resolve_smartsentinel_mapped_entity_id(state, &node_id, &entity_ids, entity_id)
             })
             .transpose()?;
         let event = Event::new(
@@ -4578,8 +5004,8 @@ fn map_smartsentinel_snapshot(
             source_entity_id,
             target_entity_id,
             snapshot_event.message.clone(),
-            snapshot_event.occurred_at.unwrap_or(snapshot.observed_at),
-            Some(snapshot.observed_at),
+            snapshot_event.occurred_at.unwrap_or(observed_at),
+            Some(observed_at),
             Some(snapshot_id.clone()),
             Some(raw_message_id),
             None,
@@ -4602,12 +5028,20 @@ fn map_smartsentinel_snapshot(
 
     Ok(SmartSentinelSnapshotResponse {
         raw_message_id,
-        entities_created_or_updated,
-        relationships_created,
-        observations_created,
-        events_created,
         snapshot_id,
         node_id,
+        entities_created,
+        entities_updated,
+        entities_reused,
+        entities_skipped,
+        relationships_created,
+        relationships_reused,
+        relationships_skipped,
+        observations_created,
+        events_created,
+        validation_warnings: validation.warnings,
+        validation_errors: validation.errors,
+        skipped_items: validation.skipped_items,
     })
 }
 
@@ -4618,14 +5052,45 @@ fn upsert_smartsentinel_entity(
     snapshot_id: &str,
     snapshot_entity: &SmartSentinelSnapshotEntity,
     now: DateTime<Utc>,
-) -> Result<Entity, ApiError> {
-    if let Some(entity) = state
+) -> Result<(Entity, SmartSentinelEntityMappingStatus), ApiError> {
+    let jsonld = smartsentinel_entity_jsonld(entity_key, node_id, snapshot_id, snapshot_entity);
+    if let Some(mut entity) = state
         .storage
         .get_entity_by_key(state.tenant_id, entity_key)?
     {
-        return Ok(entity);
+        let new_entity_type = snapshot_entity.entity_type.clone();
+        let unchanged = entity.entity_type == new_entity_type && entity.jsonld == jsonld;
+        if unchanged {
+            return Ok((entity, SmartSentinelEntityMappingStatus::Reused));
+        }
+        entity.entity_type = new_entity_type;
+        entity.jsonld = jsonld;
+        entity.updated_at = now;
+        let entity = state.storage.update_entity(entity)?;
+        return Ok((entity, SmartSentinelEntityMappingStatus::Updated));
     }
 
+    let entity = Entity::new(
+        state.tenant_id,
+        entity_key,
+        snapshot_entity.entity_type.clone(),
+        jsonld,
+        now,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    Ok((
+        state.storage.create_entity(entity)?,
+        SmartSentinelEntityMappingStatus::Created,
+    ))
+}
+
+fn smartsentinel_entity_jsonld(
+    entity_key: &str,
+    node_id: &str,
+    snapshot_id: &str,
+    snapshot_entity: &SmartSentinelSnapshotEntity,
+) -> Value {
     let jsonld = json!({
         "@context": smartsentinel_jsonld_context(),
         "@id": format!("urn:aion:smartsentinel:{node_id}:{}", snapshot_entity.id),
@@ -4638,29 +5103,46 @@ fn upsert_smartsentinel_entity(
         "sentinel:status": snapshot_entity.status,
         "sentinel:properties": snapshot_entity.properties
     });
-    let entity = Entity::new(
-        state.tenant_id,
-        entity_key,
-        snapshot_entity.entity_type.clone(),
-        jsonld,
-        now,
-    )
-    .map_err(|err| ApiError::bad_request(err.to_string()))?;
-
-    Ok(state.storage.create_entity(entity)?)
+    jsonld
 }
 
-fn smartsentinel_lookup_entity(
+fn smartsentinel_relationship_exists(
+    state: &AppState,
+    source_entity_id: Uuid,
+    relationship_type: &str,
+    target_entity_id: Uuid,
+) -> Result<bool, ApiError> {
+    Ok(state
+        .storage
+        .list_relationships(
+            state.tenant_id,
+            Some(source_entity_id),
+            Some(target_entity_id),
+        )?
+        .into_iter()
+        .any(|relationship| relationship.relationship_type == relationship_type))
+}
+
+fn resolve_smartsentinel_mapped_entity_id(
+    state: &AppState,
+    node_id: &str,
     entity_ids: &HashMap<String, Uuid>,
-    entity_id: &str,
-    field_name: &str,
+    snapshot_entity_id: &str,
 ) -> Result<Uuid, ApiError> {
-    entity_ids.get(entity_id).copied().ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "SmartSentinel {field_name} '{}' does not reference a mapped entity",
-            entity_id
-        ))
-    })
+    if let Some(entity_id) = entity_ids.get(snapshot_entity_id).copied() {
+        return Ok(entity_id);
+    }
+    let entity_key = smartsentinel_entity_key(node_id, snapshot_entity_id);
+    state
+        .storage
+        .get_entity_by_key(state.tenant_id, &entity_key)?
+        .map(|entity| entity.id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "SmartSentinel entity reference '{}' does not reference a mapped entity",
+                snapshot_entity_id
+            ))
+        })
 }
 
 fn smartsentinel_entity_key(node_id: &str, snapshot_entity_id: &str) -> String {
@@ -8520,6 +9002,9 @@ fn default_true() -> bool {
 struct ApiError {
     status: StatusCode,
     message: String,
+    validation_errors: Vec<SmartSentinelValidationIssue>,
+    validation_warnings: Vec<SmartSentinelValidationIssue>,
+    skipped_items: Vec<SmartSentinelSkippedItem>,
 }
 
 impl ApiError {
@@ -8527,6 +9012,22 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            validation_errors: Vec::new(),
+            validation_warnings: Vec::new(),
+            skipped_items: Vec::new(),
+        }
+    }
+
+    fn smartsentinel_validation(
+        message: impl Into<String>,
+        report: SmartSentinelValidationReport,
+    ) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            validation_errors: report.errors,
+            validation_warnings: report.warnings,
+            skipped_items: report.skipped_items,
         }
     }
 
@@ -8534,6 +9035,9 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: "record was not found".to_string(),
+            validation_errors: Vec::new(),
+            validation_warnings: Vec::new(),
+            skipped_items: Vec::new(),
         }
     }
 }
@@ -8545,15 +9049,24 @@ impl From<StorageError> for ApiError {
             StorageError::Conflict => Self {
                 status: StatusCode::CONFLICT,
                 message: value.to_string(),
+                validation_errors: Vec::new(),
+                validation_warnings: Vec::new(),
+                skipped_items: Vec::new(),
             },
             StorageError::ConflictWithMessage(message) => Self {
                 status: StatusCode::CONFLICT,
                 message,
+                validation_errors: Vec::new(),
+                validation_warnings: Vec::new(),
+                skipped_items: Vec::new(),
             },
             StorageError::InvalidInput(message) => Self::bad_request(message),
             StorageError::Backend(message) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 message,
+                validation_errors: Vec::new(),
+                validation_warnings: Vec::new(),
+                skipped_items: Vec::new(),
             },
         }
     }
@@ -8565,6 +9078,9 @@ impl IntoResponse for ApiError {
             self.status,
             Json(ErrorResponse {
                 error: self.message,
+                validation_errors: self.validation_errors,
+                validation_warnings: self.validation_warnings,
+                skipped_items: self.skipped_items,
             }),
         )
             .into_response()
@@ -8638,10 +9154,15 @@ mod tests {
         let summary = to_json(response).await;
         assert_eq!(summary["snapshot_id"], "snap-001");
         assert_eq!(summary["node_id"], "fog-01");
-        assert_eq!(summary["entities_created_or_updated"], 2);
+        assert_eq!(summary["entities_created"], 2);
+        assert_eq!(summary["entities_updated"], 0);
+        assert_eq!(summary["entities_reused"], 0);
         assert_eq!(summary["relationships_created"], 1);
+        assert_eq!(summary["relationships_reused"], 0);
+        assert_eq!(summary["relationships_skipped"], 0);
         assert_eq!(summary["observations_created"], 2);
         assert_eq!(summary["events_created"], 1);
+        assert_eq!(summary["validation_errors"].as_array().unwrap().len(), 0);
         let raw_message_id = summary["raw_message_id"].as_str().unwrap();
 
         let raw_messages = get_json(
@@ -8699,6 +9220,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_smartsentinel_snapshot_reuses_relationship_and_entities() {
+        let app = app();
+        let first_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_sample_snapshot(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::CREATED);
+
+        let second_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_sample_snapshot(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), StatusCode::CREATED);
+        let summary = to_json(second_response).await;
+
+        assert_eq!(summary["entities_created"], 0);
+        assert_eq!(summary["entities_updated"], 0);
+        assert_eq!(summary["entities_reused"], 2);
+        assert_eq!(summary["relationships_created"], 0);
+        assert_eq!(summary["relationships_reused"], 1);
+        assert_eq!(summary["relationships_skipped"], 0);
+
+        let entities = get_json(&app, "/entities").await;
+        let host_id = entity_id_by_key(&entities, "smartsentinel:fog-01:host:fog-01");
+        let host_context = get_json(&app, &format!("/entities/{host_id}/context")).await;
+        assert_eq!(
+            host_context["outgoing_relationships"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_snapshot_updates_existing_entity_jsonld() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_sample_snapshot(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let mut updated = smartsentinel_sample_snapshot();
+        updated["entities"][1]["status"] = json!("degraded");
+        updated["entities"][1]["properties"] = json!({"version": "2.0.0"});
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                updated,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let summary = to_json(response).await;
+        assert_eq!(summary["entities_created"], 0);
+        assert_eq!(summary["entities_updated"], 1);
+        assert_eq!(summary["entities_reused"], 1);
+
+        let entities = get_json(&app, "/entities").await;
+        let service = entity_by_key(&entities, "smartsentinel:fog-01:service:mosquitto");
+        assert_eq!(service["jsonld"]["sentinel:status"], "degraded");
+        assert_eq!(service["jsonld"]["sentinel:properties"]["version"], "2.0.0");
+    }
+
+    #[tokio::test]
     async fn invalid_smartsentinel_snapshot_preserves_raw_and_records_failure_event() {
         let app = app();
         let response = app
@@ -8716,6 +9321,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_json(response).await;
+        assert!(body["validation_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "observed_at_invalid"));
 
         let raw_messages = get_json(
             &app,
@@ -8727,7 +9338,7 @@ mod tests {
         assert!(raw_messages[0]["normalization_error"]
             .as_str()
             .unwrap()
-            .contains("invalid SmartSentinel snapshot"));
+            .contains("validation failed"));
 
         let events = get_json(&app, &format!("/events?raw_message_id={raw_message_id}")).await;
         assert!(events
@@ -8735,6 +9346,88 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| { event["event_type"] == "aion:SmartSentinelSnapshotMappingFailed" }));
+    }
+
+    #[tokio::test]
+    async fn invalid_smartsentinel_snapshot_missing_node_id_returns_structured_validation_error() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                json!({
+                    "snapshot_id": "snap-bad",
+                    "observed_at": "2026-04-29T12:00:00Z"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_json(response).await;
+        assert!(body["validation_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["path"] == "$.node_id" && issue["code"] == "node_id_missing"));
+
+        let raw_messages = get_json(
+            &app,
+            "/raw-messages?payload_format=smartsentinel-snapshot-json",
+        )
+        .await;
+        assert_eq!(raw_messages[0]["normalization_status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn invalid_smartsentinel_relationship_reports_unknown_target() {
+        let app = app();
+        let mut snapshot = smartsentinel_sample_snapshot();
+        snapshot["relationships"][0]["target"] = json!("service:missing");
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                snapshot,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_json(response).await;
+        assert!(body["validation_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "relationship_target_unknown"));
+    }
+
+    #[tokio::test]
+    async fn invalid_smartsentinel_observation_reports_validation_error() {
+        let app = app();
+        let mut snapshot = smartsentinel_sample_snapshot();
+        snapshot["observations"][0]["observed_property"] = json!("");
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                snapshot,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_json(response).await;
+        assert!(body["validation_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "observation_observed_property_missing"));
     }
 
     #[tokio::test]
@@ -14698,14 +15391,19 @@ mod tests {
     }
 
     fn entity_id_by_key(entities: &Value, entity_key: &str) -> String {
+        entity_by_key(entities, entity_key)["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn entity_by_key<'a>(entities: &'a Value, entity_key: &str) -> &'a Value {
         entities
             .as_array()
             .unwrap()
             .iter()
             .find(|entity| entity["entity_key"] == entity_key)
-            .and_then(|entity| entity["id"].as_str())
             .unwrap()
-            .to_string()
     }
 
     async fn complete_executor_test_command(
