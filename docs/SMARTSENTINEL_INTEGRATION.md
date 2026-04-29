@@ -49,7 +49,7 @@ Critical remediation must not be automatic by default. AionCore should require e
 
 SmartSentinel snapshots can be ingested through the same payload-agnostic raw message path as other integrations.
 
-Milestone 40 added the first optional ingestion skeleton. Milestone 41 hardens the same endpoint with reconciliation and diagnostics:
+Milestone 40 added the first optional ingestion skeleton. Milestone 41 hardened reconciliation and diagnostics. Milestone 42 adds provenance and evidence references:
 
 ```text
 POST /integrations/smartsentinel/snapshots
@@ -79,6 +79,9 @@ The initial skeleton supports:
 - `relationships`
 - `observations`
 - `events`
+- `source`
+- `provenance`
+- `evidence`
 
 Snapshot entities become AionCore JSON-LD entities with stable keys shaped as:
 
@@ -222,6 +225,65 @@ The snapshot endpoint returns mapping diagnostics:
 
 Validation errors are also returned in the error response body when validation fails.
 
+## Provenance And Evidence
+
+Snapshots may include a `source` object:
+
+- `agent_id`
+- `agent_version`
+- `host_id`
+- `environment`
+- `collector`
+
+Snapshots may include a `provenance` object:
+
+- `run_id`
+- `cycle_id`
+- `trace_id`
+- `correlation_id`
+- `workflow_id`
+- `external_refs`
+
+Snapshots may include an `evidence` array. Evidence references are metadata only; AionCore does not fetch evidence URIs or validate external network resources.
+
+Supported evidence fields:
+
+- `evidence_id`
+- `evidence_type`: `log`, `metric`, `trace`, `packet_capture`, `screenshot`, `report`, `url`, `command_output`, or `custom`
+- `title`
+- `description`
+- `uri`
+- `external_id`
+- `collected_at`
+- `related_entity_id`
+- `related_event_type`
+- `metadata`
+
+If `evidence_type` is missing, the reference is treated as `custom` and a validation warning is returned. If `uri` is present but not a string, the evidence item is skipped with a validation warning. AionCore does not dereference or fetch `uri`.
+
+Snapshot source, provenance, and evidence are preserved in raw-message metadata and in SmartSentinel lifecycle event metadata. Snapshot events may carry:
+
+- `incident_id`
+- `alert_id`
+- `workflow_id`
+- `run_id`
+- `trace_id`
+- `evidence_refs`
+
+These fields are preserved in AionCore event metadata. Snapshot observations may carry `evidence_refs` and `source`, which are preserved in observation metadata. Evidence entries with `related_entity_id` are also included in the related entity JSON-LD projection when that entity is materialized.
+
+The snapshot response includes:
+
+- `provenance_present`
+- `evidence_count`
+- `external_ref_count`
+- `correlation_id`
+- `trace_id`
+- `run_id`
+- `cycle_id`
+
+AI context endpoints already include recent events and observations with their metadata, so provenance and evidence references become visible through `/ai/context/entity/{entity_id}` without adding a separate AI feature.
+
 Materialize as Commands:
 
 - Run diagnostic.
@@ -300,6 +362,7 @@ The SmartSentinel integration should not:
 - No live polling is implemented.
 - No authentication is implemented for the integration endpoint.
 - No recovery action execution is implemented.
+- Evidence URIs are never fetched by AionCore.
 - No delete or graph reconciliation is performed when later snapshots omit an entity.
 - The mapper accepts a simplified snapshot shape only.
 - Relationship de-duplication is limited to exact source/type/target matches.

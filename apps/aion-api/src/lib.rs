@@ -359,6 +359,10 @@ pub struct SmartSentinelSnapshot {
     pub snapshot_id: String,
     pub node_id: String,
     pub observed_at: Option<DateTime<Utc>>,
+    pub source: Option<Value>,
+    pub provenance: Option<Value>,
+    #[serde(default)]
+    pub evidence: Vec<Value>,
     #[serde(default)]
     pub entities: Vec<SmartSentinelSnapshotEntity>,
     #[serde(default)]
@@ -395,6 +399,8 @@ pub struct SmartSentinelSnapshotObservation {
     pub value: Value,
     pub unit: Option<String>,
     pub observed_at: Option<DateTime<Utc>>,
+    pub evidence_refs: Option<Value>,
+    pub source: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -405,6 +411,12 @@ pub struct SmartSentinelSnapshotEvent {
     pub severity: Option<EventSeverity>,
     pub message: Option<String>,
     pub occurred_at: Option<DateTime<Utc>>,
+    pub incident_id: Option<String>,
+    pub alert_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub run_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub evidence_refs: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -424,6 +436,13 @@ pub struct SmartSentinelSnapshotResponse {
     pub validation_warnings: Vec<SmartSentinelValidationIssue>,
     pub validation_errors: Vec<SmartSentinelValidationIssue>,
     pub skipped_items: Vec<SmartSentinelSkippedItem>,
+    pub provenance_present: bool,
+    pub evidence_count: usize,
+    pub external_ref_count: usize,
+    pub correlation_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub run_id: Option<String>,
+    pub cycle_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,6 +470,17 @@ enum SmartSentinelEntityMappingStatus {
     Created,
     Updated,
     Reused,
+}
+
+#[derive(Debug, Clone)]
+struct SmartSentinelProvenanceSummary {
+    provenance_present: bool,
+    evidence_count: usize,
+    external_ref_count: usize,
+    correlation_id: Option<String>,
+    trace_id: Option<String>,
+    run_id: Option<String>,
+    cycle_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3933,6 +3963,8 @@ async fn ingest_smartsentinel_snapshot(
         .map(ToOwned::to_owned);
     let raw_snapshot_id = snapshot_id.clone();
     let raw_node_id = node_id.clone();
+    let provenance_metadata = smartsentinel_provenance_metadata_from_payload(&payload);
+    let provenance_summary = smartsentinel_provenance_summary(&provenance_metadata);
     let mut raw_message = RawMessage::new(
         state.tenant_id,
         RawMessageSource::Http,
@@ -3951,6 +3983,7 @@ async fn ingest_smartsentinel_snapshot(
             "topic_or_path": "/integrations/smartsentinel/snapshots",
             "snapshot_id": snapshot_id,
             "node_id": node_id,
+            "smartsentinel": provenance_metadata,
             "decoder_metadata": {
                 "adapter": "SmartSentinelSnapshotDecoder",
                 "domain_agnostic": true,
@@ -3975,6 +4008,14 @@ async fn ingest_smartsentinel_snapshot(
             "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
             "snapshot_id": raw_snapshot_id,
             "node_id": raw_node_id,
+            "source": provenance_metadata.get("source").cloned(),
+            "provenance": provenance_metadata.get("provenance").cloned(),
+            "evidence_count": provenance_summary.evidence_count,
+            "external_ref_count": provenance_summary.external_ref_count,
+            "correlation_id": provenance_summary.correlation_id,
+            "trace_id": provenance_summary.trace_id,
+            "run_id": provenance_summary.run_id,
+            "cycle_id": provenance_summary.cycle_id,
             "validation_warning_count": validation.warnings.len(),
             "validation_error_count": validation.errors.len(),
             "skipped_item_count": validation.skipped_items.len()
@@ -3999,6 +4040,14 @@ async fn ingest_smartsentinel_snapshot(
                 "snapshot_id": raw_snapshot_id,
                 "node_id": raw_node_id,
                 "reason": "validation_failed",
+                "source": provenance_metadata.get("source").cloned(),
+                "provenance": provenance_metadata.get("provenance").cloned(),
+                "evidence_count": provenance_summary.evidence_count,
+                "external_ref_count": provenance_summary.external_ref_count,
+                "correlation_id": provenance_summary.correlation_id,
+                "trace_id": provenance_summary.trace_id,
+                "run_id": provenance_summary.run_id,
+                "cycle_id": provenance_summary.cycle_id,
                 "validation_warning_count": validation.warnings.len(),
                 "validation_error_count": validation.errors.len(),
                 "skipped_item_count": validation.skipped_items.len()
@@ -4032,7 +4081,15 @@ async fn ingest_smartsentinel_snapshot(
                         "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
                         "snapshot_id": raw_snapshot_id,
                         "node_id": raw_node_id,
-                        "reason": "mapping_error"
+                        "reason": "mapping_error",
+                        "source": provenance_metadata.get("source").cloned(),
+                        "provenance": provenance_metadata.get("provenance").cloned(),
+                        "evidence_count": provenance_summary.evidence_count,
+                        "external_ref_count": provenance_summary.external_ref_count,
+                        "correlation_id": provenance_summary.correlation_id,
+                        "trace_id": provenance_summary.trace_id,
+                        "run_id": provenance_summary.run_id,
+                        "cycle_id": provenance_summary.cycle_id
                     }),
                 )?;
                 return Err(err);
@@ -4053,6 +4110,8 @@ async fn ingest_smartsentinel_snapshot(
             "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
             "snapshot_id": summary.snapshot_id,
             "node_id": summary.node_id,
+            "source": provenance_metadata.get("source").cloned(),
+            "provenance": provenance_metadata.get("provenance").cloned(),
             "entities_created": summary.entities_created,
             "entities_updated": summary.entities_updated,
             "entities_reused": summary.entities_reused,
@@ -4062,6 +4121,13 @@ async fn ingest_smartsentinel_snapshot(
             "relationships_skipped": summary.relationships_skipped,
             "observations_created": summary.observations_created,
             "events_created": summary.events_created,
+            "provenance_present": summary.provenance_present,
+            "evidence_count": summary.evidence_count,
+            "external_ref_count": summary.external_ref_count,
+            "correlation_id": summary.correlation_id,
+            "trace_id": summary.trace_id,
+            "run_id": summary.run_id,
+            "cycle_id": summary.cycle_id,
             "validation_warning_count": summary.validation_warnings.len(),
             "validation_error_count": summary.validation_errors.len(),
             "skipped_item_count": summary.skipped_items.len()
@@ -4427,6 +4493,91 @@ async fn ingest_http_resolved(
     ))
 }
 
+fn smartsentinel_provenance_metadata_from_payload(payload: &Value) -> Value {
+    json!({
+        "source": payload.get("source").cloned(),
+        "provenance": payload.get("provenance").cloned(),
+        "evidence": payload.get("evidence").cloned().unwrap_or_else(|| json!([]))
+    })
+}
+
+fn smartsentinel_provenance_metadata(snapshot: &SmartSentinelSnapshot) -> Value {
+    json!({
+        "source": snapshot.source,
+        "provenance": snapshot.provenance,
+        "evidence": snapshot.evidence
+    })
+}
+
+fn smartsentinel_provenance_summary(metadata: &Value) -> SmartSentinelProvenanceSummary {
+    let provenance = metadata.get("provenance").filter(|value| value.is_object());
+    SmartSentinelProvenanceSummary {
+        provenance_present: provenance.is_some(),
+        evidence_count: metadata
+            .get("evidence")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter(|value| smartsentinel_evidence_reference_is_usable(value))
+                    .count()
+            })
+            .unwrap_or(0),
+        external_ref_count: provenance
+            .and_then(|value| value.get("external_refs"))
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0),
+        correlation_id: provenance
+            .and_then(|value| optional_trimmed_string(value, "correlation_id")),
+        trace_id: provenance.and_then(|value| optional_trimmed_string(value, "trace_id")),
+        run_id: provenance.and_then(|value| optional_trimmed_string(value, "run_id")),
+        cycle_id: provenance.and_then(|value| optional_trimmed_string(value, "cycle_id")),
+    }
+}
+
+fn optional_trimmed_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn smartsentinel_evidence_reference_is_usable(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object
+        .get("uri")
+        .map(|value| value.is_string())
+        .unwrap_or(true)
+}
+
+fn smartsentinel_base_metadata(
+    snapshot_id: &str,
+    node_id: &str,
+    provenance_metadata: &Value,
+) -> Value {
+    let summary = smartsentinel_provenance_summary(provenance_metadata);
+    json!({
+        "adapter": "SmartSentinelSnapshotDecoder",
+        "snapshot_id": snapshot_id,
+        "node_id": node_id,
+        "source": provenance_metadata.get("source").cloned(),
+        "provenance": provenance_metadata.get("provenance").cloned(),
+        "evidence": provenance_metadata.get("evidence").cloned().unwrap_or_else(|| json!([])),
+        "evidence_count": summary.evidence_count,
+        "external_ref_count": summary.external_ref_count,
+        "correlation_id": summary.correlation_id,
+        "trace_id": summary.trace_id,
+        "run_id": summary.run_id,
+        "cycle_id": summary.cycle_id,
+        "uri_fetch_attempted": false
+    })
+}
+
 fn validate_smartsentinel_snapshot(
     state: &AppState,
     payload: &Value,
@@ -4602,8 +4753,89 @@ fn validate_smartsentinel_snapshot(
         &snapshot_entity_ids,
         &mut report,
     )?;
+    validate_smartsentinel_evidence_items(object.get("evidence"), &mut report);
 
     Ok(report)
+}
+
+fn validate_smartsentinel_evidence_items(
+    value: Option<&Value>,
+    report: &mut SmartSentinelValidationReport,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let Some(evidence) = value.as_array() else {
+        report.warnings.push(smartsentinel_issue(
+            "$.evidence",
+            "evidence_not_array",
+            "evidence must be an array when present; evidence references will be ignored",
+        ));
+        report.skipped_items.push(SmartSentinelSkippedItem {
+            path: "$.evidence".to_string(),
+            reason: "evidence_not_array".to_string(),
+        });
+        return;
+    };
+
+    for (index, evidence) in evidence.iter().enumerate() {
+        let path = format!("$.evidence[{index}]");
+        let Some(object) = evidence.as_object() else {
+            report.warnings.push(smartsentinel_issue(
+                path.clone(),
+                "evidence_not_object",
+                "evidence entry must be a JSON object; item will be skipped",
+            ));
+            report.skipped_items.push(SmartSentinelSkippedItem {
+                path,
+                reason: "evidence_not_object".to_string(),
+            });
+            continue;
+        };
+
+        if object
+            .get("evidence_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            report.warnings.push(smartsentinel_issue(
+                format!("{path}.evidence_type"),
+                "evidence_type_defaulted",
+                "evidence_type is missing; it will be interpreted as custom",
+            ));
+        }
+
+        if let Some(uri) = object.get("uri") {
+            if !uri.is_string() {
+                report.warnings.push(smartsentinel_issue(
+                    format!("{path}.uri"),
+                    "evidence_uri_invalid",
+                    "evidence uri must be a string when present; item will be skipped",
+                ));
+                report.skipped_items.push(SmartSentinelSkippedItem {
+                    path: path.clone(),
+                    reason: "evidence_uri_invalid".to_string(),
+                });
+            }
+        }
+
+        if let Some(collected_at) = object.get("collected_at") {
+            let before = report.errors.len();
+            validate_optional_rfc3339(
+                collected_at,
+                format!("{path}.collected_at"),
+                "collected_at",
+                report,
+            );
+            if report.errors.len() > before {
+                if let Some(issue) = report.errors.pop() {
+                    report.warnings.push(issue);
+                }
+            }
+        }
+    }
 }
 
 fn validate_smartsentinel_observation_items(
@@ -4821,6 +5053,8 @@ fn map_smartsentinel_snapshot(
     let snapshot_id = snapshot.snapshot_id.clone();
     let node_id = snapshot.node_id.clone();
     let observed_at = snapshot.observed_at.unwrap_or(received_at);
+    let provenance_metadata = smartsentinel_provenance_metadata(&snapshot);
+    let provenance_summary = smartsentinel_provenance_summary(&provenance_metadata);
     let mut entity_ids = HashMap::new();
     let mut entities_created = 0;
     let mut entities_updated = 0;
@@ -4840,6 +5074,7 @@ fn map_smartsentinel_snapshot(
             &entity_key,
             &node_id,
             &snapshot_id,
+            &snapshot,
             snapshot_entity,
             received_at,
         )?;
@@ -4929,13 +5164,18 @@ fn map_smartsentinel_snapshot(
                 SMARTSENTINEL_PAYLOAD_FORMAT,
                 Some(raw_message_id),
                 json!({"source": "smartsentinel"}),
-                json!({
-                    "adapter": "SmartSentinelSnapshotDecoder",
-                    "snapshot_id": snapshot_id,
-                    "node_id": node_id,
-                    "source": "entity_status",
-                    "snapshot_entity_id": snapshot_entity.id
-                }),
+                {
+                    let mut metadata =
+                        smartsentinel_base_metadata(&snapshot_id, &node_id, &provenance_metadata);
+                    merge_json_object(
+                        &mut metadata,
+                        json!({
+                        "source": "entity_status",
+                        "snapshot_entity_id": snapshot_entity.id
+                            }),
+                    );
+                    metadata
+                },
             )
             .map_err(|err| ApiError::bad_request(err.to_string()))?;
             let observation = state.storage.store_observation(observation)?;
@@ -4965,13 +5205,20 @@ fn map_smartsentinel_snapshot(
             SMARTSENTINEL_PAYLOAD_FORMAT,
             Some(raw_message_id),
             json!({"source": "smartsentinel"}),
-            json!({
-                "adapter": "SmartSentinelSnapshotDecoder",
-                "snapshot_id": snapshot_id,
-                "node_id": node_id,
-                "source": "snapshot_observation",
-                "snapshot_entity_id": snapshot_observation.entity_id
-            }),
+            {
+                let mut metadata =
+                    smartsentinel_base_metadata(&snapshot_id, &node_id, &provenance_metadata);
+                merge_json_object(
+                    &mut metadata,
+                    json!({
+                    "source": "snapshot_observation",
+                    "snapshot_entity_id": snapshot_observation.entity_id,
+                    "observation_source": snapshot_observation.source,
+                    "evidence_refs": snapshot_observation.evidence_refs
+                        }),
+                );
+                metadata
+            },
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
         let observation = state.storage.store_observation(observation)?;
@@ -5012,12 +5259,12 @@ fn map_smartsentinel_snapshot(
             None,
             None,
             None,
-            Some(json!({
-                "adapter": "SmartSentinelSnapshotDecoder",
-                "snapshot_id": snapshot_id,
-                "node_id": node_id,
-                "source": "snapshot_event"
-            })),
+            Some(smartsentinel_event_metadata(
+                &snapshot_id,
+                &node_id,
+                &provenance_metadata,
+                snapshot_event,
+            )),
             received_at,
         )
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -5042,6 +5289,13 @@ fn map_smartsentinel_snapshot(
         validation_warnings: validation.warnings,
         validation_errors: validation.errors,
         skipped_items: validation.skipped_items,
+        provenance_present: provenance_summary.provenance_present,
+        evidence_count: provenance_summary.evidence_count,
+        external_ref_count: provenance_summary.external_ref_count,
+        correlation_id: provenance_summary.correlation_id,
+        trace_id: provenance_summary.trace_id,
+        run_id: provenance_summary.run_id,
+        cycle_id: provenance_summary.cycle_id,
     })
 }
 
@@ -5050,10 +5304,12 @@ fn upsert_smartsentinel_entity(
     entity_key: &str,
     node_id: &str,
     snapshot_id: &str,
+    snapshot: &SmartSentinelSnapshot,
     snapshot_entity: &SmartSentinelSnapshotEntity,
     now: DateTime<Utc>,
 ) -> Result<(Entity, SmartSentinelEntityMappingStatus), ApiError> {
-    let jsonld = smartsentinel_entity_jsonld(entity_key, node_id, snapshot_id, snapshot_entity);
+    let jsonld =
+        smartsentinel_entity_jsonld(entity_key, node_id, snapshot_id, snapshot, snapshot_entity);
     if let Some(mut entity) = state
         .storage
         .get_entity_by_key(state.tenant_id, entity_key)?
@@ -5089,8 +5345,22 @@ fn smartsentinel_entity_jsonld(
     entity_key: &str,
     node_id: &str,
     snapshot_id: &str,
+    snapshot: &SmartSentinelSnapshot,
     snapshot_entity: &SmartSentinelSnapshotEntity,
 ) -> Value {
+    let related_evidence = snapshot
+        .evidence
+        .iter()
+        .filter(|evidence| {
+            evidence
+                .get("related_entity_id")
+                .and_then(Value::as_str)
+                .map(|entity_id| entity_id == snapshot_entity.id)
+                .unwrap_or(false)
+                && smartsentinel_evidence_reference_is_usable(evidence)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let jsonld = json!({
         "@context": smartsentinel_jsonld_context(),
         "@id": format!("urn:aion:smartsentinel:{node_id}:{}", snapshot_entity.id),
@@ -5101,9 +5371,32 @@ fn smartsentinel_entity_jsonld(
         "sentinel:nodeId": node_id,
         "sentinel:snapshotId": snapshot_id,
         "sentinel:status": snapshot_entity.status,
-        "sentinel:properties": snapshot_entity.properties
+        "sentinel:properties": snapshot_entity.properties,
+        "sentinel:evidence": related_evidence
     });
     jsonld
+}
+
+fn smartsentinel_event_metadata(
+    snapshot_id: &str,
+    node_id: &str,
+    provenance_metadata: &Value,
+    snapshot_event: &SmartSentinelSnapshotEvent,
+) -> Value {
+    let mut metadata = smartsentinel_base_metadata(snapshot_id, node_id, provenance_metadata);
+    merge_json_object(
+        &mut metadata,
+        json!({
+            "source": "snapshot_event",
+            "incident_id": snapshot_event.incident_id,
+            "alert_id": snapshot_event.alert_id,
+            "workflow_id": snapshot_event.workflow_id,
+            "run_id": snapshot_event.run_id,
+            "trace_id": snapshot_event.trace_id,
+            "evidence_refs": snapshot_event.evidence_refs
+        }),
+    );
+    metadata
 }
 
 fn smartsentinel_relationship_exists(
@@ -9469,6 +9762,114 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = to_json(response).await;
         assert_eq!(body["observations"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_snapshot_preserves_provenance_and_evidence_metadata() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_snapshot_with_provenance(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let summary = to_json(response).await;
+        assert_eq!(summary["provenance_present"], true);
+        assert_eq!(summary["evidence_count"], 2);
+        assert_eq!(summary["external_ref_count"], 1);
+        assert_eq!(summary["correlation_id"], "corr-123");
+        assert_eq!(summary["trace_id"], "trace-abc");
+        assert_eq!(summary["run_id"], "run-42");
+        assert_eq!(summary["cycle_id"], "cycle-7");
+        let raw_message_id = summary["raw_message_id"].as_str().unwrap();
+
+        let events = get_json(&app, &format!("/events?raw_message_id={raw_message_id}")).await;
+        assert!(events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "aion:SmartSentinelSnapshotReceived"
+                && event["metadata"]["provenance"]["correlation_id"] == "corr-123"
+                && event["metadata"]["evidence_count"] == 2
+        }));
+        assert!(events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "aion:SmartSentinelSnapshotMapped"
+                && event["metadata"]["trace_id"] == "trace-abc"
+                && event["metadata"]["external_ref_count"] == 1
+        }));
+
+        let sentinel_event = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "sentinel:IncidentOpened")
+            .unwrap();
+        assert_eq!(sentinel_event["metadata"]["incident_id"], "inc-001");
+        assert_eq!(sentinel_event["metadata"]["alert_id"], "alert-001");
+        assert_eq!(sentinel_event["metadata"]["workflow_id"], "wf-remediate");
+        assert_eq!(sentinel_event["metadata"]["evidence_refs"][0], "ev-log-1");
+        assert_eq!(sentinel_event["metadata"]["uri_fetch_attempted"], false);
+
+        let entities = get_json(&app, "/entities").await;
+        let service_id = entity_id_by_key(&entities, "smartsentinel:fog-02:service:api");
+        let observations = get_json(
+            &app,
+            &format!("/observations?feature_of_interest_id={service_id}"),
+        )
+        .await;
+        assert!(observations.as_array().unwrap().iter().any(|observation| {
+            observation["metadata"]["evidence_refs"][0] == "ev-metric-1"
+                && observation["metadata"]["provenance"]["run_id"] == "run-42"
+                && observation["metadata"]["uri_fetch_attempted"] == false
+        }));
+
+        let ai_context = get_json(&app, &format!("/ai/context/entity/{service_id}")).await;
+        assert!(ai_context["recent_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["metadata"]["incident_id"] == "inc-001"
+                    && event["metadata"]["evidence_refs"][0] == "ev-log-1"
+            }));
+        assert!(ai_context["recent_observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|observation| observation["metadata"]["evidence_refs"][0] == "ev-metric-1"));
+    }
+
+    #[tokio::test]
+    async fn invalid_smartsentinel_evidence_uri_is_warning_not_fetch() {
+        let app = app();
+        let mut snapshot = smartsentinel_snapshot_with_provenance();
+        snapshot["evidence"][0]["uri"] = json!({"not": "a string"});
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                snapshot,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let summary = to_json(response).await;
+        assert_eq!(summary["evidence_count"], 1);
+        assert!(summary["validation_warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "evidence_uri_invalid"));
+        assert!(summary["skipped_items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["reason"] == "evidence_uri_invalid"));
     }
 
     #[test]
@@ -15363,6 +15764,97 @@ mod tests {
                     "target_entity_id": "service:mosquitto",
                     "severity": "warning",
                     "message": "API service degraded"
+                }
+            ]
+        })
+    }
+
+    fn smartsentinel_snapshot_with_provenance() -> Value {
+        json!({
+            "snapshot_id": "snap-prov-001",
+            "node_id": "fog-02",
+            "observed_at": "2026-04-29T13:00:00Z",
+            "source": {
+                "agent_id": "agent-fog-02",
+                "agent_version": "0.4.2",
+                "host_id": "fog-02",
+                "environment": "fog",
+                "collector": "smartsentinel-snapshot"
+            },
+            "provenance": {
+                "run_id": "run-42",
+                "cycle_id": "cycle-7",
+                "trace_id": "trace-abc",
+                "correlation_id": "corr-123",
+                "workflow_id": "wf-remediate",
+                "external_refs": [
+                    {"system": "incident-platform", "external_id": "inc-001"}
+                ]
+            },
+            "evidence": [
+                {
+                    "evidence_id": "ev-log-1",
+                    "evidence_type": "log",
+                    "title": "API error log",
+                    "uri": "https://evidence.example.invalid/logs/api",
+                    "external_id": "log-001",
+                    "collected_at": "2026-04-29T13:00:02Z",
+                    "related_entity_id": "service:api",
+                    "metadata": {"line_count": 20}
+                },
+                {
+                    "evidence_id": "ev-metric-1",
+                    "evidence_type": "metric",
+                    "title": "Latency p95",
+                    "external_id": "metric-001",
+                    "related_entity_id": "service:api"
+                }
+            ],
+            "entities": [
+                {
+                    "id": "host:fog-02",
+                    "type": "sentinel:Host",
+                    "name": "fog-02",
+                    "properties": {}
+                },
+                {
+                    "id": "service:api",
+                    "type": "sentinel:Service",
+                    "name": "api",
+                    "status": "degraded",
+                    "properties": {}
+                }
+            ],
+            "relationships": [
+                {
+                    "source": "host:fog-02",
+                    "type": "sentinel:runs",
+                    "target": "service:api"
+                }
+            ],
+            "observations": [
+                {
+                    "entity_id": "service:api",
+                    "observed_property": "sentinel:LatencyP95",
+                    "value": 832.0,
+                    "unit": "ms",
+                    "observed_at": "2026-04-29T13:00:03Z",
+                    "evidence_refs": ["ev-metric-1"],
+                    "source": {"collector": "metrics-summary"}
+                }
+            ],
+            "events": [
+                {
+                    "event_type": "sentinel:IncidentOpened",
+                    "target_entity_id": "service:api",
+                    "severity": "warning",
+                    "message": "API latency degraded",
+                    "incident_id": "inc-001",
+                    "alert_id": "alert-001",
+                    "workflow_id": "wf-remediate",
+                    "run_id": "run-42",
+                    "trace_id": "trace-abc",
+                    "evidence_refs": ["ev-log-1"]
                 }
             ]
         })
