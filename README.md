@@ -378,6 +378,49 @@ $raw.connector_profile
 $events.metadata
 ```
 
+Validate the connector without contacting TTN:
+
+```powershell
+$validation = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/validate"
+
+$validation.valid
+$validation.readiness
+$validation.issues
+$validation.warnings
+$validation.mapping_count
+$validation.enabled_mapping_count
+```
+
+Validation readiness is configuration-oriented:
+
+- `ready`: no blocking issues, connector enabled, and at least one enabled TTN device mapping exists.
+- `degraded`: no blocking issues, but the connector is disabled or has warnings such as no mappings or missing public-broker credentials.
+- `invalid`: deterministic configuration checks found blocking issues such as missing broker URL, missing/implausible topic filter, wrong connector type, or unsupported payload format.
+
+Missing mappings and likely missing public TTN broker authentication are warnings:
+
+```powershell
+$ttnNoMappings = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors" `
+  -ContentType "application/json" `
+  -Body (@{
+    connector_key = "ttn-no-mappings"
+    connector_type = "mqtt"
+    connector_profile = "ttn-v3"
+    enabled = $true
+    broker_url = "mqtt://eu1.cloud.thethings.network:1883"
+    topic_filter = "v3/demo-application/devices/+/up"
+    payload_format = "ttn-uplink-json"
+  } | ConvertTo-Json -Depth 8)
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnNoMappings.id)/validate"
+```
+
 Update and delete mappings explicitly:
 
 ```powershell

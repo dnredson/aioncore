@@ -61,9 +61,11 @@ Connector registry endpoints:
 POST /ingestion/connectors
 GET /ingestion/connectors
 GET /ingestion/connectors/{connector_id}
+PATCH /ingestion/connectors/{connector_id}
 PUT /ingestion/connectors/{connector_id}/enable
 PUT /ingestion/connectors/{connector_id}/disable
 GET /ingestion/connectors/{connector_id}/status
+GET /ingestion/connectors/{connector_id}/validate
 GET /ingestion/workers/plan
 ```
 
@@ -115,6 +117,55 @@ The registry is supported by in-memory storage and PostgreSQL persistence. Durab
 
 The existing environment-variable MQTT configuration remains the default runtime MQTT connector path. It is independent of connector-based MQTT workers.
 
+## Connector Validation
+
+Connector validation is exposed through:
+
+```text
+GET /ingestion/connectors/{connector_id}/validate
+```
+
+For `connector_profile = "ttn-v3"`, validation is deterministic and non-network. It does not connect to TTN, authenticate to a broker, subscribe to topics, verify accounts, or validate TLS/mTLS. The response includes:
+
+- `connector_id`
+- `connector_key`
+- `valid`
+- `readiness`: `ready`, `degraded`, or `invalid`
+- `issues`
+- `warnings`
+- `detected_profile`
+- `expected_topic_shape`
+- `mapping_count`
+- `enabled_mapping_count`
+- `has_secret_ref`
+- `payload_format_supported`
+- `generated_at`
+
+Blocking TTN validation issues include:
+
+- `invalid_connector_type`: TTN v3 connectors must be MQTT connectors.
+- `missing_broker_url`: no broker URL is configured.
+- `missing_topic_filter`: no topic filter is configured.
+- `implausible_ttn_topic_filter`: topic filter does not look like a The Things Stack uplink topic.
+- `unsupported_ttn_payload_format`: payload format is not `ttn-uplink-json`.
+
+The accepted TTN topic shape is intentionally simple and non-network: the topic filter should contain `v3/`, `/devices/`, and `/up`, such as `v3/{application_id}/devices/+/up`.
+
+TTN validation warnings include:
+
+- `missing_ttn_device_mappings`: no TTN device mappings exist for the connector.
+- `no_enabled_ttn_device_mappings`: mappings exist, but none are enabled.
+- `missing_secret_ref_for_public_ttn_broker`: broker URL looks like a public TTN/The Things Stack endpoint and no connector secret reference is set.
+- `connector_disabled`: the connector is disabled.
+
+Validation readiness is derived from issues and warnings:
+
+- `ready`: no issues, connector enabled, and at least one enabled mapping exists.
+- `degraded`: no issues, but warnings are present, no enabled mapping exists, or the connector is disabled.
+- `invalid`: at least one blocking issue is present.
+
+Non-TTN connectors return the same response shape with a `profile_specific_validation_unavailable` warning. `/ready` does not fail because of TTN validation warnings or invalid connector configuration; readiness remains focused on storage and runtime health.
+
 ## Worker Planner
 
 The worker planner is a read-only inspection endpoint:
@@ -140,7 +191,7 @@ Spec status values:
 - `invalid`: connector is enabled but missing required fields.
 - `unsupported`: connector type is not supported by the current runtime planner.
 
-Enabled HTTP connectors plan `http_listener` specs when they have `http_path` or `endpoint`. Enabled MQTT connectors plan `mqtt_subscriber` specs when they have `broker_url` and `topic_filter`. TTN v3 connectors also plan MQTT subscriber specs, but include a validation note when their payload format is not implemented by the current decoder path.
+Enabled HTTP connectors plan `http_listener` specs when they have `http_path` or `endpoint`. Enabled MQTT connectors plan `mqtt_subscriber` specs when they have `broker_url` and `topic_filter`. TTN v3 connectors also plan MQTT subscriber specs, but include validation issues for unsupported payload formats and implausible TTN topic filters.
 
 `GET /ready` includes a cheap worker-plan summary with planned, invalid, and unsupported counts. Connector plan issues do not make readiness fail in this milestone.
 
@@ -222,7 +273,7 @@ During reconciliation:
 - valid enabled `generic-aion-mqtt` and `generic-mqtt` MQTT connectors start a worker if none is running;
 - disabled connectors stop any tracked worker;
 - invalid connectors remain stopped and report validation errors;
-- TTN v3 connectors with `payload_format = "ttn-uplink-json"` can plan/start MQTT subscriber workers when broker and topic settings are valid;
+- TTN v3 connectors with `payload_format = "ttn-uplink-json"` can plan/start MQTT subscriber workers when broker and TTN topic settings are valid;
 - if a tracked worker's relevant signature differs from the planned connector configuration, the worker is restarted.
 
 Relevant signature fields are broker URL, client ID, topic filter, payload format, content type, and connector profile. Public connector updates trigger reconciliation, so changing one of those fields restarts the tracked connector worker when dynamic workers are enabled. If an update saves invalid worker configuration, reconciliation stops any tracked worker and reports `invalid` status with validation details.
@@ -417,6 +468,8 @@ Future TTN adapter behavior should:
 - preserve uplink metadata such as RSSI, SNR, gateway IDs, frame counters, and timestamps;
 - support topic differences across tenant, application, and regional endpoint conventions.
 - validate live TTN broker details and support production TLS/mTLS where required.
+
+TTN connector validation in this milestone is deliberately limited to local configuration diagnostics. It does not prove that a TTN account exists, credentials are correct, a broker is reachable, or a subscription will succeed.
 
 ## Limitations
 

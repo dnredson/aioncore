@@ -498,6 +498,37 @@ pub struct IngestionConnectorStatusResponse {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TtnConnectorReadiness {
+    Ready,
+    Degraded,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TtnConnectorValidationIssue {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TtnConnectorValidation {
+    pub connector_id: Uuid,
+    pub connector_key: String,
+    pub valid: bool,
+    pub readiness: TtnConnectorReadiness,
+    pub issues: Vec<TtnConnectorValidationIssue>,
+    pub warnings: Vec<TtnConnectorValidationIssue>,
+    pub detected_profile: ConnectorProfile,
+    pub expected_topic_shape: &'static str,
+    pub mapping_count: usize,
+    pub enabled_mapping_count: usize,
+    pub has_secret_ref: bool,
+    pub payload_format_supported: bool,
+    pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum IngestionWorkerKind {
     HttpListener,
     MqttSubscriber,
@@ -1112,6 +1143,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/ingestion/connectors/:connector_id/status",
             get(get_ingestion_connector_status),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/validate",
+            get(validate_ingestion_connector),
         )
         .route(
             "/ingestion/connectors/:connector_id/ttn-device-mappings",
@@ -3451,6 +3486,14 @@ async fn get_ingestion_connector_status(
     Ok(Json(connector_status(&state, &connector)))
 }
 
+async fn validate_ingestion_connector(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+) -> Result<Json<TtnConnectorValidation>, ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    Ok(Json(connector_validation(&state, &connector)?))
+}
+
 async fn create_ttn_device_mapping(
     State(state): State<AppState>,
     Path(connector_id): Path<Uuid>,
@@ -4412,6 +4455,155 @@ fn connector_runtime_state_label(status: &ConnectorWorkerRuntimeState) -> &'stat
     }
 }
 
+fn connector_validation(
+    state: &AppState,
+    connector: &IngestionConnector,
+) -> Result<TtnConnectorValidation, ApiError> {
+    let mut issues = Vec::new();
+    let mut warnings = Vec::new();
+    let mappings = if connector.connector_profile == ConnectorProfile::TtnV3 {
+        state
+            .storage
+            .list_ttn_device_mappings(state.tenant_id, connector.id)?
+    } else {
+        Vec::new()
+    };
+    let mapping_count = mappings.len();
+    let enabled_mapping_count = mappings.iter().filter(|mapping| mapping.enabled).count();
+    let payload_format_supported = connector
+        .payload_format
+        .as_deref()
+        .map(is_ttn_uplink_payload_format)
+        .unwrap_or(false);
+
+    if connector.connector_profile != ConnectorProfile::TtnV3 {
+        warnings.push(ttn_validation_issue(
+            "profile_specific_validation_unavailable",
+            "profile-specific validation is currently available only for ttn-v3 connectors",
+        ));
+    } else {
+        if connector.connector_type != IngestionConnectorType::Mqtt {
+            issues.push(ttn_validation_issue(
+                "invalid_connector_type",
+                "TTN v3 connectors must use connector_type mqtt",
+            ));
+        }
+        if connector
+            .broker_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            issues.push(ttn_validation_issue(
+                "missing_broker_url",
+                "TTN v3 connectors should include broker_url before live MQTT operation",
+            ));
+        }
+        match connector.topic_filter.as_deref().map(str::trim) {
+            Some(topic_filter) if !topic_filter.is_empty() => {
+                if !is_plausible_ttn_topic_filter(topic_filter) {
+                    issues.push(ttn_validation_issue(
+                        "implausible_ttn_topic_filter",
+                        "TTN v3 topic_filter should look like v3/{application_id}/devices/+/up",
+                    ));
+                }
+            }
+            _ => issues.push(ttn_validation_issue(
+                "missing_topic_filter",
+                "TTN v3 connectors should include topic_filter before live MQTT operation",
+            )),
+        }
+        if !payload_format_supported {
+            issues.push(ttn_validation_issue(
+                "unsupported_ttn_payload_format",
+                "TTN v3 connectors require payload_format ttn-uplink-json",
+            ));
+        }
+        if mapping_count == 0 {
+            warnings.push(ttn_validation_issue(
+                "missing_ttn_device_mappings",
+                "TTN v3 connector has no device mappings; unmapped uplinks without explicit entity IDs will fail safely",
+            ));
+        } else if enabled_mapping_count == 0 {
+            warnings.push(ttn_validation_issue(
+                "no_enabled_ttn_device_mappings",
+                "TTN v3 connector has mappings, but none are enabled",
+            ));
+        }
+        if connector
+            .broker_url
+            .as_deref()
+            .map(is_public_ttn_broker_url)
+            .unwrap_or(false)
+            && connector.secret_ref_id.is_none()
+        {
+            warnings.push(ttn_validation_issue(
+                "missing_secret_ref_for_public_ttn_broker",
+                "public TTN/The Things Stack brokers usually require MQTT authentication; configure secret_ref_id before live operation",
+            ));
+        }
+        if !connector.enabled {
+            warnings.push(ttn_validation_issue(
+                "connector_disabled",
+                "connector is disabled; configuration can be valid, but runtime readiness is degraded until enabled",
+            ));
+        }
+    }
+
+    let readiness = if !issues.is_empty() {
+        TtnConnectorReadiness::Invalid
+    } else if connector.connector_profile == ConnectorProfile::TtnV3
+        && connector.enabled
+        && enabled_mapping_count > 0
+        && warnings.is_empty()
+    {
+        TtnConnectorReadiness::Ready
+    } else {
+        TtnConnectorReadiness::Degraded
+    };
+
+    Ok(TtnConnectorValidation {
+        connector_id: connector.id,
+        connector_key: connector.connector_key.clone(),
+        valid: issues.is_empty(),
+        readiness,
+        issues,
+        warnings,
+        detected_profile: connector.connector_profile.clone(),
+        expected_topic_shape: "v3/{application_id}/devices/{device_id}/up",
+        mapping_count,
+        enabled_mapping_count,
+        has_secret_ref: connector.secret_ref_id.is_some(),
+        payload_format_supported,
+        generated_at: Utc::now(),
+    })
+}
+
+fn ttn_validation_issue(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> TtnConnectorValidationIssue {
+    TtnConnectorValidationIssue {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn is_plausible_ttn_topic_filter(topic_filter: &str) -> bool {
+    let normalized = topic_filter.trim().to_ascii_lowercase();
+    normalized.contains("v3/")
+        && normalized.contains("/devices/")
+        && (normalized.ends_with("/up") || normalized.contains("/up/"))
+}
+
+fn is_public_ttn_broker_url(broker_url: &str) -> bool {
+    let normalized = broker_url.trim().to_ascii_lowercase();
+    normalized.contains("thethings.network")
+        || normalized.contains("thethings.industries")
+        || normalized.contains("thethingsstack")
+}
+
 fn worker_plan_summary(state: &AppState) -> ReadyWorkerPlanSummary {
     build_ingestion_worker_plan(state)
         .map(|plan| ReadyWorkerPlanSummary {
@@ -5212,6 +5404,12 @@ fn connector_worker_spec(
         }
         match &connector.connector_type {
             IngestionConnectorType::Http => {
+                if connector.connector_profile == ConnectorProfile::TtnV3 {
+                    validation_issues.push(worker_issue(
+                        "invalid_connector_type",
+                        "TTN v3 connector workers require connector_type mqtt",
+                    ));
+                }
                 if connector
                     .http_path
                     .as_deref()
@@ -5255,6 +5453,17 @@ fn connector_worker_spec(
                         "missing_topic_filter",
                         "MQTT connectors require topic_filter before a subscriber can be planned",
                     ));
+                } else if connector.connector_profile == ConnectorProfile::TtnV3
+                    && !connector
+                        .topic_filter
+                        .as_deref()
+                        .map(is_plausible_ttn_topic_filter)
+                        .unwrap_or(false)
+                {
+                    validation_issues.push(worker_issue(
+                        "implausible_ttn_topic_filter",
+                        "TTN v3 topic_filter should look like v3/{application_id}/devices/+/up",
+                    ));
                 }
                 if connector.connector_profile == ConnectorProfile::TtnV3
                     && !connector
@@ -5273,6 +5482,8 @@ fn connector_worker_spec(
                         issue.code.as_str(),
                         "missing_broker_url"
                             | "missing_topic_filter"
+                            | "invalid_connector_type"
+                            | "implausible_ttn_topic_filter"
                             | "missing_secret_ref"
                             | "unsupported_secret_type"
                             | "unsupported_ttn_payload_format"
@@ -9978,6 +10189,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ttn_connector_validation_reports_missing_broker_url() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-validate-missing-broker",
+            "ttn-v3",
+            true,
+            None,
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["valid"], false);
+        assert_eq!(validation["readiness"], "invalid");
+        assert!(validation_issue_codes(&validation, "issues").contains(&"missing_broker_url"));
+    }
+
+    #[tokio::test]
+    async fn ttn_connector_validation_reports_missing_topic_filter() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-validate-missing-topic",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            None,
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["valid"], false);
+        assert!(validation_issue_codes(&validation, "issues").contains(&"missing_topic_filter"));
+    }
+
+    #[tokio::test]
+    async fn ttn_connector_validation_reports_unsupported_payload_format() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-validate-bad-format",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["payload_format_supported"], false);
+        assert!(validation_issue_codes(&validation, "issues")
+            .contains(&"unsupported_ttn_payload_format"));
+    }
+
+    #[tokio::test]
+    async fn valid_looking_ttn_connector_without_mappings_is_degraded_with_warning() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-validate-no-mappings",
+            "ttn-v3",
+            true,
+            Some("mqtt://private.example.test:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["valid"], true);
+        assert_eq!(validation["readiness"], "degraded");
+        assert_eq!(validation["mapping_count"], 0);
+        assert_eq!(validation["enabled_mapping_count"], 0);
+        assert!(validation_issue_codes(&validation, "warnings")
+            .contains(&"missing_ttn_device_mappings"));
+    }
+
+    #[tokio::test]
+    async fn ttn_connector_validation_reports_mapping_counts() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-validation-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-validation-plot-01", "aion:Plot").await;
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-validate-counts",
+            "ttn-v3",
+            true,
+            Some("mqtt://private.example.test:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+        create_ttn_device_mapping(
+            &app,
+            connector["id"].as_str().unwrap(),
+            Some("farm-app"),
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["valid"], true);
+        assert_eq!(validation["readiness"], "ready");
+        assert_eq!(validation["mapping_count"], 1);
+        assert_eq!(validation["enabled_mapping_count"], 1);
+        assert!(validation["warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_ttn_broker_without_secret_ref_warns_about_auth() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-validate-auth-warning",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert!(validation_issue_codes(&validation, "warnings")
+            .contains(&"missing_secret_ref_for_public_ttn_broker"));
+        assert_eq!(validation["has_secret_ref"], false);
+    }
+
+    #[tokio::test]
+    async fn disabled_ttn_connector_validation_is_not_invalid_solely_for_disabled_state() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-validate-disabled",
+            "ttn-v3",
+            false,
+            Some("mqtt://private.example.test:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["valid"], true);
+        assert_eq!(validation["readiness"], "degraded");
+        assert!(validation_issue_codes(&validation, "warnings").contains(&"connector_disabled"));
+    }
+
+    #[tokio::test]
+    async fn non_ttn_connector_validation_returns_generic_response() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "generic-validate",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let validation = validate_connector(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(validation["valid"], true);
+        assert_eq!(validation["detected_profile"], "generic-mqtt");
+        assert!(validation_issue_codes(&validation, "warnings")
+            .contains(&"profile_specific_validation_unavailable"));
+    }
+
+    #[tokio::test]
     async fn existing_http_ingestion_without_connector_still_works() {
         let app = app();
         let sensor_id = create_test_entity(&app, "no-connector-sensor-01", "aion:Sensor").await;
@@ -10069,6 +10456,28 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_plan_includes_ttn_topic_shape_issue() {
+        let app = app();
+        create_mqtt_connector(
+            &app,
+            "ttn-plan-bad-topic",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            Some("aioncore/+/+/data"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let plan = get_worker_plan(&app).await;
+        assert_eq!(plan["invalid_workers"], 1);
+        assert_eq!(
+            plan["specs"][0]["validation_issues"][0]["code"],
+            "implausible_ttn_topic_filter"
+        );
     }
 
     #[tokio::test]
@@ -12189,6 +12598,31 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         to_json(response).await
+    }
+
+    async fn validate_connector(app: &Router, connector_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ingestion/connectors/{connector_id}/validate"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    fn validation_issue_codes<'a>(validation: &'a Value, field: &str) -> Vec<&'a str> {
+        validation[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|issue| issue["code"].as_str().unwrap())
+            .collect()
     }
 
     async fn get_worker_status(app: &Router) -> Value {
