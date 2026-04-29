@@ -187,24 +187,26 @@ pub async fn start_if_enabled(state: AppState) -> Result<(), StartupError> {
 }
 
 pub async fn start(state: AppState, config: MqttIngestConfig) -> Result<(), StartupError> {
-    start_runtime(state, config, false).await
+    start_runtime(state, config, false).await.map(|_| ())
 }
 
 pub async fn start_connector_worker(
     state: AppState,
     config: MqttIngestConfig,
-) -> Result<(), StartupError> {
+) -> Result<tokio::task::JoinHandle<()>, StartupError> {
     if let Some(connector) = config.connector.as_ref() {
         mark_connector_worker_starting(&state, connector.connector_id);
     }
-    start_runtime(state, config, true).await
+    start_runtime(state, config, true)
+        .await?
+        .ok_or_else(|| StartupError::backend_initialization("connector MQTT worker was disabled"))
 }
 
 async fn start_runtime(
     state: AppState,
     config: MqttIngestConfig,
     connector_worker: bool,
-) -> Result<(), StartupError> {
+) -> Result<Option<tokio::task::JoinHandle<()>>, StartupError> {
     update_worker_state(
         &state,
         |worker| {
@@ -219,7 +221,7 @@ async fn start_runtime(
     );
 
     if !config.enabled {
-        return Ok(());
+        return Ok(None);
     }
 
     eprintln!(
@@ -239,7 +241,7 @@ async fn start_runtime(
 
     let (client, mut eventloop) = AsyncClient::new(options, 16);
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let _client = client;
         let _ = record_mqtt_worker_event(
             &state,
@@ -399,7 +401,7 @@ async fn start_runtime(
         }
     });
 
-    Ok(())
+    Ok(Some(handle))
 }
 
 pub fn readiness(state: &AppState) -> MqttReadiness {

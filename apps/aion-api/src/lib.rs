@@ -142,6 +142,23 @@ pub struct AppState {
     mqtt_state: Arc<RwLock<mqtt_ingest::MqttWorkerState>>,
     connector_workers_enabled: Arc<RwLock<bool>>,
     connector_worker_statuses: Arc<RwLock<HashMap<Uuid, ConnectorWorkerRuntimeStatus>>>,
+    connector_worker_handles: Arc<RwLock<HashMap<Uuid, ConnectorWorkerHandle>>>,
+}
+
+#[derive(Debug)]
+struct ConnectorWorkerHandle {
+    signature: ConnectorWorkerSignature,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectorWorkerSignature {
+    broker_url: Option<String>,
+    client_id: Option<String>,
+    topic_filter: Option<String>,
+    payload_format: Option<String>,
+    content_type: Option<String>,
+    connector_profile: ConnectorProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +193,7 @@ impl AppState {
             mqtt_state: Arc::new(RwLock::new(mqtt_ingest::MqttWorkerState::default())),
             connector_workers_enabled: Arc::new(RwLock::new(false)),
             connector_worker_statuses: Arc::new(RwLock::new(HashMap::new())),
+            connector_worker_handles: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -433,8 +451,10 @@ pub enum ConnectorWorkerRuntimeState {
     Starting,
     Running,
     Degraded,
+    Stopped,
     Skipped,
     Invalid,
+    Error,
     Unsupported,
 }
 
@@ -459,6 +479,10 @@ pub struct ConnectorWorkerRuntimeStatus {
     pub last_message_at: Option<DateTime<Utc>>,
     pub last_successful_ingest_at: Option<DateTime<Utc>>,
     pub last_failed_ingest_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub stopped_at: Option<DateTime<Utc>>,
+    pub restart_count: u32,
+    pub last_reconciled_at: Option<DateTime<Utc>>,
     pub validation_issues: Vec<IngestionWorkerValidationIssue>,
     pub metadata: Option<Value>,
 }
@@ -469,6 +493,7 @@ pub struct ConnectorWorkersReadiness {
     pub total: usize,
     pub running: usize,
     pub degraded: usize,
+    pub stopped: usize,
     pub skipped: usize,
     pub invalid: usize,
     pub errors: usize,
@@ -478,6 +503,21 @@ pub struct ConnectorWorkersReadiness {
 pub struct IngestionWorkersStatusResponse {
     pub connector_workers: ConnectorWorkersReadiness,
     pub workers: Vec<ConnectorWorkerRuntimeStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconcileConnectorWorkersResponse {
+    pub connector_workers: ConnectorWorkersReadiness,
+    pub actions: Vec<ConnectorWorkerReconcileAction>,
+    pub workers: Vec<ConnectorWorkerRuntimeStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConnectorWorkerReconcileAction {
+    pub connector_id: Uuid,
+    pub connector_key: String,
+    pub action: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -953,6 +993,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/ingestion/workers/status",
             get(get_ingestion_workers_status),
+        )
+        .route(
+            "/ingestion/workers/reconcile",
+            post(reconcile_ingestion_workers),
         )
         .route("/ingest/http", post(ingest_http))
         .route("/raw-messages", get(query_raw_messages))
@@ -3061,6 +3105,7 @@ async fn create_ingestion_connector(
         &connector,
         Some("Ingestion connector created".to_string()),
     )?;
+    reconcile_connector_workers_after_mutation(&state).await;
     Ok((StatusCode::CREATED, Json(connector)))
 }
 
@@ -3092,6 +3137,7 @@ async fn enable_ingestion_connector(
         &connector,
         Some("Ingestion connector enabled".to_string()),
     )?;
+    reconcile_connector_workers_after_mutation(&state).await;
     Ok(Json(connector))
 }
 
@@ -3108,6 +3154,7 @@ async fn disable_ingestion_connector(
         &connector,
         Some("Ingestion connector disabled".to_string()),
     )?;
+    reconcile_connector_workers_after_mutation(&state).await;
     Ok(Json(connector))
 }
 
@@ -3129,6 +3176,12 @@ async fn get_ingestion_workers_status(
     State(state): State<AppState>,
 ) -> Result<Json<IngestionWorkersStatusResponse>, ApiError> {
     Ok(Json(connector_workers_status(&state)?))
+}
+
+async fn reconcile_ingestion_workers(
+    State(state): State<AppState>,
+) -> Result<Json<ReconcileConnectorWorkersResponse>, ApiError> {
+    reconcile_connector_workers(state, true).await.map(Json)
 }
 
 async fn ingest_http_for_connector(
@@ -3528,7 +3581,11 @@ fn connector_status(
             connector_type: connector.connector_type.clone(),
             connector_profile: connector.connector_profile.clone(),
             enabled: connector.enabled,
-            status: connector_runtime_state_label(&worker.status),
+            status: if !connector.enabled {
+                "disabled"
+            } else {
+                connector_runtime_state_label(&worker.status)
+            },
             last_error: worker.last_error,
             last_message_at: worker.last_message_at,
             last_successful_ingest_at: worker.last_successful_ingest_at,
@@ -3572,8 +3629,10 @@ fn connector_runtime_state_label(status: &ConnectorWorkerRuntimeState) -> &'stat
         ConnectorWorkerRuntimeState::Starting => "starting",
         ConnectorWorkerRuntimeState::Running => "ready",
         ConnectorWorkerRuntimeState::Degraded => "degraded",
+        ConnectorWorkerRuntimeState::Stopped => "stopped",
         ConnectorWorkerRuntimeState::Skipped => "skipped",
         ConnectorWorkerRuntimeState::Invalid => "error",
+        ConnectorWorkerRuntimeState::Error => "error",
         ConnectorWorkerRuntimeState::Unsupported => "unsupported",
     }
 }
@@ -3597,37 +3656,10 @@ async fn start_connector_workers(
     config: ConnectorWorkerConfig,
 ) -> Result<(), StartupError> {
     set_connector_workers_enabled(&state, config.enabled);
-    let plan = build_ingestion_worker_plan(&state)
-        .map_err(|err| StartupError::backend_initialization(err.message))?;
-    apply_connector_worker_plan(&state, &plan, config.enabled)?;
-
-    if !config.enabled {
-        return Ok(());
-    }
-
-    for spec in plan.specs {
-        if connector_worker_start_decision(&spec) != ConnectorWorkerStartDecision::StartMqtt {
-            continue;
-        }
-
-        let mqtt_config = mqtt_ingest::MqttIngestConfig::for_connector(
-            spec.broker_url.clone().unwrap_or_default(),
-            spec.client_id
-                .clone()
-                .unwrap_or_else(|| format!("aioncore-connector-{}", spec.connector_id)),
-            spec.topic_filter.clone().unwrap_or_default(),
-            spec.payload_format.clone(),
-            spec.content_type.clone(),
-            mqtt_ingest::MqttConnectorMetadata {
-                connector_id: spec.connector_id,
-                connector_key: spec.connector_key.clone(),
-                connector_profile: spec.connector_profile.clone(),
-            },
-        );
-        mqtt_ingest::start_connector_worker(state.clone(), mqtt_config).await?;
-    }
-
-    Ok(())
+    reconcile_connector_workers(state, true)
+        .await
+        .map(|_| ())
+        .map_err(|err| StartupError::backend_initialization(err.message))
 }
 
 fn build_ingestion_worker_plan(state: &AppState) -> Result<IngestionWorkerPlan, ApiError> {
@@ -3691,40 +3723,503 @@ fn connector_worker_start_decision(spec: &IngestionWorkerSpec) -> ConnectorWorke
     }
 }
 
-fn apply_connector_worker_plan(
+async fn reconcile_connector_workers_after_mutation(state: &AppState) {
+    if let Err(err) = reconcile_connector_workers(state.clone(), true).await {
+        let _ = record_connector_worker_event(
+            state,
+            "aion:ConnectorWorkerReconcileFailed",
+            EventSeverity::Error,
+            Some("Connector worker reconciliation failed".to_string()),
+            json!({
+                "error": err.message
+            }),
+        );
+    }
+}
+
+async fn reconcile_connector_workers(
+    state: AppState,
+    start_network: bool,
+) -> Result<ReconcileConnectorWorkersResponse, ApiError> {
+    let plan = build_ingestion_worker_plan(&state)?;
+    let workers_enabled = connector_workers_enabled(&state);
+    let mut actions = Vec::new();
+    let now = Utc::now();
+
+    if !workers_enabled {
+        stop_all_connector_workers(&state, now, &mut actions)?;
+        apply_connector_worker_plan_statuses(&state, &plan, now, false, &mut actions)?;
+        let status = connector_workers_status(&state)?;
+        return Ok(ReconcileConnectorWorkersResponse {
+            connector_workers: status.connector_workers,
+            actions,
+            workers: status.workers,
+        });
+    }
+
+    for spec in &plan.specs {
+        reconcile_connector_worker_spec(&state, spec, start_network, now, &mut actions).await?;
+    }
+
+    stop_workers_missing_from_plan(&state, &plan, now, &mut actions)?;
+
+    let status = connector_workers_status(&state)?;
+    Ok(ReconcileConnectorWorkersResponse {
+        connector_workers: status.connector_workers,
+        actions,
+        workers: status.workers,
+    })
+}
+
+fn apply_connector_worker_plan_statuses(
     state: &AppState,
     plan: &IngestionWorkerPlan,
-    emit_runtime_events: bool,
-) -> Result<(), StartupError> {
+    reconciled_at: DateTime<Utc>,
+    emit_skip_events: bool,
+    actions: &mut Vec<ConnectorWorkerReconcileAction>,
+) -> Result<(), ApiError> {
     for spec in &plan.specs {
-        let status = connector_runtime_status_from_spec(spec);
+        let mut status = connector_runtime_status_from_spec(spec);
+        status.last_reconciled_at = Some(reconciled_at);
         set_connector_worker_runtime_status(state, status);
 
-        if emit_runtime_events
+        if emit_skip_events
             && connector_worker_start_decision(spec) == ConnectorWorkerStartDecision::Skip
             && spec.enabled
             && spec.connector_profile == ConnectorProfile::TtnV3
         {
             record_connector_worker_event(
                 state,
-                "aion:IngestionConnectorWorkerSkipped",
+                "aion:ConnectorWorkerSkipped",
                 EventSeverity::Warning,
                 Some(
                     "TTN v3 connector worker skipped because TTN decoding is future work"
                         .to_string(),
                 ),
-                json!({
-                    "connector_id": spec.connector_id,
-                    "connector_key": spec.connector_key,
-                    "connector_profile": spec.connector_profile,
-                    "reason": "ttn_decoding_not_implemented"
-                }),
-            )
-            .map_err(|err| StartupError::backend_initialization(err.message))?;
+                connector_worker_event_metadata(spec, Some("ttn_decoding_not_implemented")),
+            )?;
+            actions.push(connector_worker_action(
+                spec,
+                "skipped",
+                Some("TTN v3 decoding is not implemented yet"),
+            ));
         }
     }
 
     Ok(())
+}
+
+async fn reconcile_connector_worker_spec(
+    state: &AppState,
+    spec: &IngestionWorkerSpec,
+    start_network: bool,
+    reconciled_at: DateTime<Utc>,
+    actions: &mut Vec<ConnectorWorkerReconcileAction>,
+) -> Result<(), ApiError> {
+    let decision = connector_worker_start_decision(spec);
+    match decision {
+        ConnectorWorkerStartDecision::StartMqtt => {
+            let signature = connector_worker_signature(spec);
+            let existing = remove_connector_worker_handle_if_changed_or_finished(
+                state,
+                spec.connector_id,
+                &signature,
+            );
+
+            match existing {
+                ExistingConnectorWorker::Same => {
+                    update_connector_worker_runtime_status(state, spec.connector_id, |worker| {
+                        worker.last_reconciled_at = Some(reconciled_at);
+                    });
+                    actions.push(connector_worker_action(spec, "unchanged", None));
+                }
+                ExistingConnectorWorker::Stopped { reason } => {
+                    let restart_count = connector_worker_restart_count(state, spec.connector_id);
+                    start_connector_worker_from_spec(
+                        state,
+                        spec,
+                        signature,
+                        start_network,
+                        reconciled_at,
+                        restart_count + 1,
+                    )
+                    .await?;
+                    let action = if reason == "config_changed" {
+                        "restarted"
+                    } else {
+                        "started"
+                    };
+                    record_connector_worker_event(
+                        state,
+                        if action == "restarted" {
+                            "aion:ConnectorWorkerRestarted"
+                        } else {
+                            "aion:ConnectorWorkerStarted"
+                        },
+                        EventSeverity::Info,
+                        Some(format!("Connector worker {action}")),
+                        connector_worker_event_metadata(spec, Some(reason)),
+                    )?;
+                    actions.push(connector_worker_action(spec, action, Some(reason)));
+                }
+                ExistingConnectorWorker::None => {
+                    let restart_count = connector_worker_restart_count(state, spec.connector_id);
+                    start_connector_worker_from_spec(
+                        state,
+                        spec,
+                        signature,
+                        start_network,
+                        reconciled_at,
+                        restart_count,
+                    )
+                    .await?;
+                    record_connector_worker_event(
+                        state,
+                        "aion:ConnectorWorkerStarted",
+                        EventSeverity::Info,
+                        Some("Connector worker started".to_string()),
+                        connector_worker_event_metadata(spec, None),
+                    )?;
+                    actions.push(connector_worker_action(spec, "started", None));
+                }
+            }
+        }
+        ConnectorWorkerStartDecision::Skip => {
+            let stopped = stop_connector_worker_if_running(
+                state,
+                spec,
+                reconciled_at,
+                "connector_not_startable",
+            )?;
+            let mut status = connector_runtime_status_from_spec(spec);
+            if stopped {
+                status.status = ConnectorWorkerRuntimeState::Stopped;
+                status.stopped_at = Some(reconciled_at);
+            }
+            status.last_reconciled_at = Some(reconciled_at);
+            set_connector_worker_runtime_status(state, status);
+            if spec.enabled && spec.connector_profile == ConnectorProfile::TtnV3 {
+                record_connector_worker_event(
+                    state,
+                    "aion:ConnectorWorkerSkipped",
+                    EventSeverity::Warning,
+                    Some(
+                        "TTN v3 connector worker skipped because TTN decoding is future work"
+                            .to_string(),
+                    ),
+                    connector_worker_event_metadata(spec, Some("ttn_decoding_not_implemented")),
+                )?;
+            }
+            actions.push(connector_worker_action(spec, "skipped", None));
+        }
+        ConnectorWorkerStartDecision::Invalid | ConnectorWorkerStartDecision::Unsupported => {
+            stop_connector_worker_if_running(state, spec, reconciled_at, "invalid_or_unsupported")?;
+            let mut status = connector_runtime_status_from_spec(spec);
+            status.last_reconciled_at = Some(reconciled_at);
+            set_connector_worker_runtime_status(state, status);
+            actions.push(connector_worker_action(
+                spec,
+                if decision == ConnectorWorkerStartDecision::Invalid {
+                    "invalid"
+                } else {
+                    "unsupported"
+                },
+                None,
+            ));
+        }
+        ConnectorWorkerStartDecision::PlannedOnly => {
+            stop_connector_worker_if_running(state, spec, reconciled_at, "not_runtime_worker")?;
+            let mut status = connector_runtime_status_from_spec(spec);
+            status.last_reconciled_at = Some(reconciled_at);
+            set_connector_worker_runtime_status(state, status);
+            actions.push(connector_worker_action(spec, "planned", None));
+        }
+    }
+
+    Ok(())
+}
+
+enum ExistingConnectorWorker {
+    None,
+    Same,
+    Stopped { reason: &'static str },
+}
+
+fn remove_connector_worker_handle_if_changed_or_finished(
+    state: &AppState,
+    connector_id: Uuid,
+    expected_signature: &ConnectorWorkerSignature,
+) -> ExistingConnectorWorker {
+    let Ok(mut handles) = state.connector_worker_handles.write() else {
+        return ExistingConnectorWorker::None;
+    };
+
+    let Some(handle) = handles.get(&connector_id) else {
+        return ExistingConnectorWorker::None;
+    };
+
+    if handle.task.is_finished() {
+        handles.remove(&connector_id);
+        return ExistingConnectorWorker::Stopped { reason: "finished" };
+    }
+
+    if &handle.signature == expected_signature {
+        return ExistingConnectorWorker::Same;
+    }
+
+    if let Some(handle) = handles.remove(&connector_id) {
+        handle.task.abort();
+    }
+    ExistingConnectorWorker::Stopped {
+        reason: "config_changed",
+    }
+}
+
+async fn start_connector_worker_from_spec(
+    state: &AppState,
+    spec: &IngestionWorkerSpec,
+    signature: ConnectorWorkerSignature,
+    start_network: bool,
+    started_at: DateTime<Utc>,
+    restart_count: u32,
+) -> Result<(), ApiError> {
+    let mut status = connector_runtime_status_from_spec(spec);
+    status.status = if start_network {
+        ConnectorWorkerRuntimeState::Starting
+    } else {
+        ConnectorWorkerRuntimeState::Planned
+    };
+    status.started_at = if start_network {
+        Some(started_at)
+    } else {
+        None
+    };
+    status.restart_count = restart_count;
+    status.last_reconciled_at = Some(started_at);
+    status.last_error = if start_network {
+        None
+    } else {
+        Some("network start skipped by test/dry-run mode".to_string())
+    };
+    set_connector_worker_runtime_status(state, status);
+
+    if !start_network {
+        return Ok(());
+    }
+
+    let mqtt_config = mqtt_ingest::MqttIngestConfig::for_connector(
+        spec.broker_url.clone().unwrap_or_default(),
+        spec.client_id
+            .clone()
+            .unwrap_or_else(|| format!("aioncore-connector-{}", spec.connector_id)),
+        spec.topic_filter.clone().unwrap_or_default(),
+        spec.payload_format.clone(),
+        spec.content_type.clone(),
+        mqtt_ingest::MqttConnectorMetadata {
+            connector_id: spec.connector_id,
+            connector_key: spec.connector_key.clone(),
+            connector_profile: spec.connector_profile.clone(),
+        },
+    );
+
+    match mqtt_ingest::start_connector_worker(state.clone(), mqtt_config).await {
+        Ok(task) => {
+            if let Ok(mut handles) = state.connector_worker_handles.write() {
+                handles.insert(spec.connector_id, ConnectorWorkerHandle { signature, task });
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let message = err.to_string();
+            update_connector_worker_runtime_status(state, spec.connector_id, |worker| {
+                worker.status = ConnectorWorkerRuntimeState::Error;
+                worker.last_error = Some(message.clone());
+                worker.last_failed_ingest_at = Some(Utc::now());
+            });
+            record_connector_worker_event(
+                state,
+                "aion:ConnectorWorkerReconcileFailed",
+                EventSeverity::Error,
+                Some("Connector worker failed to start".to_string()),
+                metadata_with_connector(
+                    json!({
+                        "reason": "start_failed",
+                        "error": message
+                    }),
+                    Some(connector_worker_event_metadata(spec, None)),
+                ),
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn stop_connector_worker_if_running(
+    state: &AppState,
+    spec: &IngestionWorkerSpec,
+    stopped_at: DateTime<Utc>,
+    reason: &'static str,
+) -> Result<bool, ApiError> {
+    let handle = state
+        .connector_worker_handles
+        .write()
+        .ok()
+        .and_then(|mut handles| handles.remove(&spec.connector_id));
+
+    let Some(handle) = handle else {
+        return Ok(false);
+    };
+
+    handle.task.abort();
+    update_connector_worker_runtime_status(state, spec.connector_id, |worker| {
+        worker.status = ConnectorWorkerRuntimeState::Stopped;
+        worker.connected = false;
+        worker.subscribed = false;
+        worker.stopped_at = Some(stopped_at);
+        worker.last_reconciled_at = Some(stopped_at);
+    });
+    record_connector_worker_event(
+        state,
+        "aion:ConnectorWorkerStopped",
+        EventSeverity::Info,
+        Some("Connector worker stopped".to_string()),
+        connector_worker_event_metadata(spec, Some(reason)),
+    )?;
+
+    Ok(true)
+}
+
+fn stop_all_connector_workers(
+    state: &AppState,
+    stopped_at: DateTime<Utc>,
+    actions: &mut Vec<ConnectorWorkerReconcileAction>,
+) -> Result<(), ApiError> {
+    let handles = state
+        .connector_worker_handles
+        .write()
+        .map(|mut handles| handles.drain().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for (connector_id, handle) in handles {
+        handle.task.abort();
+        update_connector_worker_runtime_status(state, connector_id, |worker| {
+            worker.status = ConnectorWorkerRuntimeState::Stopped;
+            worker.connected = false;
+            worker.subscribed = false;
+            worker.stopped_at = Some(stopped_at);
+            worker.last_reconciled_at = Some(stopped_at);
+            actions.push(ConnectorWorkerReconcileAction {
+                connector_id,
+                connector_key: worker.connector_key.clone(),
+                action: "stopped".to_string(),
+                reason: Some("connector_workers_disabled".to_string()),
+            });
+        });
+    }
+    Ok(())
+}
+
+fn stop_workers_missing_from_plan(
+    state: &AppState,
+    plan: &IngestionWorkerPlan,
+    stopped_at: DateTime<Utc>,
+    actions: &mut Vec<ConnectorWorkerReconcileAction>,
+) -> Result<(), ApiError> {
+    let planned_ids = plan
+        .specs
+        .iter()
+        .map(|spec| spec.connector_id)
+        .collect::<std::collections::HashSet<_>>();
+    let stale_ids = state
+        .connector_worker_handles
+        .read()
+        .map(|handles| {
+            handles
+                .keys()
+                .copied()
+                .filter(|id| !planned_ids.contains(id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for connector_id in stale_ids {
+        let handle = state
+            .connector_worker_handles
+            .write()
+            .ok()
+            .and_then(|mut handles| handles.remove(&connector_id));
+        if let Some(handle) = handle {
+            handle.task.abort();
+        }
+        update_connector_worker_runtime_status(state, connector_id, |worker| {
+            worker.status = ConnectorWorkerRuntimeState::Stopped;
+            worker.connected = false;
+            worker.subscribed = false;
+            worker.stopped_at = Some(stopped_at);
+            worker.last_reconciled_at = Some(stopped_at);
+            actions.push(ConnectorWorkerReconcileAction {
+                connector_id,
+                connector_key: worker.connector_key.clone(),
+                action: "stopped".to_string(),
+                reason: Some("connector_removed_from_plan".to_string()),
+            });
+        });
+    }
+
+    Ok(())
+}
+
+fn connector_worker_signature(spec: &IngestionWorkerSpec) -> ConnectorWorkerSignature {
+    ConnectorWorkerSignature {
+        broker_url: spec.broker_url.clone(),
+        client_id: spec.client_id.clone(),
+        topic_filter: spec.topic_filter.clone(),
+        payload_format: spec.payload_format.clone(),
+        content_type: spec.content_type.clone(),
+        connector_profile: spec.connector_profile.clone(),
+    }
+}
+
+fn connector_worker_restart_count(state: &AppState, connector_id: Uuid) -> u32 {
+    state
+        .connector_worker_statuses
+        .read()
+        .ok()
+        .and_then(|statuses| {
+            statuses
+                .get(&connector_id)
+                .map(|status| status.restart_count)
+        })
+        .unwrap_or(0)
+}
+
+fn connector_worker_event_metadata(spec: &IngestionWorkerSpec, reason: Option<&str>) -> Value {
+    let mut metadata = json!({
+        "connector_id": spec.connector_id,
+        "connector_key": spec.connector_key,
+        "connector_type": spec.connector_type,
+        "connector_profile": spec.connector_profile,
+        "worker_kind": spec.worker_kind,
+        "broker_url": spec.broker_url,
+        "topic_filter": spec.topic_filter,
+        "payload_format": spec.payload_format
+    });
+    if let (Some(object), Some(reason)) = (metadata.as_object_mut(), reason) {
+        object.insert("reason".to_string(), json!(reason));
+    }
+    metadata
+}
+
+fn connector_worker_action(
+    spec: &IngestionWorkerSpec,
+    action: &str,
+    reason: Option<&str>,
+) -> ConnectorWorkerReconcileAction {
+    ConnectorWorkerReconcileAction {
+        connector_id: spec.connector_id,
+        connector_key: spec.connector_key.clone(),
+        action: action.to_string(),
+        reason: reason.map(ToOwned::to_owned),
+    }
 }
 
 fn connector_runtime_status_from_spec(spec: &IngestionWorkerSpec) -> ConnectorWorkerRuntimeStatus {
@@ -3778,6 +4273,10 @@ fn connector_runtime_status_from_spec(spec: &IngestionWorkerSpec) -> ConnectorWo
         last_message_at: None,
         last_successful_ingest_at: None,
         last_failed_ingest_at: None,
+        started_at: None,
+        stopped_at: None,
+        restart_count: 0,
+        last_reconciled_at: None,
         validation_issues: spec.validation_issues.clone(),
         metadata: spec.metadata.clone(),
     }
@@ -3818,6 +4317,7 @@ fn connector_workers_readiness(state: &AppState) -> ConnectorWorkersReadiness {
             total: 0,
             running: 0,
             degraded: 0,
+            stopped: 0,
             skipped: 0,
             invalid: 0,
             errors: 1,
@@ -3839,6 +4339,10 @@ fn connector_workers_readiness_from_workers(
             .iter()
             .filter(|worker| worker.status == ConnectorWorkerRuntimeState::Degraded)
             .count(),
+        stopped: workers
+            .iter()
+            .filter(|worker| worker.status == ConnectorWorkerRuntimeState::Stopped)
+            .count(),
         skipped: workers
             .iter()
             .filter(|worker| worker.status == ConnectorWorkerRuntimeState::Skipped)
@@ -3852,7 +4356,9 @@ fn connector_workers_readiness_from_workers(
             .filter(|worker| {
                 matches!(
                     worker.status,
-                    ConnectorWorkerRuntimeState::Degraded | ConnectorWorkerRuntimeState::Invalid
+                    ConnectorWorkerRuntimeState::Degraded
+                        | ConnectorWorkerRuntimeState::Invalid
+                        | ConnectorWorkerRuntimeState::Error
                 )
             })
             .count(),
@@ -4059,6 +4565,7 @@ fn mark_connector_worker_starting(state: &AppState, connector_id: Uuid) {
         worker.connected = false;
         worker.subscribed = false;
         worker.last_error = None;
+        worker.started_at = worker.started_at.or_else(|| Some(Utc::now()));
     });
 }
 
@@ -4085,6 +4592,7 @@ fn mark_connector_worker_failure(state: &AppState, connector_id: Uuid, message: 
         worker.connected = false;
         worker.subscribed = false;
         worker.last_error = Some(message);
+        worker.last_failed_ingest_at = Some(Utc::now());
     });
 }
 
@@ -8069,6 +8577,174 @@ mod tests {
         let status = get_worker_status(&app).await;
         assert_eq!(status["connector_workers"]["enabled"], false);
         assert_eq!(status["workers"][0]["status"], "planned");
+    }
+
+    #[tokio::test]
+    async fn connector_worker_reconciliation_is_disabled_when_config_is_false() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        create_mqtt_connector(
+            &app,
+            "mqtt-reconcile-disabled",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let response = reconcile_connector_workers(state.clone(), false)
+            .await
+            .unwrap();
+
+        assert!(!response.connector_workers.enabled);
+        assert_eq!(
+            response.workers[0].status,
+            ConnectorWorkerRuntimeState::Planned
+        );
+        assert_eq!(response.connector_workers.running, 0);
+    }
+
+    #[tokio::test]
+    async fn enabled_valid_mqtt_connector_reconcile_records_start_intent_without_broker() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        create_mqtt_connector(
+            &app,
+            "mqtt-reconcile-start",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+        set_connector_workers_enabled(&state, true);
+
+        let response = reconcile_connector_workers(state.clone(), false)
+            .await
+            .unwrap();
+
+        assert!(response.connector_workers.enabled);
+        assert_eq!(response.actions[0].action, "started");
+        assert_eq!(
+            response.workers[0].status,
+            ConnectorWorkerRuntimeState::Planned
+        );
+        assert_eq!(response.workers[0].last_reconciled_at.is_some(), true);
+    }
+
+    #[tokio::test]
+    async fn disabling_connector_stops_running_worker_status() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        let connector = create_mqtt_connector(
+            &app,
+            "mqtt-reconcile-stop",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+        set_connector_workers_enabled(&state, true);
+        let connector_id = Uuid::parse_str(connector["id"].as_str().unwrap()).unwrap();
+        let mut plan = build_ingestion_worker_plan(&state).unwrap();
+        let spec = plan.specs.remove(0);
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        state.connector_worker_handles.write().unwrap().insert(
+            connector_id,
+            ConnectorWorkerHandle {
+                signature: connector_worker_signature(&spec),
+                task,
+            },
+        );
+        let mut status = connector_runtime_status_from_spec(&spec);
+        status.status = ConnectorWorkerRuntimeState::Running;
+        status.connected = true;
+        status.subscribed = true;
+        status.started_at = Some(Utc::now());
+        set_connector_worker_runtime_status(&state, status);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/ingestion/connectors/{connector_id}/disable"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let status = connector_workers_status(&state).unwrap();
+        assert_eq!(
+            status.workers[0].status,
+            ConnectorWorkerRuntimeState::Stopped
+        );
+        assert!(status.workers[0].stopped_at.is_some());
+        assert!(state.connector_worker_handles.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_reconcile_endpoint_returns_worker_status() {
+        let state = AppState::local();
+        let app = app_with_state(state);
+        create_mqtt_connector(
+            &app,
+            "mqtt-manual-reconcile",
+            "generic-mqtt",
+            true,
+            None,
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ingestion/workers/reconcile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body["workers"][0]["status"], "invalid");
+        assert_eq!(body["workers"][0]["last_reconciled_at"].is_null(), false);
+    }
+
+    #[tokio::test]
+    async fn creating_connector_triggers_reconciliation_path() {
+        let state = AppState::local();
+        let app = app_with_state(state.clone());
+        create_mqtt_connector(
+            &app,
+            "mqtt-create-reconcile",
+            "generic-mqtt",
+            true,
+            None,
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let status = connector_workers_status(&state).unwrap();
+        assert_eq!(
+            status.workers[0].status,
+            ConnectorWorkerRuntimeState::Invalid
+        );
+        assert!(status.workers[0].last_reconciled_at.is_some());
     }
 
     #[tokio::test]

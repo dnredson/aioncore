@@ -295,7 +295,19 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/workers/stat
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
 ```
 
-`/ingestion/workers/status` reports `planned`, `starting`, `running`, `degraded`, `skipped`, `invalid`, or `unsupported` per connector. `/ready` includes `connector_workers.total`, `running`, `degraded`, `skipped`, `invalid`, and `errors`; connector worker issues do not replace the existing storage/env-var MQTT readiness rules.
+Runtime reconciliation starts, stops, or restarts connector workers when connectors are created, enabled, or disabled. Manual reconciliation is also available:
+
+```powershell
+$reconcile = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/workers/reconcile"
+
+$reconcile.actions
+```
+
+Startup reconciliation loads persisted enabled connectors. Runtime reconciliation handles connector lifecycle changes after startup. There is not yet a general connector update endpoint, so config-change restarts are limited to future update support and internal reconciliation comparisons.
+
+`/ingestion/workers/status` reports `planned`, `starting`, `running`, `stopped`, `degraded`, `skipped`, `invalid`, `error`, or `unsupported` per connector. Status entries include `started_at`, `stopped_at`, `restart_count`, and `last_reconciled_at`. `/ready` includes `connector_workers.total`, `running`, `stopped`, `degraded`, `skipped`, `invalid`, and `errors`; connector worker issues do not replace the existing storage/env-var MQTT readiness rules.
 
 Example test publish for a connector using the generic AionCore MQTT topic convention:
 

@@ -139,21 +139,32 @@ Connector worker runtime state is exposed through:
 GET /ingestion/workers/status
 ```
 
+Manual reconciliation is exposed through:
+
+```text
+POST /ingestion/workers/reconcile
+```
+
 Status values include:
 
 - `planned`
 - `starting`
 - `running`
+- `stopped`
 - `degraded`
 - `skipped`
 - `invalid`
+- `error`
 - `unsupported`
+
+Worker status entries include connector identity, worker kind, source configuration, last error, message/ingest timestamps, `started_at`, `stopped_at`, `restart_count`, and `last_reconciled_at`.
 
 `GET /ready` includes a `connector_workers` summary with:
 
 - `enabled`
 - `total`
 - `running`
+- `stopped`
 - `degraded`
 - `skipped`
 - `invalid`
@@ -162,6 +173,35 @@ Status values include:
 Connector workers do not replace the env-var MQTT worker. If `AIONCORE_MQTT_ENABLED=true` and `AIONCORE_CONNECTOR_WORKERS_ENABLED=true`, both worker families may run.
 
 TTN v3 connectors are planned but skipped by the dynamic runtime because TTN uplink decoding is not implemented yet. No network connection is attempted for TTN v3 connector workers in this milestone.
+
+## Worker Manager And Reconciliation
+
+The runtime connector worker manager tracks active connector MQTT worker tasks by `connector_id`. Reconciliation compares the current worker plan with the tracked runtime workers.
+
+Reconciliation is triggered after:
+
+- `POST /ingestion/connectors`
+- `PUT /ingestion/connectors/{connector_id}/enable`
+- `PUT /ingestion/connectors/{connector_id}/disable`
+- `POST /ingestion/workers/reconcile`
+
+During reconciliation:
+
+- valid enabled `generic-aion-mqtt` and `generic-mqtt` MQTT connectors start a worker if none is running;
+- disabled connectors stop any tracked worker;
+- invalid connectors remain stopped and report validation errors;
+- TTN v3 connectors remain skipped until TTN decoding is implemented;
+- if a tracked worker's relevant signature differs from the planned connector configuration, the worker is restarted.
+
+Relevant signature fields are broker URL, client ID, topic filter, payload format, content type, and connector profile. A general connector update endpoint is not implemented yet, so external config updates cannot currently trigger this path through the public API.
+
+Worker lifecycle events include:
+
+- `aion:ConnectorWorkerStarted`
+- `aion:ConnectorWorkerStopped`
+- `aion:ConnectorWorkerRestarted`
+- `aion:ConnectorWorkerSkipped`
+- `aion:ConnectorWorkerReconcileFailed`
 
 ## MQTT Ingestion
 
