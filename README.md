@@ -431,6 +431,9 @@ $evidenceIngest = Invoke-RestMethod `
 $evidenceIngest.provenance_present
 $evidenceIngest.evidence_count
 $evidenceIngest.correlation_id
+$evidenceIngest.trace_id
+$evidenceIngest.run_id
+$evidenceIngest.cycle_id
 ```
 
 Query evidence/provenance metadata through events, observations, and AI context. AionCore stores evidence references only; it does not fetch evidence URLs.
@@ -446,6 +449,20 @@ $aiContext = Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ai/contex
 $events | Select-Object event_type, metadata
 $observations | Select-Object observed_property, metadata
 $aiContext.recent_events | Select-Object event_type, metadata
+```
+
+Query SmartSentinel operational provenance directly by external references:
+
+```powershell
+$incidentEvents = Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?incident_id=inc-001"
+$alertEvents = Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?alert_id=alert-001"
+$traceRawMessages = Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages?trace_id=trace-abc&run_id=run-42&cycle_id=cycle-7"
+$provenanceSearch = Invoke-RestMethod -Method Get -Uri "http://localhost:8080/provenance/search?trace_id=trace-abc"
+
+$incidentEvents | Select-Object event_type, metadata
+$alertEvents | Select-Object event_type, metadata
+$traceRawMessages | Select-Object raw_message_id, payload_format, connector_profile
+$provenanceSearch.counts
 ```
 
 TTN v3 uplink JSON can be tested locally through connector-aware HTTP ingestion without a live TTN broker. Create existing AionCore entities, a TTN connector, and an explicit device mapping:

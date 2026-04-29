@@ -1108,6 +1108,14 @@ pub struct EventQuery {
     pub command_id: Option<Uuid>,
     pub raw_message_id: Option<Uuid>,
     pub correlation_id: Option<String>,
+    pub incident_id: Option<String>,
+    pub alert_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub run_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub cycle_id: Option<String>,
+    pub evidence_id: Option<String>,
+    pub external_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1123,6 +1131,32 @@ pub struct RawMessageQuery {
     pub producer_entity_id: Option<Uuid>,
     pub feature_of_interest_id: Option<Uuid>,
     pub payload_format: Option<String>,
+    pub trace_id: Option<String>,
+    pub run_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub cycle_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub node_id: Option<String>,
+    pub connector_id: Option<Uuid>,
+    pub connector_key: Option<String>,
+    pub connector_profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProvenanceSearchQuery {
+    pub incident_id: Option<String>,
+    pub alert_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub run_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub cycle_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub node_id: Option<String>,
+    pub evidence_id: Option<String>,
+    pub external_id: Option<String>,
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1193,6 +1227,22 @@ pub struct AiEntityContextResponse {
     pub raw_message_refs: Vec<Uuid>,
     pub generated_at: DateTime<Utc>,
     pub metadata: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProvenanceSearchResponse {
+    pub matching_events: Vec<Event>,
+    pub matching_raw_messages: Vec<RawMessageResponse>,
+    pub matching_observations: Vec<Observation>,
+    pub counts: ProvenanceSearchCounts,
+    pub query: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProvenanceSearchCounts {
+    pub matching_events: usize,
+    pub matching_raw_messages: usize,
+    pub matching_observations: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1345,6 +1395,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/mcp", post(handle_mcp_json_rpc))
         .route("/mcp/tools", get(list_mcp_tools))
         .route("/mcp/tools/:tool_name", post(invoke_mcp_tool))
+        .route("/provenance/search", get(search_provenance))
         .route(
             "/ingestion/connectors",
             post(create_ingestion_connector).get(list_ingestion_connectors),
@@ -3375,18 +3426,24 @@ async fn query_events(
     State(state): State<AppState>,
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
-    Ok(Json(state.storage.query_events(
+    let events = state.storage.query_events(
         state.tenant_id,
         EventFilter {
             source_entity_id: query.source_entity_id,
             target_entity_id: query.target_entity_id,
-            event_type: query.event_type,
-            severity: query.severity,
+            event_type: query.event_type.clone(),
+            severity: query.severity.clone(),
             command_id: query.command_id,
             raw_message_id: query.raw_message_id,
-            correlation_id: query.correlation_id,
+            correlation_id: query.correlation_id.clone(),
         },
-    )?))
+    )?;
+    let events = events
+        .into_iter()
+        .filter(|event| event_matches_metadata_filters(event, &query))
+        .collect::<Vec<_>>();
+
+    Ok(Json(events))
 }
 
 async fn create_observation(
@@ -3487,10 +3544,391 @@ async fn query_raw_messages(
                 })
                 .unwrap_or(true)
         })
+        .filter(|raw_message| {
+            query
+                .connector_id
+                .map(|id| raw_message_uuid_header(raw_message, "connector_id") == Some(id))
+                .unwrap_or(true)
+        })
+        .filter(|raw_message| {
+            query
+                .connector_key
+                .as_deref()
+                .map(|connector_key| {
+                    raw_message_string_header(raw_message, "connector_key")
+                        .map(|value| value == connector_key)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true)
+        })
+        .filter(|raw_message| {
+            query
+                .connector_profile
+                .as_deref()
+                .map(|connector_profile| {
+                    raw_message_string_header(raw_message, "connector_profile")
+                        .map(|value| value.eq_ignore_ascii_case(connector_profile))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true)
+        })
+        .filter(|raw_message| raw_message_matches_provenance_filters(raw_message, &query))
         .map(raw_message_response)
         .collect::<Vec<_>>();
 
     Ok(Json(raw_messages))
+}
+
+async fn search_provenance(
+    State(state): State<AppState>,
+    Query(query): Query<ProvenanceSearchQuery>,
+) -> Result<Json<ProvenanceSearchResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(100).min(1000);
+    let events = state
+        .storage
+        .query_events(state.tenant_id, EventFilter::default())?
+        .into_iter()
+        .filter(|event| event_matches_provenance_search(event, &query))
+        .take(limit as usize)
+        .collect::<Vec<_>>();
+    let raw_messages = state
+        .storage
+        .list_raw_messages(state.tenant_id)?
+        .into_iter()
+        .filter(|raw_message| raw_message_matches_provenance_search(raw_message, &query))
+        .take(limit as usize)
+        .map(raw_message_response)
+        .collect::<Vec<_>>();
+    let observations = state
+        .storage
+        .query_observations(state.tenant_id, None, None, None, None, limit)?
+        .into_iter()
+        .filter(|observation| observation_matches_provenance_search(observation, &query))
+        .collect::<Vec<_>>();
+    let counts = ProvenanceSearchCounts {
+        matching_events: events.len(),
+        matching_raw_messages: raw_messages.len(),
+        matching_observations: observations.len(),
+    };
+    let query_metadata = provenance_search_query_metadata(&query, limit);
+
+    Ok(Json(ProvenanceSearchResponse {
+        matching_events: events,
+        matching_raw_messages: raw_messages,
+        matching_observations: observations,
+        counts,
+        query: query_metadata,
+    }))
+}
+
+fn event_matches_metadata_filters(event: &Event, query: &EventQuery) -> bool {
+    let metadata = event.metadata.as_ref();
+    optional_metadata_string_matches(metadata, "incident_id", query.incident_id.as_deref())
+        && optional_metadata_string_matches(metadata, "alert_id", query.alert_id.as_deref())
+        && optional_metadata_string_matches(metadata, "trace_id", query.trace_id.as_deref())
+        && optional_metadata_string_matches(metadata, "run_id", query.run_id.as_deref())
+        && optional_metadata_string_matches(metadata, "workflow_id", query.workflow_id.as_deref())
+        && optional_metadata_string_matches(metadata, "cycle_id", query.cycle_id.as_deref())
+        && optional_metadata_evidence_matches(
+            metadata,
+            query.evidence_id.as_deref(),
+            query.external_id.as_deref(),
+        )
+}
+
+fn raw_message_matches_provenance_filters(
+    raw_message: &RawMessage,
+    query: &RawMessageQuery,
+) -> bool {
+    optional_raw_header_string_matches(raw_message, "snapshot_id", query.snapshot_id.as_deref())
+        && optional_raw_header_string_matches(raw_message, "node_id", query.node_id.as_deref())
+        && optional_raw_smartsentinel_string_matches(
+            raw_message,
+            "trace_id",
+            query.trace_id.as_deref(),
+        )
+        && optional_raw_smartsentinel_string_matches(raw_message, "run_id", query.run_id.as_deref())
+        && optional_raw_smartsentinel_string_matches(
+            raw_message,
+            "workflow_id",
+            query.workflow_id.as_deref(),
+        )
+        && optional_raw_smartsentinel_string_matches(
+            raw_message,
+            "cycle_id",
+            query.cycle_id.as_deref(),
+        )
+        && optional_raw_smartsentinel_string_matches(
+            raw_message,
+            "correlation_id",
+            query.correlation_id.as_deref(),
+        )
+}
+
+fn event_matches_provenance_search(event: &Event, query: &ProvenanceSearchQuery) -> bool {
+    let metadata = event.metadata.as_ref();
+    optional_metadata_string_matches(metadata, "incident_id", query.incident_id.as_deref())
+        && optional_metadata_string_matches(metadata, "alert_id", query.alert_id.as_deref())
+        && optional_metadata_string_matches(metadata, "trace_id", query.trace_id.as_deref())
+        && optional_metadata_string_matches(metadata, "run_id", query.run_id.as_deref())
+        && optional_metadata_string_matches(metadata, "workflow_id", query.workflow_id.as_deref())
+        && optional_metadata_string_matches(metadata, "cycle_id", query.cycle_id.as_deref())
+        && optional_metadata_string_matches(
+            metadata,
+            "correlation_id",
+            query.correlation_id.as_deref(),
+        )
+        && optional_metadata_string_matches(metadata, "snapshot_id", query.snapshot_id.as_deref())
+        && optional_metadata_string_matches(metadata, "node_id", query.node_id.as_deref())
+        && optional_metadata_evidence_matches(
+            metadata,
+            query.evidence_id.as_deref(),
+            query.external_id.as_deref(),
+        )
+}
+
+fn raw_message_matches_provenance_search(
+    raw_message: &RawMessage,
+    query: &ProvenanceSearchQuery,
+) -> bool {
+    optional_raw_header_string_matches(raw_message, "snapshot_id", query.snapshot_id.as_deref())
+        && optional_raw_header_string_matches(raw_message, "node_id", query.node_id.as_deref())
+        && optional_raw_smartsentinel_string_matches(
+            raw_message,
+            "trace_id",
+            query.trace_id.as_deref(),
+        )
+        && optional_raw_smartsentinel_string_matches(raw_message, "run_id", query.run_id.as_deref())
+        && optional_raw_smartsentinel_string_matches(
+            raw_message,
+            "workflow_id",
+            query.workflow_id.as_deref(),
+        )
+        && optional_raw_smartsentinel_string_matches(
+            raw_message,
+            "cycle_id",
+            query.cycle_id.as_deref(),
+        )
+        && optional_raw_smartsentinel_string_matches(
+            raw_message,
+            "correlation_id",
+            query.correlation_id.as_deref(),
+        )
+        && optional_raw_smartsentinel_evidence_id_matches(raw_message, query.evidence_id.as_deref())
+        && optional_raw_smartsentinel_external_id_matches(raw_message, query.external_id.as_deref())
+        && optional_raw_smartsentinel_external_id_matches(raw_message, query.incident_id.as_deref())
+        && query.alert_id.is_none()
+}
+
+fn observation_matches_provenance_search(
+    observation: &Observation,
+    query: &ProvenanceSearchQuery,
+) -> bool {
+    optional_metadata_string_matches(
+        Some(&observation.metadata),
+        "trace_id",
+        query.trace_id.as_deref(),
+    ) && optional_metadata_string_matches(
+        Some(&observation.metadata),
+        "run_id",
+        query.run_id.as_deref(),
+    ) && optional_metadata_string_matches(
+        Some(&observation.metadata),
+        "workflow_id",
+        query.workflow_id.as_deref(),
+    ) && optional_metadata_string_matches(
+        Some(&observation.metadata),
+        "cycle_id",
+        query.cycle_id.as_deref(),
+    ) && optional_metadata_string_matches(
+        Some(&observation.metadata),
+        "correlation_id",
+        query.correlation_id.as_deref(),
+    ) && optional_metadata_string_matches(
+        Some(&observation.metadata),
+        "snapshot_id",
+        query.snapshot_id.as_deref(),
+    ) && optional_metadata_string_matches(
+        Some(&observation.metadata),
+        "node_id",
+        query.node_id.as_deref(),
+    ) && optional_metadata_evidence_matches(
+        Some(&observation.metadata),
+        query.evidence_id.as_deref(),
+        query.external_id.as_deref(),
+    ) && query.incident_id.is_none()
+        && query.alert_id.is_none()
+}
+
+fn optional_metadata_string_matches(
+    metadata: Option<&Value>,
+    key: &str,
+    expected: Option<&str>,
+) -> bool {
+    expected
+        .map(|expected| {
+            metadata
+                .map(|metadata| metadata_string_matches(metadata, key, expected))
+                .unwrap_or(false)
+        })
+        .unwrap_or(true)
+}
+
+fn metadata_string_matches(metadata: &Value, key: &str, expected: &str) -> bool {
+    value_string_matches(metadata.get(key), expected)
+        || metadata
+            .get("provenance")
+            .map(|provenance| value_string_matches(provenance.get(key), expected))
+            .unwrap_or(false)
+}
+
+fn optional_metadata_evidence_matches(
+    metadata: Option<&Value>,
+    evidence_id: Option<&str>,
+    external_id: Option<&str>,
+) -> bool {
+    evidence_id
+        .map(|expected| {
+            metadata
+                .map(|metadata| metadata_evidence_id_matches(metadata, expected))
+                .unwrap_or(false)
+        })
+        .unwrap_or(true)
+        && external_id
+            .map(|expected| {
+                metadata
+                    .map(|metadata| metadata_external_id_matches(metadata, expected))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
+}
+
+fn metadata_evidence_id_matches(metadata: &Value, expected: &str) -> bool {
+    metadata
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .map(|refs| refs.iter().any(|value| value.as_str() == Some(expected)))
+        .unwrap_or(false)
+        || metadata
+            .get("evidence")
+            .and_then(Value::as_array)
+            .map(|evidence| {
+                evidence
+                    .iter()
+                    .any(|item| value_string_matches(item.get("evidence_id"), expected))
+            })
+            .unwrap_or(false)
+}
+
+fn metadata_external_id_matches(metadata: &Value, expected: &str) -> bool {
+    metadata
+        .get("external_id")
+        .map(|value| value.as_str() == Some(expected))
+        .unwrap_or(false)
+        || metadata
+            .get("evidence")
+            .and_then(Value::as_array)
+            .map(|evidence| {
+                evidence
+                    .iter()
+                    .any(|item| value_string_matches(item.get("external_id"), expected))
+            })
+            .unwrap_or(false)
+        || metadata
+            .get("provenance")
+            .and_then(|provenance| provenance.get("external_refs"))
+            .and_then(Value::as_array)
+            .map(|refs| {
+                refs.iter()
+                    .any(|item| value_string_matches(item.get("external_id"), expected))
+            })
+            .unwrap_or(false)
+}
+
+fn optional_raw_header_string_matches(
+    raw_message: &RawMessage,
+    key: &str,
+    expected: Option<&str>,
+) -> bool {
+    expected
+        .map(|expected| {
+            raw_message
+                .headers
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|value| value == expected)
+                .unwrap_or(false)
+        })
+        .unwrap_or(true)
+}
+
+fn optional_raw_smartsentinel_string_matches(
+    raw_message: &RawMessage,
+    key: &str,
+    expected: Option<&str>,
+) -> bool {
+    expected
+        .map(|expected| raw_smartsentinel_string_matches(raw_message, key, expected))
+        .unwrap_or(true)
+}
+
+fn raw_smartsentinel_string_matches(raw_message: &RawMessage, key: &str, expected: &str) -> bool {
+    raw_message
+        .headers
+        .get("smartsentinel")
+        .map(|metadata| metadata_string_matches(metadata, key, expected))
+        .unwrap_or(false)
+}
+
+fn optional_raw_smartsentinel_evidence_id_matches(
+    raw_message: &RawMessage,
+    expected: Option<&str>,
+) -> bool {
+    expected
+        .map(|expected| {
+            raw_message
+                .headers
+                .get("smartsentinel")
+                .map(|metadata| metadata_evidence_id_matches(metadata, expected))
+                .unwrap_or(false)
+        })
+        .unwrap_or(true)
+}
+
+fn optional_raw_smartsentinel_external_id_matches(
+    raw_message: &RawMessage,
+    expected: Option<&str>,
+) -> bool {
+    expected
+        .map(|expected| {
+            raw_message
+                .headers
+                .get("smartsentinel")
+                .map(|metadata| metadata_external_id_matches(metadata, expected))
+                .unwrap_or(false)
+        })
+        .unwrap_or(true)
+}
+
+fn value_string_matches(value: Option<&Value>, expected: &str) -> bool {
+    value.and_then(Value::as_str) == Some(expected)
+}
+
+fn provenance_search_query_metadata(query: &ProvenanceSearchQuery, limit: u32) -> Value {
+    json!({
+        "incident_id": query.incident_id.as_deref(),
+        "alert_id": query.alert_id.as_deref(),
+        "trace_id": query.trace_id.as_deref(),
+        "run_id": query.run_id.as_deref(),
+        "workflow_id": query.workflow_id.as_deref(),
+        "cycle_id": query.cycle_id.as_deref(),
+        "correlation_id": query.correlation_id.as_deref(),
+        "snapshot_id": query.snapshot_id.as_deref(),
+        "node_id": query.node_id.as_deref(),
+        "evidence_id": query.evidence_id.as_deref(),
+        "external_id": query.external_id.as_deref(),
+        "limit": limit
+    })
 }
 
 async fn create_connector_secret(
@@ -9839,6 +10277,148 @@ mod tests {
             .unwrap()
             .iter()
             .any(|observation| observation["metadata"]["evidence_refs"][0] == "ev-metric-1"));
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_events_can_be_queried_by_external_references() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_snapshot_with_provenance(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let incident_events = get_json(&app, "/events?incident_id=inc-001").await;
+        assert!(incident_events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "sentinel:IncidentOpened"
+                && event["metadata"]["incident_id"] == "inc-001"
+        }));
+
+        let alert_events = get_json(&app, "/events?alert_id=alert-001").await;
+        assert!(alert_events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "sentinel:IncidentOpened"
+                && event["metadata"]["alert_id"] == "alert-001"
+        }));
+
+        let evidence_events = get_json(&app, "/events?evidence_id=ev-log-1").await;
+        assert!(evidence_events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "sentinel:IncidentOpened"
+                && event["metadata"]["evidence_refs"][0] == "ev-log-1"
+        }));
+
+        let external_events = get_json(&app, "/events?external_id=log-001").await;
+        assert!(external_events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "sentinel:IncidentOpened"
+                && event["metadata"]["evidence"][0]["external_id"] == "log-001"
+        }));
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_lifecycle_events_can_be_queried_by_provenance() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_snapshot_with_provenance(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let trace_events = get_json(&app, "/events?trace_id=trace-abc").await;
+        assert!(trace_events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "aion:SmartSentinelSnapshotMapped"
+                && event["metadata"]["trace_id"] == "trace-abc"
+        }));
+
+        let run_events = get_json(&app, "/events?run_id=run-42").await;
+        assert!(run_events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "aion:SmartSentinelSnapshotReceived"
+                && event["metadata"]["run_id"] == "run-42"
+        }));
+
+        let cycle_events = get_json(&app, "/events?cycle_id=cycle-7").await;
+        assert!(cycle_events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "aion:SmartSentinelSnapshotMapped"
+                && event["metadata"]["cycle_id"] == "cycle-7"
+        }));
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_raw_messages_can_be_queried_by_provenance() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_snapshot_with_provenance(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let summary = to_json(response).await;
+        let raw_message_id = summary["raw_message_id"].as_str().unwrap();
+
+        let raw_messages = get_json(
+            &app,
+            "/raw-messages?trace_id=trace-abc&run_id=run-42&cycle_id=cycle-7&snapshot_id=snap-prov-001&node_id=fog-02&connector_profile=smartsentinel",
+        )
+        .await;
+        assert!(raw_messages.as_array().unwrap().iter().any(|raw_message| {
+            raw_message["raw_message_id"] == raw_message_id
+                && raw_message["payload_format"] == "smartsentinel-snapshot-json"
+                && raw_message["connector_profile"] == "smartsentinel"
+        }));
+    }
+
+    #[tokio::test]
+    async fn provenance_search_returns_matching_events_raw_messages_and_observations() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_snapshot_with_provenance(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let results = get_json(&app, "/provenance/search?trace_id=trace-abc").await;
+        assert!(results["counts"]["matching_events"].as_u64().unwrap() >= 2);
+        assert!(results["counts"]["matching_raw_messages"].as_u64().unwrap() >= 1);
+        assert!(results["counts"]["matching_observations"].as_u64().unwrap() >= 1);
+        assert!(results["matching_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["metadata"]["trace_id"] == "trace-abc"));
+        assert!(results["matching_raw_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|raw_message| raw_message["payload_format"] == "smartsentinel-snapshot-json"));
+        assert!(results["matching_observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|observation| {
+                observation["metadata"]["trace_id"] == "trace-abc"
+                    && observation["metadata"]["uri_fetch_attempted"] == false
+            }));
     }
 
     #[tokio::test]

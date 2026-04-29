@@ -284,6 +284,61 @@ The snapshot response includes:
 
 AI context endpoints already include recent events and observations with their metadata, so provenance and evidence references become visible through `/ai/context/entity/{entity_id}` without adding a separate AI feature.
 
+## Provenance Query Ergonomics
+
+Milestone 43 adds query filters over already-preserved SmartSentinel provenance metadata. These filters do not introduce a SmartSentinel runtime, polling, execution, URI fetching, or external AI calls.
+
+Event queries support:
+
+```text
+GET /events?incident_id=inc-001
+GET /events?alert_id=alert-001
+GET /events?trace_id=trace-abc
+GET /events?run_id=run-42
+GET /events?workflow_id=wf-remediate
+GET /events?cycle_id=cycle-7
+GET /events?evidence_id=ev-log-1
+GET /events?external_id=log-001
+```
+
+The existing event filters remain available and can be combined with these metadata filters. Matching is exact and is evaluated against event metadata fields, nested `provenance`, `evidence_refs`, evidence entries, and provenance `external_refs` where applicable.
+
+Raw-message queries support:
+
+```text
+GET /raw-messages?trace_id=trace-abc
+GET /raw-messages?run_id=run-42
+GET /raw-messages?workflow_id=wf-remediate
+GET /raw-messages?cycle_id=cycle-7
+GET /raw-messages?correlation_id=corr-123
+GET /raw-messages?snapshot_id=snap-evidence-001
+GET /raw-messages?node_id=fog-02
+GET /raw-messages?connector_profile=smartsentinel
+GET /raw-messages?connector_key=...
+GET /raw-messages?connector_id=...
+```
+
+Raw-message matching is exact and uses raw-message headers, including the SmartSentinel provenance metadata preserved at ingestion time. The response remains the existing raw-message response shape.
+
+An aggregate provenance search endpoint is also available:
+
+```text
+GET /provenance/search?trace_id=trace-abc
+GET /provenance/search?incident_id=inc-001
+```
+
+The response includes:
+
+- `matching_events`
+- `matching_raw_messages`
+- `matching_observations`
+- `counts`
+- `query`
+
+This endpoint is intended for operator audit and explainability workflows, such as finding all AionCore records tied to a SmartSentinel trace, run, cycle, incident, or evidence reference. Observation matching is metadata-based and returns only observations that already carry matching provenance or evidence metadata.
+
+The implementation applies provenance metadata filters in the API layer after using existing storage queries. This keeps SmartSentinel optional and avoids new required storage schema fields. PostgreSQL JSONB indexes for these query fields are future optimization work rather than a Milestone 43 requirement.
+
 Materialize as Commands:
 
 - Run diagnostic.
@@ -366,3 +421,5 @@ The SmartSentinel integration should not:
 - No delete or graph reconciliation is performed when later snapshots omit an entity.
 - The mapper accepts a simplified snapshot shape only.
 - Relationship de-duplication is limited to exact source/type/target matches.
+- Provenance filters are exact-match metadata filters and do not perform full-text search or external system lookups.
+- PostgreSQL-specific JSONB indexes for provenance filters are not added yet.
