@@ -49,15 +49,44 @@ Critical remediation must not be automatic by default. AionCore should require e
 
 SmartSentinel snapshots can be ingested through the same payload-agnostic raw message path as other integrations.
 
-Recommended raw message metadata:
+Milestone 40 adds the first optional ingestion skeleton:
 
-- `protocol`: `http`, `webhook`, `file`, or integration-specific value.
-- `payload_format`: `smartsentinel_snapshot`.
-- `source_type`: integration source.
-- `source_ref`: SmartSentinel workspace, project, environment, or snapshot reference.
+```text
+POST /integrations/smartsentinel/snapshots
+```
+
+The endpoint accepts a simplified SmartSentinel/DATUM-like snapshot JSON document and stores it as a raw message before any mapping is attempted.
+
+Raw message metadata:
+
+- `protocol`: `http`.
+- `payload_format`: `smartsentinel-snapshot-json`.
+- `source_type`: `http`.
+- `source_ref`: `/integrations/smartsentinel/snapshots`.
+- `connector_profile`: `smartsentinel` in raw-message headers only; this does not make SmartSentinel a required connector dependency.
 - `received_at`: AionCore receive time.
 
 Raw snapshot payloads should be preserved before normalization.
+
+## Current Snapshot Shape
+
+The initial skeleton supports:
+
+- `snapshot_id`
+- `node_id`
+- `observed_at`
+- `entities`
+- `relationships`
+- `observations`
+- `events`
+
+Snapshot entities become AionCore JSON-LD entities with stable keys shaped as:
+
+```text
+smartsentinel:{node_id}:{snapshot_entity_id}
+```
+
+For example, `service:mosquitto` from node `fog-01` becomes `smartsentinel:fog-01:service:mosquitto`.
 
 ## Materialization Strategy
 
@@ -101,6 +130,12 @@ Materialize as Events:
 - Dependency became unavailable.
 - Backup completed.
 - SLO breach detected.
+
+The current endpoint materializes only entities, relationships, observations, and events. It also records AionCore lifecycle events:
+
+- `aion:SmartSentinelSnapshotReceived`
+- `aion:SmartSentinelSnapshotMapped`
+- `aion:SmartSentinelSnapshotMappingFailed`
 
 Materialize as Commands:
 
@@ -173,3 +208,13 @@ The SmartSentinel integration should not:
 - Force operational monitoring assumptions into core migrations.
 - Store all high-frequency metrics inside AionCore.
 - Allow AI clients to execute critical actions by default.
+
+## Current Limitations
+
+- No SmartSentinel agent runtime is implemented.
+- No live polling is implemented.
+- No authentication is implemented for the integration endpoint.
+- No recovery action execution is implemented.
+- No delete or graph reconciliation is performed when later snapshots omit an entity.
+- Relationship de-duplication is not implemented yet.
+- The mapper accepts a simplified snapshot shape only.

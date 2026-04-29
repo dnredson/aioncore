@@ -13,6 +13,7 @@ pub enum PayloadFormat {
     JsonMapping,
     CanonicalJson,
     TtnUplinkJson,
+    SmartSentinelSnapshotJson,
     Unknown(String),
 }
 
@@ -24,6 +25,7 @@ impl fmt::Display for PayloadFormat {
             Self::JsonMapping => f.write_str("json_mapping"),
             Self::CanonicalJson => f.write_str("canonical_json"),
             Self::TtnUplinkJson => f.write_str("ttn_uplink_json"),
+            Self::SmartSentinelSnapshotJson => f.write_str("smartsentinel_snapshot_json"),
             Self::Unknown(value) => f.write_str(value),
         }
     }
@@ -40,6 +42,7 @@ impl FromStr for PayloadFormat {
             "json_mapping" | "mapping" | "application/json" => Self::JsonMapping,
             "canonical_json" | "canonical" => Self::CanonicalJson,
             "ttn_uplink_json" | "application/vnd.thethings.uplink+json" => Self::TtnUplinkJson,
+            "smartsentinel_snapshot_json" => Self::SmartSentinelSnapshotJson,
             _ => Self::Unknown(value.to_string()),
         };
         Ok(format)
@@ -570,6 +573,12 @@ mod tests {
         assert_eq!(
             "ttn-uplink-json".parse::<PayloadFormat>().unwrap(),
             PayloadFormat::TtnUplinkJson
+        );
+        assert_eq!(
+            "smartsentinel-snapshot-json"
+                .parse::<PayloadFormat>()
+                .unwrap(),
+            PayloadFormat::SmartSentinelSnapshotJson
         );
     }
 

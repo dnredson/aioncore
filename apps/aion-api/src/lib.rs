@@ -352,6 +352,72 @@ pub struct HttpIngestResponse {
     pub observations: Vec<Observation>,
 }
 
+const SMARTSENTINEL_PAYLOAD_FORMAT: &str = "smartsentinel-snapshot-json";
+
+#[derive(Debug, Deserialize)]
+pub struct SmartSentinelSnapshot {
+    pub snapshot_id: String,
+    pub node_id: String,
+    pub observed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub entities: Vec<SmartSentinelSnapshotEntity>,
+    #[serde(default)]
+    pub relationships: Vec<SmartSentinelSnapshotRelationship>,
+    #[serde(default)]
+    pub observations: Vec<SmartSentinelSnapshotObservation>,
+    #[serde(default)]
+    pub events: Vec<SmartSentinelSnapshotEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SmartSentinelSnapshotEntity {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub entity_type: String,
+    pub name: Option<String>,
+    pub status: Option<String>,
+    #[serde(default = "empty_object")]
+    pub properties: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SmartSentinelSnapshotRelationship {
+    pub source: String,
+    #[serde(rename = "type")]
+    pub relationship_type: String,
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SmartSentinelSnapshotObservation {
+    pub entity_id: String,
+    pub observed_property: String,
+    pub value: Value,
+    pub unit: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SmartSentinelSnapshotEvent {
+    pub event_type: String,
+    pub target_entity_id: Option<String>,
+    pub source_entity_id: Option<String>,
+    pub severity: Option<EventSeverity>,
+    pub message: Option<String>,
+    pub occurred_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SmartSentinelSnapshotResponse {
+    pub raw_message_id: Uuid,
+    pub entities_created_or_updated: usize,
+    pub relationships_created: usize,
+    pub observations_created: usize,
+    pub events_created: usize,
+    pub snapshot_id: String,
+    pub node_id: String,
+}
+
 #[derive(Debug, Clone)]
 struct ResolvedTtnDeviceMapping {
     mapping_id: Uuid,
@@ -1272,6 +1338,10 @@ pub fn app_with_state(state: AppState) -> Router {
             post(reconcile_ingestion_workers),
         )
         .route("/ingest/http", post(ingest_http))
+        .route(
+            "/integrations/smartsentinel/snapshots",
+            post(ingest_smartsentinel_snapshot),
+        )
         .route("/raw-messages", get(query_raw_messages))
         .route("/raw-messages/:raw_message_id", get(get_raw_message))
         .route(
@@ -3803,6 +3873,165 @@ async fn reconcile_ingestion_workers(
     reconcile_connector_workers(state, true).await.map(Json)
 }
 
+async fn ingest_smartsentinel_snapshot(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<(StatusCode, Json<SmartSentinelSnapshotResponse>), ApiError> {
+    let received_at = Utc::now();
+    let snapshot_id = payload
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let node_id = payload
+        .get("node_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let mut raw_message = RawMessage::new(
+        state.tenant_id,
+        RawMessageSource::Http,
+        Some("/integrations/smartsentinel/snapshots".to_string()),
+        node_id.clone(),
+        Some(SMARTSENTINEL_PAYLOAD_FORMAT.to_string()),
+        Some("application/json".to_string()),
+        None,
+        None,
+        Some(SMARTSENTINEL_PAYLOAD_FORMAT.to_string()),
+        json!({
+            "protocol": "http",
+            "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
+            "connector_profile": "smartsentinel",
+            "source_endpoint": "/integrations/smartsentinel/snapshots",
+            "topic_or_path": "/integrations/smartsentinel/snapshots",
+            "snapshot_id": snapshot_id,
+            "node_id": node_id,
+            "decoder_metadata": {
+                "adapter": "SmartSentinelSnapshotDecoder",
+                "domain_agnostic": true,
+                "actions_executed": false
+            }
+        }),
+        payload_to_bytes(&payload),
+        received_at,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    raw_message = state.storage.store_raw_message(raw_message)?;
+    record_ingest_event_optional(
+        &state,
+        "aion:SmartSentinelSnapshotReceived",
+        EventSeverity::Info,
+        None,
+        None,
+        Some(raw_message.id),
+        Some("SmartSentinel snapshot received".to_string()),
+        json!({
+            "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
+            "snapshot_id": snapshot_id,
+            "node_id": node_id
+        }),
+    )?;
+
+    let snapshot = match serde_json::from_value::<SmartSentinelSnapshot>(payload.clone()) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let message = format!("invalid SmartSentinel snapshot: {err}");
+            state
+                .storage
+                .mark_raw_message_failed(state.tenant_id, raw_message.id, &message)?;
+            record_ingest_event_optional(
+                &state,
+                "aion:SmartSentinelSnapshotMappingFailed",
+                EventSeverity::Error,
+                None,
+                None,
+                Some(raw_message.id),
+                Some(message.clone()),
+                json!({
+                    "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
+                    "snapshot_id": snapshot_id,
+                    "node_id": node_id,
+                    "reason": "invalid_snapshot"
+                }),
+            )?;
+            return Err(ApiError::bad_request(message));
+        }
+    };
+
+    if snapshot.snapshot_id.trim().is_empty() || snapshot.node_id.trim().is_empty() {
+        let message = "invalid SmartSentinel snapshot: snapshot_id and node_id must not be empty";
+        state
+            .storage
+            .mark_raw_message_failed(state.tenant_id, raw_message.id, message)?;
+        record_ingest_event_optional(
+            &state,
+            "aion:SmartSentinelSnapshotMappingFailed",
+            EventSeverity::Error,
+            None,
+            None,
+            Some(raw_message.id),
+            Some(message.to_string()),
+            json!({
+                "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
+                "snapshot_id": snapshot.snapshot_id,
+                "node_id": snapshot.node_id,
+                "reason": "invalid_snapshot_identity"
+            }),
+        )?;
+        return Err(ApiError::bad_request(message));
+    }
+
+    let summary = match map_smartsentinel_snapshot(&state, snapshot, raw_message.id, received_at) {
+        Ok(summary) => summary,
+        Err(err) => {
+            state
+                .storage
+                .mark_raw_message_failed(state.tenant_id, raw_message.id, &err.message)?;
+            record_ingest_event_optional(
+                &state,
+                "aion:SmartSentinelSnapshotMappingFailed",
+                EventSeverity::Error,
+                None,
+                None,
+                Some(raw_message.id),
+                Some(err.message.clone()),
+                json!({
+                    "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
+                    "snapshot_id": snapshot_id,
+                    "node_id": node_id,
+                    "reason": "mapping_error"
+                }),
+            )?;
+            return Err(err);
+        }
+    };
+    state
+        .storage
+        .mark_raw_message_normalized(state.tenant_id, raw_message.id)?;
+    record_ingest_event_optional(
+        &state,
+        "aion:SmartSentinelSnapshotMapped",
+        EventSeverity::Info,
+        None,
+        None,
+        Some(raw_message.id),
+        Some("SmartSentinel snapshot mapped".to_string()),
+        json!({
+            "payload_format": SMARTSENTINEL_PAYLOAD_FORMAT,
+            "snapshot_id": summary.snapshot_id,
+            "node_id": summary.node_id,
+            "entities_created_or_updated": summary.entities_created_or_updated,
+            "relationships_created": summary.relationships_created,
+            "observations_created": summary.observations_created,
+            "events_created": summary.events_created
+        }),
+    )?;
+
+    Ok((StatusCode::CREATED, Json(summary)))
+}
+
 async fn ingest_http_for_connector(
     State(state): State<AppState>,
     Path(connector_id): Path<Uuid>,
@@ -4157,6 +4386,308 @@ async fn ingest_http_resolved(
             observations,
         }),
     ))
+}
+
+fn map_smartsentinel_snapshot(
+    state: &AppState,
+    snapshot: SmartSentinelSnapshot,
+    raw_message_id: Uuid,
+    received_at: DateTime<Utc>,
+) -> Result<SmartSentinelSnapshotResponse, ApiError> {
+    let snapshot_id = snapshot.snapshot_id.clone();
+    let node_id = snapshot.node_id.clone();
+    let mut entity_ids = HashMap::new();
+    let mut entities_created_or_updated = 0;
+    let mut relationships_created = 0;
+    let mut observations_created = 0;
+    let mut events_created = 0;
+    let observer_raw_id = format!("host:{node_id}");
+
+    for snapshot_entity in &snapshot.entities {
+        if snapshot_entity.id.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "SmartSentinel entity id must not be empty",
+            ));
+        }
+        if snapshot_entity.entity_type.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "SmartSentinel entity type must not be empty",
+            ));
+        }
+
+        let entity_key = smartsentinel_entity_key(&node_id, &snapshot_entity.id);
+        let entity = upsert_smartsentinel_entity(
+            state,
+            &entity_key,
+            &node_id,
+            &snapshot_id,
+            snapshot_entity,
+            received_at,
+        )?;
+        entity_ids.insert(snapshot_entity.id.clone(), entity.id);
+        entities_created_or_updated += 1;
+    }
+
+    let observer_entity_id = entity_ids.get(&observer_raw_id).copied().or_else(|| {
+        snapshot
+            .entities
+            .first()
+            .and_then(|entity| entity_ids.get(&entity.id).copied())
+    });
+
+    for relationship in &snapshot.relationships {
+        let source_entity_id = entity_ids
+            .get(&relationship.source)
+            .copied()
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "SmartSentinel relationship source '{}' does not reference a mapped entity",
+                    relationship.source
+                ))
+            })?;
+        let target_entity_id = entity_ids
+            .get(&relationship.target)
+            .copied()
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "SmartSentinel relationship target '{}' does not reference a mapped entity",
+                    relationship.target
+                ))
+            })?;
+        let relationship = Relationship::new(
+            state.tenant_id,
+            source_entity_id,
+            relationship.relationship_type.clone(),
+            target_entity_id,
+            json!({
+                "@context": smartsentinel_jsonld_context(),
+                "@type": "aion:Relationship",
+                "sentinel:snapshotId": snapshot_id,
+                "sentinel:nodeId": node_id,
+                "sentinel:source": relationship.source,
+                "sentinel:target": relationship.target
+            }),
+            received_at,
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        state.storage.create_relationship(relationship)?;
+        relationships_created += 1;
+    }
+
+    for snapshot_entity in &snapshot.entities {
+        if let Some(status) = snapshot_entity
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let feature_of_interest_id = entity_ids[&snapshot_entity.id];
+            let producer_entity_id = observer_entity_id.unwrap_or(feature_of_interest_id);
+            let observation = Observation::new(
+                state.tenant_id,
+                producer_entity_id,
+                feature_of_interest_id,
+                format!("{}Status", snapshot_entity.entity_type),
+                ObservationValue::Text {
+                    value: status.to_string(),
+                },
+                None,
+                snapshot.observed_at,
+                received_at,
+                "http",
+                SMARTSENTINEL_PAYLOAD_FORMAT,
+                Some(raw_message_id),
+                json!({"source": "smartsentinel"}),
+                json!({
+                    "adapter": "SmartSentinelSnapshotDecoder",
+                    "snapshot_id": snapshot_id,
+                    "node_id": node_id,
+                    "source": "entity_status",
+                    "snapshot_entity_id": snapshot_entity.id
+                }),
+            )
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            let observation = state.storage.store_observation(observation)?;
+            evaluate_rules_for_observation(state, &observation, true)?;
+            observations_created += 1;
+        }
+    }
+
+    for snapshot_observation in &snapshot.observations {
+        let feature_of_interest_id = entity_ids
+            .get(&snapshot_observation.entity_id)
+            .copied()
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "SmartSentinel observation entity_id '{}' does not reference a mapped entity",
+                    snapshot_observation.entity_id
+                ))
+            })?;
+        let producer_entity_id = observer_entity_id.unwrap_or(feature_of_interest_id);
+        let observation = Observation::new(
+            state.tenant_id,
+            producer_entity_id,
+            feature_of_interest_id,
+            snapshot_observation.observed_property.clone(),
+            observation_value_from_json(&snapshot_observation.value),
+            snapshot_observation.unit.clone(),
+            snapshot_observation
+                .observed_at
+                .unwrap_or(snapshot.observed_at),
+            received_at,
+            "http",
+            SMARTSENTINEL_PAYLOAD_FORMAT,
+            Some(raw_message_id),
+            json!({"source": "smartsentinel"}),
+            json!({
+                "adapter": "SmartSentinelSnapshotDecoder",
+                "snapshot_id": snapshot_id,
+                "node_id": node_id,
+                "source": "snapshot_observation",
+                "snapshot_entity_id": snapshot_observation.entity_id
+            }),
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        let observation = state.storage.store_observation(observation)?;
+        evaluate_rules_for_observation(state, &observation, true)?;
+        observations_created += 1;
+    }
+
+    for snapshot_event in &snapshot.events {
+        let source_entity_id = snapshot_event
+            .source_entity_id
+            .as_deref()
+            .map(|entity_id| {
+                smartsentinel_lookup_entity(&entity_ids, entity_id, "event source_entity_id")
+            })
+            .transpose()?;
+        let target_entity_id = snapshot_event
+            .target_entity_id
+            .as_deref()
+            .map(|entity_id| {
+                smartsentinel_lookup_entity(&entity_ids, entity_id, "event target_entity_id")
+            })
+            .transpose()?;
+        let event = Event::new(
+            state.tenant_id,
+            snapshot_event.event_type.clone(),
+            snapshot_event
+                .severity
+                .clone()
+                .unwrap_or(EventSeverity::Info),
+            source_entity_id,
+            target_entity_id,
+            snapshot_event.message.clone(),
+            snapshot_event.occurred_at.unwrap_or(snapshot.observed_at),
+            Some(snapshot.observed_at),
+            Some(snapshot_id.clone()),
+            Some(raw_message_id),
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "adapter": "SmartSentinelSnapshotDecoder",
+                "snapshot_id": snapshot_id,
+                "node_id": node_id,
+                "source": "snapshot_event"
+            })),
+            received_at,
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        let event = state.storage.store_event(event)?;
+        evaluate_rules_for_event(state, &event, true)?;
+        events_created += 1;
+    }
+
+    Ok(SmartSentinelSnapshotResponse {
+        raw_message_id,
+        entities_created_or_updated,
+        relationships_created,
+        observations_created,
+        events_created,
+        snapshot_id,
+        node_id,
+    })
+}
+
+fn upsert_smartsentinel_entity(
+    state: &AppState,
+    entity_key: &str,
+    node_id: &str,
+    snapshot_id: &str,
+    snapshot_entity: &SmartSentinelSnapshotEntity,
+    now: DateTime<Utc>,
+) -> Result<Entity, ApiError> {
+    if let Some(entity) = state
+        .storage
+        .get_entity_by_key(state.tenant_id, entity_key)?
+    {
+        return Ok(entity);
+    }
+
+    let jsonld = json!({
+        "@context": smartsentinel_jsonld_context(),
+        "@id": format!("urn:aion:smartsentinel:{node_id}:{}", snapshot_entity.id),
+        "@type": snapshot_entity.entity_type,
+        "entity_key": entity_key,
+        "name": snapshot_entity.name,
+        "sentinel:externalId": snapshot_entity.id,
+        "sentinel:nodeId": node_id,
+        "sentinel:snapshotId": snapshot_id,
+        "sentinel:status": snapshot_entity.status,
+        "sentinel:properties": snapshot_entity.properties
+    });
+    let entity = Entity::new(
+        state.tenant_id,
+        entity_key,
+        snapshot_entity.entity_type.clone(),
+        jsonld,
+        now,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    Ok(state.storage.create_entity(entity)?)
+}
+
+fn smartsentinel_lookup_entity(
+    entity_ids: &HashMap<String, Uuid>,
+    entity_id: &str,
+    field_name: &str,
+) -> Result<Uuid, ApiError> {
+    entity_ids.get(entity_id).copied().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "SmartSentinel {field_name} '{}' does not reference a mapped entity",
+            entity_id
+        ))
+    })
+}
+
+fn smartsentinel_entity_key(node_id: &str, snapshot_entity_id: &str) -> String {
+    format!("smartsentinel:{node_id}:{snapshot_entity_id}")
+}
+
+fn smartsentinel_jsonld_context() -> Value {
+    json!({
+        "aion": "https://aioncore.org/ns#",
+        "sentinel": "https://aioncore.org/ns/smartsentinel#"
+    })
+}
+
+fn observation_value_from_json(value: &Value) -> ObservationValue {
+    if let Some(value) = value.as_f64() {
+        ObservationValue::Number { value }
+    } else if let Some(value) = value.as_str() {
+        ObservationValue::Text {
+            value: value.to_string(),
+        }
+    } else if let Some(value) = value.as_bool() {
+        ObservationValue::Bool { value }
+    } else {
+        ObservationValue::Json {
+            value: value.clone(),
+        }
+    }
 }
 
 fn decoder_for_format(payload_format: &str) -> Result<Box<dyn PayloadDecoder>, ApiError> {
@@ -8088,6 +8619,163 @@ mod tests {
         assert_eq!(body["storage"], "memory");
         assert_eq!(body["mqtt"]["enabled"], false);
         assert_eq!(body["migrations_ready"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn ingests_smartsentinel_snapshot_and_materializes_records() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_sample_snapshot(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let summary = to_json(response).await;
+        assert_eq!(summary["snapshot_id"], "snap-001");
+        assert_eq!(summary["node_id"], "fog-01");
+        assert_eq!(summary["entities_created_or_updated"], 2);
+        assert_eq!(summary["relationships_created"], 1);
+        assert_eq!(summary["observations_created"], 2);
+        assert_eq!(summary["events_created"], 1);
+        let raw_message_id = summary["raw_message_id"].as_str().unwrap();
+
+        let raw_messages = get_json(
+            &app,
+            "/raw-messages?payload_format=smartsentinel-snapshot-json",
+        )
+        .await;
+        assert_eq!(raw_messages.as_array().unwrap().len(), 1);
+        assert_eq!(raw_messages[0]["raw_message_id"], raw_message_id);
+        assert_eq!(
+            raw_messages[0]["payload_format"],
+            SMARTSENTINEL_PAYLOAD_FORMAT
+        );
+
+        let entities = get_json(&app, "/entities").await;
+        let host_id = entity_id_by_key(&entities, "smartsentinel:fog-01:host:fog-01");
+        let service_id = entity_id_by_key(&entities, "smartsentinel:fog-01:service:mosquitto");
+
+        let host_context = get_json(&app, &format!("/entities/{host_id}/context")).await;
+        assert_eq!(
+            host_context["outgoing_relationships"][0]["relationship_type"],
+            "sentinel:runs"
+        );
+
+        let observations = get_json(
+            &app,
+            &format!("/observations?feature_of_interest_id={service_id}"),
+        )
+        .await;
+        assert!(observations.as_array().unwrap().iter().any(|observation| {
+            observation["observed_property"] == "sentinel:ServiceStatus"
+                && observation["value"]["value"] == "healthy"
+        }));
+
+        let events = get_json(&app, &format!("/events?raw_message_id={raw_message_id}")).await;
+        assert!(events.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "sentinel:ServiceDegraded"
+                && event["target_entity_id"] == service_id
+        }));
+        assert!(events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| { event["event_type"] == "aion:SmartSentinelSnapshotMapped" }));
+
+        let ai_context = get_json(&app, &format!("/ai/context/entity/{service_id}")).await;
+        assert_eq!(
+            ai_context["target_entity"]["entity_key"],
+            "smartsentinel:fog-01:service:mosquitto"
+        );
+        assert!(!ai_context["recent_observations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_smartsentinel_snapshot_preserves_raw_and_records_failure_event() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                json!({
+                    "snapshot_id": "snap-bad",
+                    "node_id": "fog-01",
+                    "observed_at": "not-a-date"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let raw_messages = get_json(
+            &app,
+            "/raw-messages?payload_format=smartsentinel-snapshot-json",
+        )
+        .await;
+        let raw_message_id = raw_messages[0]["raw_message_id"].as_str().unwrap();
+        assert_eq!(raw_messages[0]["normalization_status"], "failed");
+        assert!(raw_messages[0]["normalization_error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid SmartSentinel snapshot"));
+
+        let events = get_json(&app, &format!("/events?raw_message_id={raw_message_id}")).await;
+        assert!(events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| { event["event_type"] == "aion:SmartSentinelSnapshotMappingFailed" }));
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_endpoint_does_not_change_normal_http_ingestion() {
+        let app = app();
+        let entity = create_native_entity(
+            &app,
+            json!({
+                "@context": {"aion": "https://aioncore.org/ns#"},
+                "@id": "urn:aion:test:device:normal-01",
+                "@type": "aion:Device",
+                "entity_key": "normal-01"
+            }),
+        )
+        .await;
+        let entity_id = entity["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": entity_id,
+                    "feature_of_interest_id": entity_id,
+                    "payload_format": "canonical-json",
+                    "protocol": "http",
+                    "content_type": "application/json",
+                    "payload": {
+                        "observed_property": "temperature",
+                        "value": 21.5,
+                        "observed_at": "2026-04-29T12:00:00Z"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_json(response).await;
+        assert_eq!(body["observations"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -13939,6 +14627,85 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         to_json(response).await
+    }
+
+    fn smartsentinel_sample_snapshot() -> Value {
+        json!({
+            "snapshot_id": "snap-001",
+            "node_id": "fog-01",
+            "observed_at": "2026-04-29T12:00:00Z",
+            "entities": [
+                {
+                    "id": "host:fog-01",
+                    "type": "sentinel:Host",
+                    "name": "fog-01",
+                    "properties": {}
+                },
+                {
+                    "id": "service:mosquitto",
+                    "type": "sentinel:Service",
+                    "name": "mosquitto",
+                    "status": "healthy",
+                    "properties": {}
+                }
+            ],
+            "relationships": [
+                {
+                    "source": "host:fog-01",
+                    "type": "sentinel:runs",
+                    "target": "service:mosquitto"
+                }
+            ],
+            "observations": [
+                {
+                    "entity_id": "service:mosquitto",
+                    "observed_property": "sentinel:ServiceStatus",
+                    "value": "healthy",
+                    "observed_at": "2026-04-29T12:00:01Z"
+                }
+            ],
+            "events": [
+                {
+                    "event_type": "sentinel:ServiceDegraded",
+                    "target_entity_id": "service:mosquitto",
+                    "severity": "warning",
+                    "message": "API service degraded"
+                }
+            ]
+        })
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn create_native_entity(app: &Router, entity: Value) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request("POST", "/entities", entity))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    fn entity_id_by_key(entities: &Value, entity_key: &str) -> String {
+        entities
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entity| entity["entity_key"] == entity_key)
+            .and_then(|entity| entity["id"].as_str())
+            .unwrap()
+            .to_string()
     }
 
     async fn complete_executor_test_command(

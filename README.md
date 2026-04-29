@@ -39,6 +39,7 @@ The architecture should later support distributed deployment, where HTTP ingesti
 - [Domain Model](docs/DOMAIN_MODEL.md)
 - [Observation Model](docs/OBSERVATION_MODEL.md)
 - [Ingestion Model](docs/INGESTION_MODEL.md)
+- [SmartSentinel Integration](docs/SMARTSENTINEL_INTEGRATION.md)
 - [Persistence Model](docs/PERSISTENCE_MODEL.md)
 - [AI and MCP Model](docs/AI_MCP_MODEL.md)
 - [Architecture Decision Records](docs/ADR)
@@ -242,6 +243,75 @@ $raw = Invoke-RestMethod `
 $raw.connector_id
 $raw.connector_key
 $raw.connector_profile
+```
+
+Optional SmartSentinel snapshot ingestion can be tested without a SmartSentinel runtime. AionCore stores the full snapshot as a raw message and maps selected operational-domain data into domain-agnostic entities, relationships, observations, and events:
+
+```powershell
+$snapshot = @{
+  snapshot_id = "snap-001"
+  node_id = "fog-01"
+  observed_at = "2026-04-29T12:00:00Z"
+  entities = @(
+    @{
+      id = "host:fog-01"
+      type = "sentinel:Host"
+      name = "fog-01"
+      properties = @{}
+    }
+    @{
+      id = "service:mosquitto"
+      type = "sentinel:Service"
+      name = "mosquitto"
+      status = "healthy"
+      properties = @{}
+    }
+  )
+  relationships = @(
+    @{
+      source = "host:fog-01"
+      type = "sentinel:runs"
+      target = "service:mosquitto"
+    }
+  )
+  observations = @(
+    @{
+      entity_id = "service:mosquitto"
+      observed_property = "sentinel:ServiceStatus"
+      value = "healthy"
+      observed_at = "2026-04-29T12:00:01Z"
+    }
+  )
+  events = @(
+    @{
+      event_type = "sentinel:ServiceDegraded"
+      target_entity_id = "service:mosquitto"
+      severity = "warning"
+      message = "API service degraded"
+    }
+  )
+}
+
+$sentinelIngest = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/integrations/smartsentinel/snapshots" `
+  -ContentType "application/json" `
+  -Body ($snapshot | ConvertTo-Json -Depth 12)
+
+$sentinelIngest
+```
+
+Query the materialized records:
+
+```powershell
+$entities = Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities"
+$service = $entities | Where-Object { $_.entity_key -eq "smartsentinel:fog-01:service:mosquitto" }
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/raw-messages/$($sentinelIngest.raw_message_id)"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/observations?feature_of_interest_id=$($service.id)"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?raw_message_id=$($sentinelIngest.raw_message_id)"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ai/context/entity/$($service.id)"
 ```
 
 TTN v3 uplink JSON can be tested locally through connector-aware HTTP ingestion without a live TTN broker. Create existing AionCore entities, a TTN connector, and an explicit device mapping:
