@@ -463,6 +463,23 @@ $credentialValidation | ConvertTo-Json -Depth 8
 
 `$ttnSecret.secret_value` is empty because secret values are write-only in API responses. Validation reports whether a secret is configured and its non-secret type, but never returns the stored password/token.
 
+Preview the future live-validation checklist without connecting to TTN:
+
+```powershell
+$livePlan = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-live-readiness-plan"
+
+$livePlan.dry_run
+$livePlan.safe_to_connect
+$livePlan.can_attempt_live_validation
+$livePlan.blockers
+$livePlan.required_operator_steps
+$livePlan.checks | Select-Object check_key,status,reason,future_live_check
+```
+
+The dry-run plan always includes `no_network_call_performed`. Missing `broker_url`, `topic_filter`, `payload_format = "ttn-uplink-json"`, `secret_ref_id`, a compatible `mqtt_basic_auth` connector secret, or an enabled TTN device mapping appear as blockers before AionCore would allow future live validation.
+
 Update and delete mappings explicitly:
 
 ```powershell

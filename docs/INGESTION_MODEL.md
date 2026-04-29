@@ -123,6 +123,7 @@ Connector validation is exposed through:
 
 ```text
 GET /ingestion/connectors/{connector_id}/validate
+GET /ingestion/connectors/{connector_id}/ttn-live-readiness-plan
 ```
 
 For `connector_profile = "ttn-v3"`, validation is deterministic and non-network. It does not connect to TTN, authenticate to a broker, subscribe to topics, verify accounts, or validate TLS/mTLS. The response includes:
@@ -182,6 +183,40 @@ Validation readiness is derived from issues and warnings:
 - `invalid`: at least one blocking issue is present.
 
 Non-TTN connectors return the same response shape with a `profile_specific_validation_unavailable` warning. `/ready` does not fail because of TTN validation warnings or invalid connector configuration; readiness remains focused on storage and runtime health.
+
+TTN live readiness planning is a dry run for future opt-in live validation. It never opens a socket, resolves DNS, authenticates, subscribes, validates credentials, or contacts TTN/The Things Stack. The response includes:
+
+- `connector_id`
+- `connector_key`
+- `dry_run = true`
+- `can_attempt_live_validation`
+- `readiness`: `ready`, `degraded`, or `invalid`
+- `checks`
+- `blockers`
+- `warnings`
+- `required_operator_steps`
+- `safe_to_connect`
+- `generated_at`
+
+Each check includes `check_key`, `description`, `status` (`pass`, `warn`, `fail`, or `skipped`), optional `reason`, and `future_live_check`.
+
+Dry-run checks include:
+
+- `connector_profile_is_ttn_v3`
+- `connector_type_is_mqtt`
+- `broker_url_present`
+- `topic_filter_present`
+- `topic_filter_plausibly_ttn`
+- `payload_format_is_ttn_uplink_json`
+- `secret_ref_present`
+- `secret_ref_resolves`
+- `secret_type_is_mqtt_basic_auth`
+- `secret_username_present`
+- `secret_value_present_internally`
+- `at_least_one_enabled_ttn_mapping`
+- `no_network_call_performed`
+
+For live-readiness planning, missing broker URL, topic filter, compatible `mqtt_basic_auth` connector secret, `secret_ref_id`, `payload_format = "ttn-uplink-json"`, and enabled TTN device mappings are blockers. A disabled TTN connector is not safe to connect and returns an operator step to enable it. Non-TTN connectors return a not-applicable plan with `safe_to_connect = false`.
 
 ## Worker Planner
 

@@ -532,6 +532,39 @@ pub struct TtnConnectorValidation {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TtnLiveReadinessCheckStatus {
+    Pass,
+    Warn,
+    Fail,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TtnLiveReadinessCheck {
+    pub check_key: &'static str,
+    pub description: &'static str,
+    pub status: TtnLiveReadinessCheckStatus,
+    pub reason: Option<String>,
+    pub future_live_check: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TtnLiveReadinessPlan {
+    pub connector_id: Uuid,
+    pub connector_key: String,
+    pub dry_run: bool,
+    pub can_attempt_live_validation: bool,
+    pub readiness: TtnConnectorReadiness,
+    pub checks: Vec<TtnLiveReadinessCheck>,
+    pub blockers: Vec<TtnConnectorValidationIssue>,
+    pub warnings: Vec<TtnConnectorValidationIssue>,
+    pub required_operator_steps: Vec<String>,
+    pub safe_to_connect: bool,
+    pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum IngestionWorkerKind {
     HttpListener,
     MqttSubscriber,
@@ -1150,6 +1183,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/ingestion/connectors/:connector_id/validate",
             get(validate_ingestion_connector),
+        )
+        .route(
+            "/ingestion/connectors/:connector_id/ttn-live-readiness-plan",
+            get(get_ttn_live_readiness_plan),
         )
         .route(
             "/ingestion/connectors/:connector_id/ttn-device-mappings",
@@ -3497,6 +3534,14 @@ async fn validate_ingestion_connector(
     Ok(Json(connector_validation(&state, &connector)?))
 }
 
+async fn get_ttn_live_readiness_plan(
+    State(state): State<AppState>,
+    Path(connector_id): Path<Uuid>,
+) -> Result<Json<TtnLiveReadinessPlan>, ApiError> {
+    let connector = get_connector(&state, connector_id)?;
+    Ok(Json(ttn_live_readiness_plan(&state, &connector)?))
+}
+
 async fn create_ttn_device_mapping(
     State(state): State<AppState>,
     Path(connector_id): Path<Uuid>,
@@ -4656,6 +4701,465 @@ fn ttn_operator_hints() -> Vec<String> {
         "Use a topic_filter shaped like v3/{application_id}/devices/{device_id}/up or v3/{application_id}/devices/+/up.".to_string(),
         "No live credential or broker verification is performed by this validation endpoint.".to_string(),
     ]
+}
+
+fn ttn_live_readiness_plan(
+    state: &AppState,
+    connector: &IngestionConnector,
+) -> Result<TtnLiveReadinessPlan, ApiError> {
+    let validation = connector_validation(state, connector)?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    let mut required_operator_steps = Vec::new();
+
+    if connector.connector_profile != ConnectorProfile::TtnV3 {
+        checks.push(ttn_live_check(
+            "connector_profile_is_ttn_v3",
+            "Connector profile is TTN v3",
+            TtnLiveReadinessCheckStatus::Skipped,
+            Some("profile-specific TTN live readiness planning is not applicable".to_string()),
+            false,
+        ));
+        warnings.push(ttn_validation_issue(
+            "not_applicable",
+            "TTN live readiness planning applies only to ttn-v3 connectors",
+        ));
+        return Ok(TtnLiveReadinessPlan {
+            connector_id: connector.id,
+            connector_key: connector.connector_key.clone(),
+            dry_run: true,
+            can_attempt_live_validation: false,
+            readiness: TtnConnectorReadiness::Degraded,
+            checks,
+            blockers,
+            warnings,
+            required_operator_steps,
+            safe_to_connect: false,
+            generated_at: Utc::now(),
+        });
+    }
+
+    let profile_ok = connector.connector_profile == ConnectorProfile::TtnV3;
+    checks.push(ttn_live_check_from_bool(
+        "connector_profile_is_ttn_v3",
+        "Connector profile is TTN v3",
+        profile_ok,
+        "connector_profile must be ttn-v3",
+        false,
+    ));
+    if !profile_ok {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "connector_profile_not_ttn_v3",
+            "connector profile must be ttn-v3",
+            "Create or select a connector with connector_profile = ttn-v3.",
+        );
+    }
+
+    let connector_type_ok = connector.connector_type == IngestionConnectorType::Mqtt;
+    checks.push(ttn_live_check_from_bool(
+        "connector_type_is_mqtt",
+        "Connector type is MQTT",
+        connector_type_ok,
+        "connector_type must be mqtt",
+        false,
+    ));
+    if !connector_type_ok {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "connector_type_not_mqtt",
+            "connector_type must be mqtt",
+            "Create or update the TTN connector so connector_type = mqtt.",
+        );
+    }
+
+    let broker_url_present = connector
+        .broker_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    checks.push(ttn_live_check_from_bool(
+        "broker_url_present",
+        "Broker URL is configured",
+        broker_url_present,
+        "broker_url is missing",
+        true,
+    ));
+    if !broker_url_present {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "missing_broker_url",
+            "broker_url is required before any future live TTN validation attempt",
+            "Set broker_url to the TTN/The Things Stack MQTT endpoint for the deployment.",
+        );
+    }
+
+    let topic_filter_present = connector
+        .topic_filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    checks.push(ttn_live_check_from_bool(
+        "topic_filter_present",
+        "Topic filter is configured",
+        topic_filter_present,
+        "topic_filter is missing",
+        true,
+    ));
+    if !topic_filter_present {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "missing_topic_filter",
+            "topic_filter is required before any future live TTN validation attempt",
+            "Set topic_filter to a TTN uplink topic such as v3/{application_id}/devices/+/up.",
+        );
+    }
+
+    let topic_filter_plausibly_ttn = connector
+        .topic_filter
+        .as_deref()
+        .map(is_plausible_ttn_topic_filter)
+        .unwrap_or(false);
+    checks.push(ttn_live_check(
+        "topic_filter_plausibly_ttn",
+        "Topic filter looks like a TTN uplink topic",
+        if topic_filter_present {
+            if topic_filter_plausibly_ttn {
+                TtnLiveReadinessCheckStatus::Pass
+            } else {
+                TtnLiveReadinessCheckStatus::Fail
+            }
+        } else {
+            TtnLiveReadinessCheckStatus::Skipped
+        },
+        if topic_filter_present && !topic_filter_plausibly_ttn {
+            Some("topic_filter should contain v3/, /devices/, and /up".to_string())
+        } else if !topic_filter_present {
+            Some("topic_filter is missing".to_string())
+        } else {
+            None
+        },
+        true,
+    ));
+    if topic_filter_present && !topic_filter_plausibly_ttn {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "implausible_ttn_topic_filter",
+            "topic_filter does not look like a TTN uplink topic",
+            "Set topic_filter to match the application/device uplink topic shape.",
+        );
+    }
+
+    checks.push(ttn_live_check_from_bool(
+        "payload_format_is_ttn_uplink_json",
+        "Payload format is ttn-uplink-json",
+        validation.payload_format_supported,
+        "payload_format must be ttn-uplink-json",
+        false,
+    ));
+    if !validation.payload_format_supported {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "unsupported_ttn_payload_format",
+            "payload_format must be ttn-uplink-json",
+            "Set payload_format = ttn-uplink-json.",
+        );
+    }
+
+    checks.push(ttn_live_check_from_bool(
+        "secret_ref_present",
+        "Connector references a connector secret",
+        validation.has_secret_ref,
+        "secret_ref_id is missing",
+        false,
+    ));
+    if !validation.has_secret_ref {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "missing_secret_ref",
+            "secret_ref_id is required before any future live TTN validation attempt",
+            "Create a mqtt_basic_auth connector secret and attach it with secret_ref_id.",
+        );
+    }
+
+    let secret_ref_resolves =
+        validation.has_secret_ref && !ttn_validation_has_issue(&validation, "secret_ref_not_found");
+    checks.push(ttn_live_check(
+        "secret_ref_resolves",
+        "Connector secret reference resolves",
+        if validation.has_secret_ref {
+            if secret_ref_resolves {
+                TtnLiveReadinessCheckStatus::Pass
+            } else {
+                TtnLiveReadinessCheckStatus::Fail
+            }
+        } else {
+            TtnLiveReadinessCheckStatus::Skipped
+        },
+        if validation.has_secret_ref && !secret_ref_resolves {
+            Some("secret_ref_id does not reference an existing connector secret".to_string())
+        } else if !validation.has_secret_ref {
+            Some("secret_ref_id is missing".to_string())
+        } else {
+            None
+        },
+        false,
+    ));
+    if validation.has_secret_ref && !secret_ref_resolves {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "secret_ref_not_found",
+            "secret_ref_id does not reference an existing connector secret",
+            "Attach secret_ref_id to an existing connector secret.",
+        );
+    }
+
+    let secret_type_is_mqtt_basic_auth =
+        validation.secret_type == Some(ConnectorSecretType::MqttBasicAuth);
+    checks.push(ttn_live_check(
+        "secret_type_is_mqtt_basic_auth",
+        "Connector secret type is mqtt_basic_auth",
+        if secret_ref_resolves {
+            if secret_type_is_mqtt_basic_auth {
+                TtnLiveReadinessCheckStatus::Pass
+            } else {
+                TtnLiveReadinessCheckStatus::Fail
+            }
+        } else {
+            TtnLiveReadinessCheckStatus::Skipped
+        },
+        if secret_ref_resolves && !secret_type_is_mqtt_basic_auth {
+            Some("referenced secret must use secret_type mqtt_basic_auth".to_string())
+        } else if !secret_ref_resolves {
+            Some("secret reference does not resolve".to_string())
+        } else {
+            None
+        },
+        false,
+    ));
+    if secret_ref_resolves && !secret_type_is_mqtt_basic_auth {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "incompatible_secret_type",
+            "referenced secret must use secret_type mqtt_basic_auth",
+            "Create or attach a connector secret with secret_type = mqtt_basic_auth.",
+        );
+    }
+
+    let secret_username_present = secret_type_is_mqtt_basic_auth
+        && !ttn_validation_has_issue(&validation, "missing_secret_username");
+    checks.push(ttn_live_check(
+        "secret_username_present",
+        "Connector secret has a username",
+        if secret_type_is_mqtt_basic_auth {
+            if secret_username_present {
+                TtnLiveReadinessCheckStatus::Pass
+            } else {
+                TtnLiveReadinessCheckStatus::Fail
+            }
+        } else {
+            TtnLiveReadinessCheckStatus::Skipped
+        },
+        if secret_type_is_mqtt_basic_auth && !secret_username_present {
+            Some("mqtt_basic_auth secret is missing username".to_string())
+        } else if !secret_type_is_mqtt_basic_auth {
+            Some("secret type is not mqtt_basic_auth".to_string())
+        } else {
+            None
+        },
+        false,
+    ));
+    if secret_type_is_mqtt_basic_auth && !secret_username_present {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "missing_secret_username",
+            "mqtt_basic_auth secret is missing username",
+            "Set the connector secret username to the TTN MQTT username for the deployment.",
+        );
+    }
+
+    let secret_value_present = validation.secret_configured
+        && !ttn_validation_has_issue(&validation, "missing_secret_value");
+    checks.push(ttn_live_check(
+        "secret_value_present_internally",
+        "Connector secret has an internal secret value",
+        if secret_type_is_mqtt_basic_auth {
+            if secret_value_present {
+                TtnLiveReadinessCheckStatus::Pass
+            } else {
+                TtnLiveReadinessCheckStatus::Fail
+            }
+        } else {
+            TtnLiveReadinessCheckStatus::Skipped
+        },
+        if secret_type_is_mqtt_basic_auth && !secret_value_present {
+            Some("secret value is missing internally".to_string())
+        } else if !secret_type_is_mqtt_basic_auth {
+            Some("secret type is not mqtt_basic_auth".to_string())
+        } else {
+            None
+        },
+        false,
+    ));
+    if secret_type_is_mqtt_basic_auth && !secret_value_present {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "missing_secret_value",
+            "connector secret has no internal secret value",
+            "Store the TTN MQTT password or API token in the connector secret_value.",
+        );
+    }
+
+    let has_enabled_mapping = validation.enabled_mapping_count > 0;
+    checks.push(ttn_live_check_from_bool(
+        "at_least_one_enabled_ttn_mapping",
+        "At least one enabled TTN device mapping exists",
+        has_enabled_mapping,
+        "no enabled TTN device mapping exists",
+        false,
+    ));
+    if !has_enabled_mapping {
+        add_ttn_live_blocker(
+            &mut blockers,
+            &mut required_operator_steps,
+            "missing_enabled_ttn_device_mapping",
+            "at least one enabled TTN device mapping is required before live validation",
+            "Create and enable a TTN device mapping for the connector.",
+        );
+    }
+
+    checks.push(ttn_live_check(
+        "no_network_call_performed",
+        "Dry-run plan did not contact TTN or any broker",
+        TtnLiveReadinessCheckStatus::Pass,
+        Some("this endpoint is deterministic and non-network".to_string()),
+        false,
+    ));
+
+    if !connector.enabled {
+        warnings.push(ttn_validation_issue(
+            "connector_disabled",
+            "connector is disabled; enable it before any future live validation attempt",
+        ));
+        push_unique_step(
+            &mut required_operator_steps,
+            "Enable the TTN connector before attempting live validation.",
+        );
+    }
+
+    for issue in &validation.issues {
+        push_unique_issue(&mut blockers, issue.clone());
+    }
+    for warning in &validation.warnings {
+        push_unique_issue(&mut warnings, warning.clone());
+    }
+
+    let safe_to_connect = connector.enabled && blockers.is_empty();
+    let readiness = if safe_to_connect {
+        TtnConnectorReadiness::Ready
+    } else if blockers.is_empty() {
+        TtnConnectorReadiness::Degraded
+    } else {
+        TtnConnectorReadiness::Invalid
+    };
+
+    Ok(TtnLiveReadinessPlan {
+        connector_id: connector.id,
+        connector_key: connector.connector_key.clone(),
+        dry_run: true,
+        can_attempt_live_validation: safe_to_connect,
+        readiness,
+        checks,
+        blockers,
+        warnings,
+        required_operator_steps,
+        safe_to_connect,
+        generated_at: Utc::now(),
+    })
+}
+
+fn ttn_validation_has_issue(validation: &TtnConnectorValidation, code: &str) -> bool {
+    validation.issues.iter().any(|issue| issue.code == code)
+}
+
+fn ttn_live_check_from_bool(
+    check_key: &'static str,
+    description: &'static str,
+    passed: bool,
+    failure_reason: &'static str,
+    future_live_check: bool,
+) -> TtnLiveReadinessCheck {
+    ttn_live_check(
+        check_key,
+        description,
+        if passed {
+            TtnLiveReadinessCheckStatus::Pass
+        } else {
+            TtnLiveReadinessCheckStatus::Fail
+        },
+        if passed {
+            None
+        } else {
+            Some(failure_reason.to_string())
+        },
+        future_live_check,
+    )
+}
+
+fn ttn_live_check(
+    check_key: &'static str,
+    description: &'static str,
+    status: TtnLiveReadinessCheckStatus,
+    reason: Option<String>,
+    future_live_check: bool,
+) -> TtnLiveReadinessCheck {
+    TtnLiveReadinessCheck {
+        check_key,
+        description,
+        status,
+        reason,
+        future_live_check,
+    }
+}
+
+fn add_ttn_live_blocker(
+    blockers: &mut Vec<TtnConnectorValidationIssue>,
+    required_operator_steps: &mut Vec<String>,
+    code: &'static str,
+    message: &'static str,
+    step: &'static str,
+) {
+    push_unique_issue(blockers, ttn_validation_issue(code, message));
+    push_unique_step(required_operator_steps, step);
+}
+
+fn push_unique_issue(
+    issues: &mut Vec<TtnConnectorValidationIssue>,
+    issue: TtnConnectorValidationIssue,
+) {
+    if !issues.iter().any(|existing| existing.code == issue.code) {
+        issues.push(issue);
+    }
+}
+
+fn push_unique_step(steps: &mut Vec<String>, step: &'static str) {
+    if !steps.iter().any(|existing| existing == step) {
+        steps.push(step.to_string());
+    }
 }
 
 fn is_plausible_ttn_topic_filter(topic_filter: &str) -> bool {
@@ -10548,6 +11052,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_ttn_live_readiness_plan_is_safe_to_connect() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "ttn-live-ready-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "ttn-live-ready-plot-01", "aion:Plot").await;
+        let secret = create_connector_secret_with_type(
+            &app,
+            "ttn-live-ready-secret",
+            "mqtt_basic_auth",
+            Some("farm-app@tenant"),
+            "secret-pass",
+        )
+        .await;
+        let connector = create_ttn_connector_with_secret(
+            &app,
+            "ttn-live-ready",
+            secret["id"].as_str().unwrap(),
+        )
+        .await;
+        create_ttn_device_mapping(
+            &app,
+            connector["id"].as_str().unwrap(),
+            Some("farm-app"),
+            "soil-node-01",
+            &sensor_id,
+            Some(&plot_id),
+        )
+        .await;
+
+        let plan = get_ttn_live_readiness_plan(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(plan["dry_run"], true);
+        assert_eq!(plan["safe_to_connect"], true);
+        assert_eq!(plan["can_attempt_live_validation"], true);
+        assert_eq!(plan["readiness"], "ready");
+        assert!(plan["blockers"].as_array().unwrap().is_empty());
+        assert!(plan_has_check(&plan, "no_network_call_performed", "pass"));
+        assert!(!plan.to_string().contains("secret-pass"));
+    }
+
+    #[tokio::test]
+    async fn ttn_live_readiness_plan_missing_broker_url_creates_blocker() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-live-missing-broker",
+            "ttn-v3",
+            true,
+            None,
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let plan = get_ttn_live_readiness_plan(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(plan["safe_to_connect"], false);
+        assert_eq!(plan["readiness"], "invalid");
+        assert!(validation_issue_codes(&plan, "blockers").contains(&"missing_broker_url"));
+    }
+
+    #[tokio::test]
+    async fn ttn_live_readiness_plan_missing_secret_creates_blocker() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "ttn-live-missing-secret",
+            "ttn-v3",
+            true,
+            Some("mqtt://eu1.cloud.thethings.network:1883"),
+            Some("v3/demo-app/devices/+/up"),
+            Some("ttn-uplink-json"),
+        )
+        .await;
+
+        let plan = get_ttn_live_readiness_plan(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(plan["safe_to_connect"], false);
+        assert!(validation_issue_codes(&plan, "blockers").contains(&"missing_secret_ref"));
+        assert!(plan["required_operator_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step.as_str().unwrap().contains("mqtt_basic_auth")));
+    }
+
+    #[tokio::test]
+    async fn ttn_live_readiness_plan_missing_mapping_creates_blocker() {
+        let app = app();
+        let secret = create_connector_secret_with_type(
+            &app,
+            "ttn-live-no-mapping-secret",
+            "mqtt_basic_auth",
+            Some("farm-app@tenant"),
+            "secret-pass",
+        )
+        .await;
+        let connector = create_ttn_connector_with_secret(
+            &app,
+            "ttn-live-no-mapping",
+            secret["id"].as_str().unwrap(),
+        )
+        .await;
+
+        let plan = get_ttn_live_readiness_plan(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(plan["safe_to_connect"], false);
+        assert!(validation_issue_codes(&plan, "blockers")
+            .contains(&"missing_enabled_ttn_device_mapping"));
+        assert!(plan_has_check(
+            &plan,
+            "at_least_one_enabled_ttn_mapping",
+            "fail"
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_ttn_live_readiness_plan_is_not_applicable() {
+        let app = app();
+        let connector = create_mqtt_connector(
+            &app,
+            "generic-live-plan",
+            "generic-mqtt",
+            true,
+            Some("mqtt://127.0.0.1:1883"),
+            Some("aioncore/+/+/data"),
+            Some("canonical-json"),
+        )
+        .await;
+
+        let plan = get_ttn_live_readiness_plan(&app, connector["id"].as_str().unwrap()).await;
+        assert_eq!(plan["dry_run"], true);
+        assert_eq!(plan["safe_to_connect"], false);
+        assert_eq!(plan["can_attempt_live_validation"], false);
+        assert!(validation_issue_codes(&plan, "warnings").contains(&"not_applicable"));
+        assert!(plan_has_check(
+            &plan,
+            "connector_profile_is_ttn_v3",
+            "skipped"
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabled_ttn_live_readiness_plan_is_not_safe() {
+        let app = app();
+        let secret = create_connector_secret_with_type(
+            &app,
+            "ttn-live-disabled-secret",
+            "mqtt_basic_auth",
+            Some("farm-app@tenant"),
+            "secret-pass",
+        )
+        .await;
+        let connector = create_ttn_connector_with_secret(
+            &app,
+            "ttn-live-disabled",
+            secret["id"].as_str().unwrap(),
+        )
+        .await;
+        let connector_id = connector["id"].as_str().unwrap();
+        let disable_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/ingestion/connectors/{connector_id}/disable"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disable_response.status(), StatusCode::OK);
+
+        let plan = get_ttn_live_readiness_plan(&app, connector_id).await;
+        assert_eq!(plan["safe_to_connect"], false);
+        assert_eq!(plan["can_attempt_live_validation"], false);
+        assert!(validation_issue_codes(&plan, "warnings").contains(&"connector_disabled"));
+    }
+
+    #[tokio::test]
     async fn existing_http_ingestion_without_connector_still_works() {
         let app = app();
         let sensor_id = create_test_entity(&app, "no-connector-sensor-01", "aion:Sensor").await;
@@ -12880,6 +13559,24 @@ mod tests {
         to_json(response).await
     }
 
+    async fn get_ttn_live_readiness_plan(app: &Router, connector_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/ingestion/connectors/{connector_id}/ttn-live-readiness-plan"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
     fn validation_issue_codes<'a>(validation: &'a Value, field: &str) -> Vec<&'a str> {
         validation[field]
             .as_array()
@@ -12887,6 +13584,14 @@ mod tests {
             .iter()
             .map(|issue| issue["code"].as_str().unwrap())
             .collect()
+    }
+
+    fn plan_has_check(plan: &Value, check_key: &str, status: &str) -> bool {
+        plan["checks"].as_array().unwrap().iter().any(|check| {
+            check["check_key"] == check_key
+                && check["status"] == status
+                && check["future_live_check"].is_boolean()
+        })
     }
 
     async fn get_worker_status(app: &Router) -> Value {
