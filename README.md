@@ -43,6 +43,7 @@ The architecture should later support distributed deployment, where HTTP ingesti
 - [SmartSentinel Integration](docs/SMARTSENTINEL_INTEGRATION.md)
 - [Persistence Model](docs/PERSISTENCE_MODEL.md)
 - [AI and MCP Model](docs/AI_MCP_MODEL.md)
+- [Roadmap](docs/ROADMAP.md)
 - [Security Model](docs/SECURITY_MODEL.md)
 - [Architecture Decision Records](docs/ADR)
 
