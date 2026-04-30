@@ -43,6 +43,7 @@ The architecture should later support distributed deployment, where HTTP ingesti
 - [SmartSentinel Integration](docs/SMARTSENTINEL_INTEGRATION.md)
 - [Persistence Model](docs/PERSISTENCE_MODEL.md)
 - [AI and MCP Model](docs/AI_MCP_MODEL.md)
+- [Security Model](docs/SECURITY_MODEL.md)
 - [Architecture Decision Records](docs/ADR)
 
 ## Key Principles
@@ -68,6 +69,18 @@ The architecture should later support distributed deployment, where HTTP ingesti
 AionCore currently has a minimal Rust workspace, core domain models, SQL migrations, and a local in-memory API runtime for early testing.
 
 The PostgreSQL and TimescaleDB migration foundation now covers the current in-memory models, including commands, actions, events, executor agents, command leases, and rules. Runtime persistence is not wired yet; the local API still uses in-memory storage.
+
+## Authentication Status
+
+Most current AionCore APIs are unauthenticated. This is acceptable for local development and tests only, not for public or production exposure.
+
+Local development warning:
+
+- run the API on trusted local networks only
+- do not expose `/mcp`, `/mcp/tools`, or `/ai/context/*` publicly
+- do not treat current connector-secret redaction as a complete production security model
+
+The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md) and [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, machine-principal protection for adapters and executors, connector-secret protection, and MCP hardening.
 
 ## Run Locally Without Docker
 
