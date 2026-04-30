@@ -1,6 +1,7 @@
 use aion_action::{
     Action, ActionResult, ApprovalStatus, Capability, Command, CommandLease, CommandStatus,
-    ExecutorAgent, ExecutorAgentStatus, ExecutorCapability, ExecutorScope, Policy,
+    EdgeAdapter, EdgeAdapterStatus, EdgeAdapterStatusReport, EdgeAdapterType, ExecutorAgent,
+    ExecutorAgentStatus, ExecutorCapability, ExecutorScope, Policy,
 };
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
@@ -963,6 +964,53 @@ pub struct ExecutorCommandCompletionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RegisterEdgeAdapterRequest {
+    pub adapter_key: String,
+    pub display_name: Option<String>,
+    pub adapter_type: EdgeAdapterType,
+    pub status: Option<EdgeAdapterStatus>,
+    pub version: Option<String>,
+    pub host_id: Option<String>,
+    pub site_id: Option<String>,
+    pub environment: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EdgeAdapterHeartbeatRequest {
+    pub status: EdgeAdapterStatus,
+    pub version: Option<String>,
+    pub host_id: Option<String>,
+    pub site_id: Option<String>,
+    pub environment: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub uptime_seconds: Option<u64>,
+    pub active_connectors: Option<u32>,
+    pub active_plugins: Option<u32>,
+    pub dlq_depth: Option<u64>,
+    pub dlq_oldest_record_at: Option<DateTime<Utc>>,
+    pub last_publish_success_at: Option<DateTime<Utc>>,
+    pub last_publish_failure_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EdgeAdapterRegistrationResponse {
+    pub adapter: EdgeAdapter,
+    pub entity: Option<Entity>,
+    pub status: EdgeAdapterStatusReport,
+    pub reused: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EdgeAdapterStatusResponse {
+    pub adapter: EdgeAdapter,
+    pub entity: Option<Entity>,
+    pub status: EdgeAdapterStatusReport,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RegisterSmartSentinelExecutorRequest {
     pub agent_key: String,
     pub display_name: Option<String>,
@@ -1410,6 +1458,16 @@ pub fn app_with_state(state: AppState) -> Router {
             "/executors/:executor_id/commands/:command_id/fail",
             post(fail_executor_command),
         )
+        .route(
+            "/adapters",
+            post(register_edge_adapter).get(list_edge_adapters),
+        )
+        .route("/adapters/:adapter_id", get(get_edge_adapter))
+        .route(
+            "/adapters/:adapter_id/heartbeat",
+            put(heartbeat_edge_adapter),
+        )
+        .route("/adapters/:adapter_id/status", get(get_edge_adapter_status))
         .route("/commands", post(create_command).get(query_commands))
         .route(
             "/commands/recover-expired-leases",
@@ -3083,6 +3141,188 @@ async fn fail_executor_command(
         command,
         action,
         action_result,
+    }))
+}
+
+async fn register_edge_adapter(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterEdgeAdapterRequest>,
+) -> Result<(StatusCode, Json<EdgeAdapterRegistrationResponse>), ApiError> {
+    let now = Utc::now();
+    let existing = state
+        .storage
+        .get_edge_adapter_by_key(state.tenant_id, &request.adapter_key)?;
+    let previous_status = existing.as_ref().map(|adapter| adapter.status.clone());
+    let reused = previous_status.is_some();
+
+    let adapter = if let Some(mut adapter) = existing {
+        adapter.display_name = request.display_name;
+        adapter.adapter_type = request.adapter_type;
+        adapter.status = request
+            .status
+            .clone()
+            .unwrap_or_else(|| adapter.status.clone());
+        adapter.version = request.version;
+        adapter.host_id = request.host_id;
+        adapter.site_id = request.site_id;
+        adapter.environment = request.environment;
+        adapter.metadata = request.metadata;
+        adapter.updated_at = now;
+        state.storage.update_edge_adapter(adapter)?
+    } else {
+        let adapter = EdgeAdapter::new(
+            state.tenant_id,
+            request.adapter_key,
+            request.adapter_type,
+            request.display_name,
+            request.status.unwrap_or(EdgeAdapterStatus::Unknown),
+            request.version,
+            request.host_id,
+            request.site_id,
+            request.environment,
+            request.metadata,
+            now,
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        state.storage.create_edge_adapter(adapter)?
+    };
+
+    let entity = upsert_edge_adapter_entity(&state, &adapter)?;
+    let status = edge_adapter_status_from_registration(&adapter, now);
+    let status = state
+        .storage
+        .put_edge_adapter_status(state.tenant_id, status)?;
+    record_edge_adapter_event(
+        &state,
+        "aion:EdgeAdapterRegistered",
+        &adapter,
+        Some(&entity),
+        Some(&status),
+        Some(json!({
+            "reused": previous_status.is_some(),
+            "source": "edge_adapter_api"
+        })),
+    )?;
+    if previous_status.as_ref() != Some(&adapter.status) {
+        record_edge_adapter_status_changed_event(
+            &state,
+            &adapter,
+            Some(&entity),
+            previous_status.clone(),
+        )?;
+    }
+
+    Ok((
+        if reused {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        Json(EdgeAdapterRegistrationResponse {
+            adapter,
+            entity: Some(entity),
+            status,
+            reused,
+        }),
+    ))
+}
+
+async fn list_edge_adapters(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<EdgeAdapter>>, ApiError> {
+    Ok(Json(state.storage.list_edge_adapters(state.tenant_id)?))
+}
+
+async fn get_edge_adapter(
+    State(state): State<AppState>,
+    Path(adapter_id): Path<Uuid>,
+) -> Result<Json<EdgeAdapter>, ApiError> {
+    Ok(Json(get_edge_adapter_record(&state, adapter_id)?))
+}
+
+async fn heartbeat_edge_adapter(
+    State(state): State<AppState>,
+    Path(adapter_id): Path<Uuid>,
+    Json(request): Json<EdgeAdapterHeartbeatRequest>,
+) -> Result<Json<EdgeAdapterStatusResponse>, ApiError> {
+    let mut adapter = get_edge_adapter_record(&state, adapter_id)?;
+    let previous_status = adapter.status.clone();
+    let observed_at = request.observed_at.unwrap_or_else(Utc::now);
+    let request_metadata = request.metadata.clone();
+    adapter.heartbeat(request.status.clone(), observed_at);
+    if request.version.is_some() {
+        adapter.version = request.version;
+    }
+    if request.host_id.is_some() {
+        adapter.host_id = request.host_id;
+    }
+    if request.site_id.is_some() {
+        adapter.site_id = request.site_id;
+    }
+    if request.environment.is_some() {
+        adapter.environment = request.environment;
+    }
+    if request_metadata.is_some() {
+        adapter.metadata = request_metadata.clone();
+    }
+    let adapter = state.storage.update_edge_adapter(adapter)?;
+    let entity = upsert_edge_adapter_entity(&state, &adapter)?;
+    let status = EdgeAdapterStatusReport {
+        adapter_id: adapter.id,
+        status: request.status,
+        observed_at,
+        uptime_seconds: request.uptime_seconds,
+        active_connectors: request.active_connectors,
+        active_plugins: request.active_plugins,
+        dlq_depth: request.dlq_depth,
+        dlq_oldest_record_at: request.dlq_oldest_record_at,
+        last_publish_success_at: request.last_publish_success_at,
+        last_publish_failure_at: request.last_publish_failure_at,
+        last_error: request.last_error,
+        metadata: request_metadata,
+    };
+    let status = state
+        .storage
+        .put_edge_adapter_status(state.tenant_id, status)?;
+    record_edge_adapter_event(
+        &state,
+        "aion:EdgeAdapterHeartbeat",
+        &adapter,
+        Some(&entity),
+        Some(&status),
+        Some(json!({"source": "edge_adapter_api"})),
+    )?;
+    if previous_status != adapter.status {
+        record_edge_adapter_status_changed_event(
+            &state,
+            &adapter,
+            Some(&entity),
+            Some(previous_status),
+        )?;
+    }
+
+    Ok(Json(EdgeAdapterStatusResponse {
+        adapter,
+        entity: Some(entity),
+        status,
+    }))
+}
+
+async fn get_edge_adapter_status(
+    State(state): State<AppState>,
+    Path(adapter_id): Path<Uuid>,
+) -> Result<Json<EdgeAdapterStatusResponse>, ApiError> {
+    let adapter = get_edge_adapter_record(&state, adapter_id)?;
+    let entity = get_edge_adapter_entity(&state, &adapter)?;
+    let status = state
+        .storage
+        .get_edge_adapter_status(state.tenant_id, adapter_id)?
+        .unwrap_or_else(|| edge_adapter_status_from_adapter(&adapter, adapter.last_seen_at));
+
+    Ok(Json(EdgeAdapterStatusResponse {
+        adapter,
+        entity,
+        status,
     }))
 }
 
@@ -8972,6 +9212,199 @@ fn get_executor_agent(state: &AppState, executor_id: Uuid) -> Result<ExecutorAge
         .ok_or_else(ApiError::not_found)
 }
 
+fn get_edge_adapter_record(state: &AppState, adapter_id: Uuid) -> Result<EdgeAdapter, ApiError> {
+    state
+        .storage
+        .get_edge_adapter(state.tenant_id, adapter_id)?
+        .ok_or_else(ApiError::not_found)
+}
+
+fn get_edge_adapter_entity(
+    state: &AppState,
+    adapter: &EdgeAdapter,
+) -> Result<Option<Entity>, ApiError> {
+    state
+        .storage
+        .get_entity_by_key(
+            state.tenant_id,
+            &edge_adapter_entity_key(&adapter.adapter_key),
+        )
+        .map_err(ApiError::from)
+}
+
+fn upsert_edge_adapter_entity(state: &AppState, adapter: &EdgeAdapter) -> Result<Entity, ApiError> {
+    let entity_key = edge_adapter_entity_key(&adapter.adapter_key);
+    let now = Utc::now();
+    let jsonld = edge_adapter_jsonld(adapter);
+    if let Some(mut entity) = state
+        .storage
+        .get_entity_by_key(state.tenant_id, &entity_key)?
+    {
+        let unchanged = entity.entity_type == "aion:EdgeAdapter" && entity.jsonld == jsonld;
+        if unchanged {
+            return Ok(entity);
+        }
+        entity.entity_type = "aion:EdgeAdapter".to_string();
+        entity.jsonld = jsonld;
+        entity.updated_at = now;
+        return Ok(state.storage.update_entity(entity)?);
+    }
+
+    let entity = Entity::new(state.tenant_id, entity_key, "aion:EdgeAdapter", jsonld, now)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok(state.storage.create_entity(entity)?)
+}
+
+fn edge_adapter_entity_key(adapter_key: &str) -> String {
+    format!("edge-adapter:{adapter_key}")
+}
+
+fn edge_adapter_jsonld(adapter: &EdgeAdapter) -> Value {
+    json!({
+        "@context": {"aion": "https://aioncore.org/ns#"},
+        "@id": format!("urn:aion:edge-adapter:{}", adapter.adapter_key),
+        "@type": "aion:EdgeAdapter",
+        "entity_key": edge_adapter_entity_key(&adapter.adapter_key),
+        "adapter_key": adapter.adapter_key,
+        "adapter_type": adapter.adapter_type,
+        "status": adapter.status,
+        "display_name": adapter.display_name,
+        "version": adapter.version,
+        "host_id": adapter.host_id,
+        "site_id": adapter.site_id,
+        "environment": adapter.environment,
+        "last_seen_at": adapter.last_seen_at,
+        "metadata": adapter.metadata
+    })
+}
+
+fn edge_adapter_status_from_registration(
+    adapter: &EdgeAdapter,
+    observed_at: DateTime<Utc>,
+) -> EdgeAdapterStatusReport {
+    EdgeAdapterStatusReport {
+        adapter_id: adapter.id,
+        status: adapter.status.clone(),
+        observed_at,
+        uptime_seconds: None,
+        active_connectors: None,
+        active_plugins: None,
+        dlq_depth: None,
+        dlq_oldest_record_at: None,
+        last_publish_success_at: None,
+        last_publish_failure_at: None,
+        last_error: None,
+        metadata: adapter.metadata.clone(),
+    }
+}
+
+fn edge_adapter_status_from_adapter(
+    adapter: &EdgeAdapter,
+    observed_at: Option<DateTime<Utc>>,
+) -> EdgeAdapterStatusReport {
+    EdgeAdapterStatusReport {
+        adapter_id: adapter.id,
+        status: adapter.status.clone(),
+        observed_at: observed_at.unwrap_or(adapter.created_at),
+        uptime_seconds: None,
+        active_connectors: None,
+        active_plugins: None,
+        dlq_depth: None,
+        dlq_oldest_record_at: None,
+        last_publish_success_at: None,
+        last_publish_failure_at: None,
+        last_error: None,
+        metadata: adapter.metadata.clone(),
+    }
+}
+
+fn record_edge_adapter_event(
+    state: &AppState,
+    event_type: impl Into<String>,
+    adapter: &EdgeAdapter,
+    entity: Option<&Entity>,
+    status: Option<&EdgeAdapterStatusReport>,
+    metadata: Option<Value>,
+) -> Result<Event, ApiError> {
+    let mut event_metadata = json!({
+        "adapter_id": adapter.id,
+        "adapter_key": adapter.adapter_key,
+        "adapter_type": adapter.adapter_type,
+        "status": adapter.status,
+        "version": adapter.version,
+        "host_id": adapter.host_id,
+        "site_id": adapter.site_id,
+        "environment": adapter.environment,
+        "last_seen_at": adapter.last_seen_at
+    });
+    if let Some(object) = event_metadata.as_object_mut() {
+        if let Some(status) = status {
+            object.insert(
+                "status_report".to_string(),
+                json!({
+                    "status": status.status,
+                    "observed_at": status.observed_at,
+                    "uptime_seconds": status.uptime_seconds,
+                    "active_connectors": status.active_connectors,
+                    "active_plugins": status.active_plugins,
+                    "dlq_depth": status.dlq_depth,
+                    "dlq_oldest_record_at": status.dlq_oldest_record_at,
+                    "last_publish_success_at": status.last_publish_success_at,
+                    "last_publish_failure_at": status.last_publish_failure_at,
+                    "last_error": status.last_error,
+                    "metadata": status.metadata
+                }),
+            );
+        }
+        if let Some(entity) = entity {
+            object.insert("entity_id".to_string(), json!(entity.id));
+            object.insert("entity_key".to_string(), json!(entity.entity_key));
+        }
+        if let Some(metadata) = metadata {
+            object.insert("metadata".to_string(), metadata);
+        }
+    }
+
+    record_event(
+        state,
+        EventDraft {
+            event_type: event_type.into(),
+            severity: EventSeverity::Info,
+            source_entity_id: None,
+            target_entity_id: entity.map(|entity| entity.id),
+            message: Some(format!("Edge adapter {} event", adapter.adapter_key)),
+            occurred_at: Utc::now(),
+            observed_at: None,
+            correlation_id: None,
+            raw_message_id: None,
+            observation_id: None,
+            command_id: None,
+            action_id: None,
+            action_result_id: None,
+            metadata: Some(event_metadata),
+        },
+    )
+}
+
+fn record_edge_adapter_status_changed_event(
+    state: &AppState,
+    adapter: &EdgeAdapter,
+    entity: Option<&Entity>,
+    previous_status: Option<EdgeAdapterStatus>,
+) -> Result<Event, ApiError> {
+    record_edge_adapter_event(
+        state,
+        "aion:EdgeAdapterStatusChanged",
+        adapter,
+        entity,
+        None,
+        Some(json!({
+            "previous_status": previous_status,
+            "current_status": adapter.status
+        })),
+    )
+}
+
 fn ensure_smartsentinel_executor(executor: &ExecutorAgent) -> Result<(), ApiError> {
     if executor.agent_type != "smartsentinel" {
         return Err(ApiError::bad_request(
@@ -10782,6 +11215,276 @@ mod tests {
             event["event_type"] == "sentinel:IncidentOpened"
                 && event["metadata"]["evidence"][0]["external_id"] == "log-001"
         }));
+    }
+
+    #[tokio::test]
+    async fn registers_edge_adapter_creates_entity_and_emits_events() {
+        let app = app();
+        let adapter_key = format!("edge-adapter-register-{}", Uuid::new_v4());
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": adapter_key,
+                    "display_name": "Fog Gateway",
+                    "adapter_type": "edge",
+                    "status": "online",
+                    "version": "1.2.3",
+                    "host_id": "host-01",
+                    "site_id": "site-01",
+                    "environment": "fog",
+                    "metadata": {
+                        "source": "test"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let registration = to_json(response).await;
+        let adapter_id = registration["adapter"]["id"].as_str().unwrap();
+        assert_eq!(registration["reused"], false);
+        assert_eq!(registration["adapter"]["adapter_key"], adapter_key);
+        assert_eq!(registration["status"]["status"], "online");
+        assert_eq!(registration["entity"]["entity_type"], "aion:EdgeAdapter");
+        assert_eq!(registration["entity"]["jsonld"]["adapter_key"], adapter_key);
+
+        let adapters = get_json(&app, "/adapters").await;
+        assert!(adapters.as_array().unwrap().iter().any(|adapter| {
+            adapter["id"] == adapter_id && adapter["adapter_key"] == adapter_key
+        }));
+
+        let entity = get_json(
+            &app,
+            &format!(
+                "/entities?entity_type=aion:EdgeAdapter&entity_key=edge-adapter:{adapter_key}"
+            ),
+        )
+        .await;
+        assert!(entity.as_array().unwrap().iter().any(|entity| {
+            entity["entity_key"] == format!("edge-adapter:{adapter_key}")
+                && entity["jsonld"]["adapter_key"] == adapter_key
+        }));
+
+        let registered_events =
+            get_json(&app, "/events?event_type=aion:EdgeAdapterRegistered").await;
+        assert!(registered_events.as_array().unwrap().iter().any(|event| {
+            event["metadata"]["adapter_key"] == adapter_key
+                && event["metadata"]["status_report"]["status"] == "online"
+        }));
+        let status_changed_events =
+            get_json(&app, "/events?event_type=aion:EdgeAdapterStatusChanged").await;
+        assert!(status_changed_events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["metadata"]["adapter_key"] == adapter_key
+                    && event["metadata"]["metadata"]["current_status"] == "online"
+            }));
+    }
+
+    #[tokio::test]
+    async fn re_registering_same_edge_adapter_key_reuses_existing_record() {
+        let app = app();
+        let adapter_key = format!("edge-adapter-reuse-{}", Uuid::new_v4());
+
+        let first = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": adapter_key,
+                    "adapter_type": "fog",
+                    "status": "offline"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = to_json(first).await;
+        let adapter_id = first_body["adapter"]["id"].as_str().unwrap().to_string();
+
+        let second = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": adapter_key,
+                    "display_name": "Updated Fog Gateway",
+                    "adapter_type": "fog",
+                    "status": "degraded",
+                    "metadata": {
+                        "source": "test",
+                        "revision": 2
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = to_json(second).await;
+        assert_eq!(second_body["reused"], true);
+        assert_eq!(second_body["adapter"]["id"], adapter_id);
+        assert_eq!(
+            second_body["adapter"]["display_name"],
+            "Updated Fog Gateway"
+        );
+        assert_eq!(second_body["adapter"]["status"], "degraded");
+
+        let adapters = get_json(&app, "/adapters").await;
+        assert_eq!(adapters.as_array().unwrap().len(), 1);
+        let fetched = get_json(&app, &format!("/adapters/{adapter_id}")).await;
+        assert_eq!(fetched["id"], adapter_id);
+        assert_eq!(fetched["adapter_key"], adapter_key);
+    }
+
+    #[tokio::test]
+    async fn edge_adapter_heartbeat_updates_status_and_last_seen_at() {
+        let app = app();
+        let adapter_key = format!("edge-adapter-heartbeat-{}", Uuid::new_v4());
+
+        let register = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": adapter_key,
+                    "adapter_type": "edge",
+                    "status": "online"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(register.status(), StatusCode::CREATED);
+        let adapter = to_json(register).await;
+        let adapter_id = adapter["adapter"]["id"].as_str().unwrap().to_string();
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/adapters/{adapter_id}/heartbeat"),
+                json!({
+                    "status": "degraded",
+                    "version": "1.2.4",
+                    "host_id": "host-02",
+                    "site_id": "site-01",
+                    "environment": "fog",
+                    "observed_at": "2026-04-29T15:00:00Z",
+                    "uptime_seconds": 3600,
+                    "active_connectors": 3,
+                    "active_plugins": 2,
+                    "dlq_depth": 7,
+                    "dlq_oldest_record_at": "2026-04-29T14:30:00Z",
+                    "last_publish_success_at": "2026-04-29T14:59:00Z",
+                    "last_publish_failure_at": "2026-04-29T14:58:30Z",
+                    "last_error": "broker unavailable",
+                    "metadata": {
+                        "source": "test",
+                        "dlq_replayed": false
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let heartbeat = to_json(response).await;
+        assert_eq!(heartbeat["adapter"]["status"], "degraded");
+        assert_eq!(heartbeat["adapter"]["last_seen_at"], "2026-04-29T15:00:00Z");
+        assert_eq!(heartbeat["status"]["status"], "degraded");
+        assert_eq!(heartbeat["status"]["dlq_depth"], 7);
+        assert_eq!(heartbeat["status"]["last_error"], "broker unavailable");
+
+        let fetched = get_json(&app, &format!("/adapters/{adapter_id}")).await;
+        assert_eq!(fetched["status"], "degraded");
+        assert_eq!(fetched["last_seen_at"], "2026-04-29T15:00:00Z");
+
+        let status = get_json(&app, &format!("/adapters/{adapter_id}/status")).await;
+        assert_eq!(status["status"]["dlq_depth"], 7);
+        assert_eq!(status["status"]["active_connectors"], 3);
+        assert_eq!(status["status"]["active_plugins"], 2);
+        assert_eq!(status["status"]["last_error"], "broker unavailable");
+
+        let heartbeat_events = get_json(&app, "/events?event_type=aion:EdgeAdapterHeartbeat").await;
+        assert!(heartbeat_events.as_array().unwrap().iter().any(|event| {
+            event["metadata"]["adapter_key"] == adapter_key
+                && event["metadata"]["status_report"]["dlq_depth"] == 7
+        }));
+        let status_changed_events =
+            get_json(&app, "/events?event_type=aion:EdgeAdapterStatusChanged").await;
+        assert!(status_changed_events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["metadata"]["adapter_key"] == adapter_key
+                    && event["metadata"]["metadata"]["previous_status"] == "online"
+                    && event["metadata"]["metadata"]["current_status"] == "degraded"
+            }));
+    }
+
+    #[tokio::test]
+    async fn edge_adapter_status_endpoint_returns_dlq_fields() {
+        let app = app();
+        let adapter_key = format!("edge-adapter-status-{}", Uuid::new_v4());
+
+        let register = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": adapter_key,
+                    "adapter_type": "lab",
+                    "status": "online"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(register.status(), StatusCode::CREATED);
+        let adapter = to_json(register).await;
+        let adapter_id = adapter["adapter"]["id"].as_str().unwrap().to_string();
+
+        app.clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/adapters/{adapter_id}/heartbeat"),
+                json!({
+                    "status": "online",
+                    "observed_at": "2026-04-29T15:15:00Z",
+                    "dlq_depth": 12,
+                    "dlq_oldest_record_at": "2026-04-29T15:00:00Z",
+                    "last_publish_success_at": "2026-04-29T15:14:00Z",
+                    "metadata": {
+                        "source": "test",
+                        "queue": "offline"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let status = get_json(&app, &format!("/adapters/{adapter_id}/status")).await;
+        assert_eq!(status["adapter"]["adapter_key"], adapter_key);
+        assert_eq!(status["status"]["dlq_depth"], 12);
+        assert_eq!(
+            status["status"]["dlq_oldest_record_at"],
+            "2026-04-29T15:00:00Z"
+        );
+        assert_eq!(
+            status["status"]["last_publish_success_at"],
+            "2026-04-29T15:14:00Z"
+        );
+        assert_eq!(status["status"]["metadata"]["queue"], "offline");
     }
 
     #[tokio::test]

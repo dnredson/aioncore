@@ -254,6 +254,49 @@ The adapter is not required by the AionCore runtime. Current server-side ingesti
 
 The future adapter model covers local parser plugins, output modes such as `senml-json`, `canonical-json`, and future `aion-observation-batch`, local DLQ/offline buffering, retry/backoff behavior, safe local credential handling, and publishing to AionCore HTTP or MQTT ingestion. See [Aion Edge Adapter Model](docs/EDGE_ADAPTER_MODEL.md).
 
+Edge adapter registration and status reporting are documented as a future optional contract and do not change current runtime behavior:
+
+```powershell
+$adapter = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/adapters" `
+  -ContentType "application/json" `
+  -Body (@{
+    adapter_key = "fog-01-mqtt"
+    display_name = "Fog 01 MQTT Adapter"
+    adapter_type = "edge"
+    status = "online"
+    version = "1.0.0"
+    host_id = "fog-01"
+    site_id = "site-01"
+    environment = "fog"
+    metadata = @{
+      source = "manual-registration"
+    }
+  } | ConvertTo-Json -Depth 8)
+
+$heartbeat = Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/adapters/$($adapter.adapter.id)/heartbeat" `
+  -ContentType "application/json" `
+  -Body (@{
+    status = "degraded"
+    observed_at = "2026-04-29T15:00:00Z"
+    dlq_depth = 7
+    dlq_oldest_record_at = "2026-04-29T14:30:00Z"
+    last_publish_success_at = "2026-04-29T14:59:00Z"
+    last_error = "broker unavailable"
+    metadata = @{
+      dlq_replayed = $false
+    }
+  } | ConvertTo-Json -Depth 8)
+
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/adapters/$($adapter.adapter.id)/status"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?event_type=aion:EdgeAdapterHeartbeat"
+```
+
+Current server-side connectors remain valid and continue to work independently of this future adapter path.
+
 Optional SmartSentinel snapshot ingestion can be tested without a SmartSentinel runtime. AionCore stores the full snapshot as a raw message and maps selected operational-domain data into domain-agnostic entities, relationships, observations, and events:
 
 ```powershell

@@ -81,6 +81,42 @@ Each adapter should have a stable `adapter_id`. Future milestones may register a
 - Entity registration can represent the adapter as a deployed component in the semantic graph.
 - ExecutorAgent registration can support future command polling for adapter-managed operational tasks, subject to the existing policy and lease model.
 
+## Registration And Status API Contract
+
+This milestone defines a lightweight AionCore-facing contract for future adapters. It does not implement runtime collection.
+
+Suggested endpoints:
+
+- `POST /adapters`
+- `GET /adapters`
+- `GET /adapters/{adapter_id}`
+- `PUT /adapters/{adapter_id}/heartbeat`
+- `GET /adapters/{adapter_id}/status`
+
+Registration should capture:
+
+- `adapter_key`
+- optional display name
+- `adapter_type`
+- optional version
+- optional host, site, and environment metadata
+- optional adapter-local metadata
+
+Heartbeat and status payloads should capture:
+
+- current status
+- `observed_at`
+- optional uptime
+- optional active connector and plugin counts
+- optional DLQ depth and oldest record age
+- optional last successful and failed publish timestamps
+- optional last error message
+- optional metadata
+
+When an adapter registers, AionCore may materialize or update an Entity using `entity_type = aion:EdgeAdapter` and an entity key derived from `adapter_key`. That entity is a semantic representation of the deployed adapter, not a runtime implementation detail.
+
+AionCore should emit lifecycle events for registration, heartbeat, and status changes, while keeping secrets out of event metadata.
+
 ## Supported Source Types
 
 The adapter architecture should allow plugins for:
@@ -256,6 +292,7 @@ Future adapter heartbeats may be represented as Observations or Events:
 - No adapter secrets, tokens, passwords, keys, or real configs are added.
 - No AionCore API behavior changes are required.
 - No AionCore DLQ implementation is added.
+- No adapter runtime collection or buffering logic is added.
 - No serial, SDI-12, CoAP, CSV, or ChirpStack reader is implemented in AionCore.
 - No dashboard, Cassandra adapter, production MCP transport, or external AI integration is added.
 

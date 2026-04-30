@@ -62,6 +62,103 @@ pub enum ExecutorAgentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum EdgeAdapterType {
+    Edge,
+    Fog,
+    Cloud,
+    Lab,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeAdapterStatus {
+    Online,
+    Offline,
+    Degraded,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeAdapter {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub adapter_key: String,
+    pub display_name: Option<String>,
+    pub adapter_type: EdgeAdapterType,
+    pub status: EdgeAdapterStatus,
+    pub version: Option<String>,
+    pub host_id: Option<String>,
+    pub site_id: Option<String>,
+    pub environment: Option<String>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl EdgeAdapter {
+    pub fn new(
+        tenant_id: Uuid,
+        adapter_key: impl Into<String>,
+        adapter_type: EdgeAdapterType,
+        display_name: Option<String>,
+        status: EdgeAdapterStatus,
+        version: Option<String>,
+        host_id: Option<String>,
+        site_id: Option<String>,
+        environment: Option<String>,
+        metadata: Option<Value>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, ActionModelError> {
+        let adapter_key = adapter_key.into();
+        if adapter_key.trim().is_empty() {
+            return Err(ActionModelError::EmptyAgentKey);
+        }
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            tenant_id,
+            adapter_key,
+            display_name,
+            adapter_type,
+            status,
+            version,
+            host_id,
+            site_id,
+            environment,
+            last_seen_at: None,
+            metadata,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn heartbeat(&mut self, status: EdgeAdapterStatus, now: DateTime<Utc>) {
+        self.status = status;
+        self.last_seen_at = Some(now);
+        self.updated_at = now;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeAdapterStatusReport {
+    pub adapter_id: Uuid,
+    pub status: EdgeAdapterStatus,
+    pub observed_at: DateTime<Utc>,
+    pub uptime_seconds: Option<u64>,
+    pub active_connectors: Option<u32>,
+    pub active_plugins: Option<u32>,
+    pub dlq_depth: Option<u64>,
+    pub dlq_oldest_record_at: Option<DateTime<Utc>>,
+    pub last_publish_success_at: Option<DateTime<Utc>>,
+    pub last_publish_failure_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommandLeaseStatus {
     Active,
     Expired,

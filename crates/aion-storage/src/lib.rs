@@ -1,6 +1,6 @@
 use aion_action::{
     Action, ActionResult, Capability, Command, CommandLease, CommandLeaseStatus, CommandStatus,
-    ExecutorAgent, ExecutorCapability, ExecutorScope, Policy,
+    EdgeAdapter, EdgeAdapterStatusReport, ExecutorAgent, ExecutorCapability, ExecutorScope, Policy,
 };
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
@@ -42,6 +42,8 @@ pub const MIGRATION_0009_CREATE_TTN_DEVICE_MAPPINGS: &str =
     include_str!("../../../migrations/0009_create_ttn_device_mappings.sql");
 pub const MIGRATION_0010_HARDEN_TTN_DEVICE_MAPPING_UNIQUENESS: &str =
     include_str!("../../../migrations/0010_harden_ttn_device_mapping_uniqueness.sql");
+pub const MIGRATION_0011_CREATE_EDGE_ADAPTERS: &str =
+    include_str!("../../../migrations/0011_create_edge_adapters.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -77,6 +79,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0010_harden_ttn_device_mapping_uniqueness.sql",
         MIGRATION_0010_HARDEN_TTN_DEVICE_MAPPING_UNIQUENESS,
+    ),
+    (
+        "0011_create_edge_adapters.sql",
+        MIGRATION_0011_CREATE_EDGE_ADAPTERS,
     ),
 ];
 
@@ -660,6 +666,32 @@ pub trait ExecutorStore {
     ) -> StorageResult<Vec<ExecutorScope>>;
 }
 
+pub trait EdgeAdapterStore {
+    fn create_edge_adapter(&self, adapter: EdgeAdapter) -> StorageResult<EdgeAdapter>;
+    fn update_edge_adapter(&self, adapter: EdgeAdapter) -> StorageResult<EdgeAdapter>;
+    fn get_edge_adapter(
+        &self,
+        tenant_id: Uuid,
+        adapter_id: Uuid,
+    ) -> StorageResult<Option<EdgeAdapter>>;
+    fn get_edge_adapter_by_key(
+        &self,
+        tenant_id: Uuid,
+        adapter_key: &str,
+    ) -> StorageResult<Option<EdgeAdapter>>;
+    fn list_edge_adapters(&self, tenant_id: Uuid) -> StorageResult<Vec<EdgeAdapter>>;
+    fn put_edge_adapter_status(
+        &self,
+        tenant_id: Uuid,
+        status: EdgeAdapterStatusReport,
+    ) -> StorageResult<EdgeAdapterStatusReport>;
+    fn get_edge_adapter_status(
+        &self,
+        tenant_id: Uuid,
+        adapter_id: Uuid,
+    ) -> StorageResult<Option<EdgeAdapterStatusReport>>;
+}
+
 pub trait CommandStore {
     fn store_command(&self, command: Command) -> StorageResult<Command>;
     fn update_command(&self, command: Command) -> StorageResult<Command>;
@@ -755,6 +787,7 @@ pub trait ControlPlaneStore:
     + IngestionConnectorStore
     + ConnectorSecretStore
     + TtnDeviceMappingStore
+    + EdgeAdapterStore
     + CapabilityStore
     + PolicyStore
     + CommandStore
@@ -774,6 +807,7 @@ impl<T> ControlPlaneStore for T where
         + IngestionConnectorStore
         + ConnectorSecretStore
         + TtnDeviceMappingStore
+        + EdgeAdapterStore
         + CapabilityStore
         + PolicyStore
         + CommandStore
@@ -848,6 +882,9 @@ struct InMemoryState {
     executor_key_index: HashMap<(Uuid, String), Uuid>,
     executor_capabilities: HashMap<(Uuid, Uuid), Vec<ExecutorCapability>>,
     executor_scopes: HashMap<(Uuid, Uuid), Vec<ExecutorScope>>,
+    edge_adapters: HashMap<Uuid, EdgeAdapter>,
+    edge_adapter_key_index: HashMap<(Uuid, String), Uuid>,
+    edge_adapter_statuses: HashMap<Uuid, EdgeAdapterStatusReport>,
     commands: HashMap<Uuid, Command>,
     command_leases: HashMap<Uuid, CommandLease>,
     policies: HashMap<Uuid, Policy>,
@@ -1627,6 +1664,116 @@ impl ExecutorStore for InMemoryStorage {
     }
 }
 
+impl EdgeAdapterStore for InMemoryStorage {
+    fn create_edge_adapter(&self, adapter: EdgeAdapter) -> StorageResult<EdgeAdapter> {
+        let mut state = self.write_state()?;
+        let index_key = (adapter.tenant_id, adapter.adapter_key.clone());
+        if state.edge_adapters.contains_key(&adapter.id)
+            || state.edge_adapter_key_index.contains_key(&index_key)
+        {
+            return Err(StorageError::Conflict);
+        }
+
+        state.edge_adapter_key_index.insert(index_key, adapter.id);
+        state.edge_adapters.insert(adapter.id, adapter.clone());
+        Ok(adapter)
+    }
+
+    fn update_edge_adapter(&self, adapter: EdgeAdapter) -> StorageResult<EdgeAdapter> {
+        let mut state = self.write_state()?;
+        let index_key = (adapter.tenant_id, adapter.adapter_key.clone());
+        match state.edge_adapter_key_index.get(&index_key).copied() {
+            Some(existing_id) if existing_id == adapter.id => {}
+            Some(_) => return Err(StorageError::Conflict),
+            None => return Err(StorageError::NotFound),
+        }
+        let stored = state
+            .edge_adapters
+            .get_mut(&adapter.id)
+            .filter(|stored| stored.tenant_id == adapter.tenant_id)
+            .ok_or(StorageError::NotFound)?;
+        *stored = adapter.clone();
+        Ok(adapter)
+    }
+
+    fn get_edge_adapter(
+        &self,
+        tenant_id: Uuid,
+        adapter_id: Uuid,
+    ) -> StorageResult<Option<EdgeAdapter>> {
+        Ok(self
+            .read_state()?
+            .edge_adapters
+            .get(&adapter_id)
+            .filter(|adapter| adapter.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn get_edge_adapter_by_key(
+        &self,
+        tenant_id: Uuid,
+        adapter_key: &str,
+    ) -> StorageResult<Option<EdgeAdapter>> {
+        let state = self.read_state()?;
+        Ok(state
+            .edge_adapter_key_index
+            .get(&(tenant_id, adapter_key.to_string()))
+            .and_then(|adapter_id| state.edge_adapters.get(adapter_id))
+            .cloned())
+    }
+
+    fn list_edge_adapters(&self, tenant_id: Uuid) -> StorageResult<Vec<EdgeAdapter>> {
+        let mut adapters = self
+            .read_state()?
+            .edge_adapters
+            .values()
+            .filter(|adapter| adapter.tenant_id == tenant_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        adapters.sort_by(|left, right| left.adapter_key.cmp(&right.adapter_key));
+        Ok(adapters)
+    }
+
+    fn put_edge_adapter_status(
+        &self,
+        tenant_id: Uuid,
+        status: EdgeAdapterStatusReport,
+    ) -> StorageResult<EdgeAdapterStatusReport> {
+        let mut state = self.write_state()?;
+        if !state
+            .edge_adapters
+            .get(&status.adapter_id)
+            .map(|adapter| adapter.tenant_id == tenant_id)
+            .unwrap_or(false)
+        {
+            return Err(StorageError::NotFound);
+        }
+        state
+            .edge_adapter_statuses
+            .insert(status.adapter_id, status.clone());
+        Ok(status)
+    }
+
+    fn get_edge_adapter_status(
+        &self,
+        tenant_id: Uuid,
+        adapter_id: Uuid,
+    ) -> StorageResult<Option<EdgeAdapterStatusReport>> {
+        let state = self.read_state()?;
+        let allowed = state
+            .edge_adapters
+            .get(&adapter_id)
+            .map(|adapter| adapter.tenant_id == tenant_id)
+            .unwrap_or(false);
+        Ok(state
+            .edge_adapter_statuses
+            .get(&adapter_id)
+            .filter(|status| allowed && status.adapter_id == adapter_id)
+            .cloned())
+    }
+}
+
 impl CommandStore for InMemoryStorage {
     fn store_command(&self, command: Command) -> StorageResult<Command> {
         let mut state = self.write_state()?;
@@ -2024,7 +2171,7 @@ mod tests {
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 10);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 11);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
@@ -2044,6 +2191,7 @@ mod tests {
             ORDERED_MIGRATIONS[9].0,
             "0010_harden_ttn_device_mapping_uniqueness.sql"
         );
+        assert_eq!(ORDERED_MIGRATIONS[10].0, "0011_create_edge_adapters.sql");
     }
 
     #[test]
@@ -2070,6 +2218,8 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS executor_agents",
             "CREATE TABLE IF NOT EXISTS executor_capabilities",
             "CREATE TABLE IF NOT EXISTS executor_scopes",
+            "CREATE TABLE IF NOT EXISTS edge_adapters",
+            "CREATE TABLE IF NOT EXISTS edge_adapter_statuses",
             "CREATE TABLE IF NOT EXISTS command_leases",
             "CREATE TABLE IF NOT EXISTS rules",
             "CREATE TABLE IF NOT EXISTS ingestion_connectors",
@@ -2154,6 +2304,9 @@ mod tests {
             "events_correlation_idx",
             "executor_agents_agent_key_idx",
             "executor_agents_status_idx",
+            "edge_adapters_adapter_key_idx",
+            "edge_adapters_status_idx",
+            "edge_adapter_statuses_observed_at_idx",
             "command_leases_command_idx",
             "command_leases_executor_idx",
             "command_leases_status_expires_idx",

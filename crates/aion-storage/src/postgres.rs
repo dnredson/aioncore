@@ -3,6 +3,7 @@ use ::postgres::error::SqlState;
 use ::postgres::types::{Json, ToSql};
 use ::postgres::{Client, Config as PgConfig, NoTls, Row};
 use aion_action::{ApprovalStatus, ExecutorAgentStatus};
+use aion_action::{EdgeAdapter, EdgeAdapterStatus, EdgeAdapterStatusReport, EdgeAdapterType};
 use aion_event::EventSeverity;
 use aion_observation::ObservationValue;
 use aion_raw_message::{NormalizationStatus, RawMessageSource};
@@ -371,6 +372,50 @@ fn row_to_executor(row: Row) -> StorageResult<ExecutorAgent> {
             .map(|Json(value)| value),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_edge_adapter(row: Row) -> StorageResult<EdgeAdapter> {
+    Ok(EdgeAdapter {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        adapter_key: row.get("adapter_key"),
+        display_name: row.get("display_name"),
+        adapter_type: edge_adapter_type_from_db(row.get::<_, String>("adapter_type"))?,
+        status: edge_adapter_status_from_db(row.get::<_, String>("status"))?,
+        version: row.get("version"),
+        host_id: row.get("host_id"),
+        site_id: row.get("site_id"),
+        environment: row.get("environment"),
+        last_seen_at: row.get("last_seen_at"),
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_edge_adapter_status(row: Row) -> StorageResult<EdgeAdapterStatusReport> {
+    Ok(EdgeAdapterStatusReport {
+        adapter_id: row.get("adapter_id"),
+        status: edge_adapter_status_from_db(row.get::<_, String>("status"))?,
+        observed_at: row.get("observed_at"),
+        uptime_seconds: row
+            .get::<_, Option<i64>>("uptime_seconds")
+            .map(|value| value as u64),
+        active_connectors: row.get("active_connectors"),
+        active_plugins: row.get("active_plugins"),
+        dlq_depth: row
+            .get::<_, Option<i64>>("dlq_depth")
+            .map(|value| value as u64),
+        dlq_oldest_record_at: row.get("dlq_oldest_record_at"),
+        last_publish_success_at: row.get("last_publish_success_at"),
+        last_publish_failure_at: row.get("last_publish_failure_at"),
+        last_error: row.get("last_error"),
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
     })
 }
 
@@ -772,6 +817,50 @@ fn executor_status_from_db(status: String) -> StorageResult<ExecutorAgentStatus>
         "degraded" => Ok(ExecutorAgentStatus::Degraded),
         other => Err(StorageError::Backend(format!(
             "unknown executor status in database: {other}"
+        ))),
+    }
+}
+
+fn edge_adapter_type_to_db(adapter_type: &EdgeAdapterType) -> &'static str {
+    match adapter_type {
+        EdgeAdapterType::Edge => "edge",
+        EdgeAdapterType::Fog => "fog",
+        EdgeAdapterType::Cloud => "cloud",
+        EdgeAdapterType::Lab => "lab",
+        EdgeAdapterType::Custom => "custom",
+    }
+}
+
+fn edge_adapter_type_from_db(value: String) -> StorageResult<EdgeAdapterType> {
+    match value.as_str() {
+        "edge" => Ok(EdgeAdapterType::Edge),
+        "fog" => Ok(EdgeAdapterType::Fog),
+        "cloud" => Ok(EdgeAdapterType::Cloud),
+        "lab" => Ok(EdgeAdapterType::Lab),
+        "custom" => Ok(EdgeAdapterType::Custom),
+        other => Err(StorageError::Backend(format!(
+            "unknown edge adapter type in database: {other}"
+        ))),
+    }
+}
+
+fn edge_adapter_status_to_db(status: &EdgeAdapterStatus) -> &'static str {
+    match status {
+        EdgeAdapterStatus::Online => "online",
+        EdgeAdapterStatus::Offline => "offline",
+        EdgeAdapterStatus::Degraded => "degraded",
+        EdgeAdapterStatus::Unknown => "unknown",
+    }
+}
+
+fn edge_adapter_status_from_db(value: String) -> StorageResult<EdgeAdapterStatus> {
+    match value.as_str() {
+        "online" => Ok(EdgeAdapterStatus::Online),
+        "offline" => Ok(EdgeAdapterStatus::Offline),
+        "degraded" => Ok(EdgeAdapterStatus::Degraded),
+        "unknown" => Ok(EdgeAdapterStatus::Unknown),
+        other => Err(StorageError::Backend(format!(
+            "unknown edge adapter status in database: {other}"
         ))),
     }
 }
@@ -3097,6 +3186,254 @@ impl ExecutorStore for PostgresStorage {
     }
 }
 
+impl EdgeAdapterStore for PostgresStorage {
+    fn create_edge_adapter(&self, adapter: EdgeAdapter) -> StorageResult<EdgeAdapter> {
+        self.with_client(|client| {
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO edge_adapters (
+                        id,
+                        tenant_id,
+                        adapter_key,
+                        display_name,
+                        adapter_type,
+                        status,
+                        version,
+                        host_id,
+                        site_id,
+                        environment,
+                        last_seen_at,
+                        metadata,
+                        created_at,
+                        updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    RETURNING id, tenant_id, adapter_key, display_name, adapter_type, status, version, host_id, site_id, environment, last_seen_at, metadata, created_at, updated_at
+                    ",
+                    &[
+                        &adapter.id,
+                        &adapter.tenant_id,
+                        &adapter.adapter_key,
+                        &adapter.display_name,
+                        &edge_adapter_type_to_db(&adapter.adapter_type),
+                        &edge_adapter_status_to_db(&adapter.status),
+                        &adapter.version,
+                        &adapter.host_id,
+                        &adapter.site_id,
+                        &adapter.environment,
+                        &adapter.last_seen_at,
+                        &json_option_column(adapter.metadata.as_ref()),
+                        &adapter.created_at,
+                        &adapter.updated_at,
+                    ],
+                )
+                .map_err(|err| if is_unique_violation(&err) { StorageError::Conflict } else { map_postgres_error(err) })?;
+            row_to_edge_adapter(row)
+        })
+    }
+
+    fn update_edge_adapter(&self, adapter: EdgeAdapter) -> StorageResult<EdgeAdapter> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE edge_adapters
+                    SET adapter_key = $3,
+                        display_name = $4,
+                        adapter_type = $5,
+                        status = $6,
+                        version = $7,
+                        host_id = $8,
+                        site_id = $9,
+                        environment = $10,
+                        last_seen_at = $11,
+                        metadata = $12,
+                        updated_at = $13
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING id, tenant_id, adapter_key, display_name, adapter_type, status, version, host_id, site_id, environment, last_seen_at, metadata, created_at, updated_at
+                    ",
+                    &[
+                        &adapter.tenant_id,
+                        &adapter.id,
+                        &adapter.adapter_key,
+                        &adapter.display_name,
+                        &edge_adapter_type_to_db(&adapter.adapter_type),
+                        &edge_adapter_status_to_db(&adapter.status),
+                        &adapter.version,
+                        &adapter.host_id,
+                        &adapter.site_id,
+                        &adapter.environment,
+                        &adapter.last_seen_at,
+                        &json_option_column(adapter.metadata.as_ref()),
+                        &adapter.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_edge_adapter).ok_or(StorageError::NotFound)
+        })?
+    }
+
+    fn get_edge_adapter(
+        &self,
+        tenant_id: Uuid,
+        adapter_id: Uuid,
+    ) -> StorageResult<Option<EdgeAdapter>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, adapter_key, display_name, adapter_type, status, version, host_id, site_id, environment, last_seen_at, metadata, created_at, updated_at
+                    FROM edge_adapters
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &adapter_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_edge_adapter(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn get_edge_adapter_by_key(
+        &self,
+        tenant_id: Uuid,
+        adapter_key: &str,
+    ) -> StorageResult<Option<EdgeAdapter>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, adapter_key, display_name, adapter_type, status, version, host_id, site_id, environment, last_seen_at, metadata, created_at, updated_at
+                    FROM edge_adapters
+                    WHERE tenant_id = $1 AND adapter_key = $2
+                    ",
+                    &[&tenant_id, &adapter_key],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_edge_adapter(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_edge_adapters(&self, tenant_id: Uuid) -> StorageResult<Vec<EdgeAdapter>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, adapter_key, display_name, adapter_type, status, version, host_id, site_id, environment, last_seen_at, metadata, created_at, updated_at
+                    FROM edge_adapters
+                    WHERE tenant_id = $1
+                    ",
+                    &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            let mut adapters = rows
+                .into_iter()
+                .map(row_to_edge_adapter)
+                .collect::<StorageResult<Vec<_>>>()?;
+            adapters.sort_by(|left, right| left.adapter_key.cmp(&right.adapter_key));
+            Ok(adapters)
+        })
+    }
+
+    fn put_edge_adapter_status(
+        &self,
+        tenant_id: Uuid,
+        status: EdgeAdapterStatusReport,
+    ) -> StorageResult<EdgeAdapterStatusReport> {
+        self.with_client(|client| {
+            let mut tx = client.transaction().map_err(map_postgres_error)?;
+            let adapter_exists = tx
+                .query_opt(
+                    "SELECT id FROM edge_adapters WHERE tenant_id = $1 AND id = $2",
+                    &[&tenant_id, &status.adapter_id],
+                )
+                .map_err(map_postgres_error)?
+                .is_some();
+            if !adapter_exists {
+                return Err(StorageError::NotFound);
+            }
+            tx.execute(
+                "
+                INSERT INTO edge_adapter_statuses (
+                    adapter_id,
+                    tenant_id,
+                    status,
+                    observed_at,
+                    uptime_seconds,
+                    active_connectors,
+                    active_plugins,
+                    dlq_depth,
+                    dlq_oldest_record_at,
+                    last_publish_success_at,
+                    last_publish_failure_at,
+                    last_error,
+                    metadata
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                ON CONFLICT (adapter_id) DO UPDATE SET
+                    tenant_id = EXCLUDED.tenant_id,
+                    status = EXCLUDED.status,
+                    observed_at = EXCLUDED.observed_at,
+                    uptime_seconds = EXCLUDED.uptime_seconds,
+                    active_connectors = EXCLUDED.active_connectors,
+                    active_plugins = EXCLUDED.active_plugins,
+                    dlq_depth = EXCLUDED.dlq_depth,
+                    dlq_oldest_record_at = EXCLUDED.dlq_oldest_record_at,
+                    last_publish_success_at = EXCLUDED.last_publish_success_at,
+                    last_publish_failure_at = EXCLUDED.last_publish_failure_at,
+                    last_error = EXCLUDED.last_error,
+                    metadata = EXCLUDED.metadata
+                ",
+                &[
+                    &status.adapter_id,
+                    &tenant_id,
+                    &edge_adapter_status_to_db(&status.status),
+                    &status.observed_at,
+                    &status.uptime_seconds.map(|value| value as i64),
+                    &status.active_connectors.map(|value| value as i32),
+                    &status.active_plugins.map(|value| value as i32),
+                    &status.dlq_depth.map(|value| value as i64),
+                    &status.dlq_oldest_record_at,
+                    &status.last_publish_success_at,
+                    &status.last_publish_failure_at,
+                    &status.last_error,
+                    &json_option_column(status.metadata.as_ref()),
+                ],
+            )
+            .map_err(map_postgres_error)?;
+            tx.commit().map_err(map_postgres_error)?;
+            Ok(status)
+        })
+    }
+
+    fn get_edge_adapter_status(
+        &self,
+        tenant_id: Uuid,
+        adapter_id: Uuid,
+    ) -> StorageResult<Option<EdgeAdapterStatusReport>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT adapter_id, tenant_id, status, observed_at, uptime_seconds, active_connectors, active_plugins, dlq_depth, dlq_oldest_record_at, last_publish_success_at, last_publish_failure_at, last_error, metadata
+                    FROM edge_adapter_statuses
+                    WHERE tenant_id = $1 AND adapter_id = $2
+                    ",
+                    &[&tenant_id, &adapter_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_edge_adapter_status(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3366,6 +3703,87 @@ mod tests {
         }
 
         assert!(postgres_test_storage().is_none());
+    }
+
+    #[test]
+    fn postgres_edge_adapter_parity() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap();
+        let adapter = EdgeAdapter::new(
+            tenant.id,
+            format!("edge-adapter-{suffix}"),
+            EdgeAdapterType::Fog,
+            Some(format!("Edge adapter {suffix}")),
+            EdgeAdapterStatus::Online,
+            Some("1.0.0".to_string()),
+            Some("host-01".to_string()),
+            Some("site-01".to_string()),
+            Some("fog".to_string()),
+            Some(json!({"suite": "postgres", "suffix": suffix})),
+            now,
+        )
+        .expect("valid edge adapter");
+        let status = EdgeAdapterStatusReport {
+            adapter_id: adapter.id,
+            status: EdgeAdapterStatus::Degraded,
+            observed_at: now,
+            uptime_seconds: Some(3600),
+            active_connectors: Some(2),
+            active_plugins: Some(1),
+            dlq_depth: Some(4),
+            dlq_oldest_record_at: Some(now),
+            last_publish_success_at: Some(now),
+            last_publish_failure_at: None,
+            last_error: Some("upstream unavailable".to_string()),
+            metadata: Some(json!({"source": "postgres-test"})),
+        };
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store
+                .create_tenant(tenant.clone())
+                .expect("failed to create tenant");
+        }
+
+        for store in [
+            &in_memory as &dyn EdgeAdapterStore,
+            &pg as &dyn EdgeAdapterStore,
+        ] {
+            let created = store
+                .create_edge_adapter(adapter.clone())
+                .expect("create edge adapter");
+            assert_eq!(created, adapter);
+            assert_eq!(
+                store
+                    .get_edge_adapter(tenant.id, adapter.id)
+                    .expect("get edge adapter")
+                    .expect("missing edge adapter"),
+                adapter
+            );
+            assert_eq!(
+                store
+                    .get_edge_adapter_by_key(tenant.id, &adapter.adapter_key)
+                    .expect("get edge adapter by key")
+                    .expect("missing edge adapter by key"),
+                adapter
+            );
+
+            let updated_status = store
+                .put_edge_adapter_status(tenant.id, status.clone())
+                .expect("put edge adapter status");
+            assert_eq!(updated_status, status);
+            assert_eq!(
+                store
+                    .get_edge_adapter_status(tenant.id, adapter.id)
+                    .expect("get edge adapter status")
+                    .expect("missing edge adapter status"),
+                status
+            );
+        }
     }
 
     #[test]
