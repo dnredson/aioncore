@@ -1,0 +1,21 @@
+{
+  "dlq_record_id": "dlq-demo-0001",
+  "adapter_id": "edge-adapter-demo-01",
+  "source_protocol": "csv",
+  "source_ref": "dropbox/site-01/weather.csv",
+  "parser_name": "csv-weather-v1",
+  "payload_format_hint": "csv",
+  "failure_class": "parse_error",
+  "failure_reason": "missing required column observed_at",
+  "attempt_count": 3,
+  "first_seen_at": "2026-04-30T12:00:00Z",
+  "last_attempted_at": "2026-04-30T12:05:00Z",
+  "next_retry_at": null,
+  "replay_eligible": false,
+  "raw_payload_ref": "local-dlq://edge-adapter-demo-01/dlq-demo-0001",
+  "metadata": {
+    "site_id": "site-01",
+    "dlq_replayed": false,
+    "secret_exposed": false
+  }
+}

@@ -963,6 +963,69 @@ pub struct ExecutorCommandCompletionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RegisterSmartSentinelExecutorRequest {
+    pub agent_key: String,
+    pub display_name: Option<String>,
+    pub metadata: Option<Value>,
+    #[serde(default)]
+    pub capabilities: Vec<SmartSentinelExecutorCapabilityRequest>,
+    #[serde(default)]
+    pub scopes: Vec<PutExecutorScopeRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SmartSentinelExecutorCapabilityRequest {
+    CommandType(String),
+    Detailed {
+        command_type: String,
+        protocol: Option<String>,
+        metadata: Option<Value>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterSmartSentinelExecutorResponse {
+    pub executor: ExecutorAgent,
+    pub reused: bool,
+    pub capabilities: Vec<ExecutorCapability>,
+    pub scopes: Vec<ExecutorScope>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SmartSentinelCommandEnvelope {
+    pub command: Command,
+    pub latest_lease: Option<CommandLease>,
+    pub target_entity: Option<Entity>,
+    pub recent_provenance: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SmartSentinelCommandReportRequest {
+    pub action_type: String,
+    pub status: String,
+    pub verified: bool,
+    pub result_payload: Value,
+    pub evidence_refs: Option<Value>,
+    pub incident_id: Option<String>,
+    pub alert_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub run_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub message: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SmartSentinelCommandReportResponse {
+    pub command: Command,
+    pub action: Action,
+    pub action_result: ActionResult,
+    pub event: Event,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RefreshCommandLeaseRequest {
     pub executor_id: Uuid,
     pub lease_duration_seconds: Option<i64>,
@@ -1463,6 +1526,22 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/integrations/smartsentinel/snapshots",
             post(ingest_smartsentinel_snapshot),
+        )
+        .route(
+            "/integrations/smartsentinel/executors/register",
+            post(register_smartsentinel_executor),
+        )
+        .route(
+            "/integrations/smartsentinel/executors/:executor_id/commands",
+            get(poll_smartsentinel_executor_commands),
+        )
+        .route(
+            "/integrations/smartsentinel/executors/:executor_id/commands/:command_id/claim",
+            post(claim_smartsentinel_executor_command),
+        )
+        .route(
+            "/integrations/smartsentinel/executors/:executor_id/commands/:command_id/report",
+            post(report_smartsentinel_executor_command),
         )
         .route("/raw-messages", get(query_raw_messages))
         .route("/raw-messages/:raw_message_id", get(get_raw_message))
@@ -3004,6 +3083,240 @@ async fn fail_executor_command(
         command,
         action,
         action_result,
+    }))
+}
+
+async fn register_smartsentinel_executor(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterSmartSentinelExecutorRequest>,
+) -> Result<(StatusCode, Json<RegisterSmartSentinelExecutorResponse>), ApiError> {
+    let now = Utc::now();
+    let existing = state
+        .storage
+        .list_executors(state.tenant_id)?
+        .into_iter()
+        .find(|executor| executor.agent_key == request.agent_key);
+
+    let (executor, reused) = if let Some(mut executor) = existing {
+        if executor.agent_type != "smartsentinel" {
+            return Err(ApiError::bad_request(
+                "agent_key is already registered for a non-SmartSentinel executor",
+            ));
+        }
+        executor.display_name = request.display_name;
+        executor.metadata = request.metadata;
+        executor.heartbeat(ExecutorAgentStatus::Online, now);
+        (state.storage.update_executor(executor)?, true)
+    } else {
+        let executor = ExecutorAgent::new(
+            state.tenant_id,
+            request.agent_key,
+            "smartsentinel",
+            request.display_name,
+            ExecutorAgentStatus::Online,
+            request.metadata,
+            now,
+        )
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        (state.storage.create_executor(executor)?, false)
+    };
+
+    let capabilities = smart_sentinel_executor_capabilities(executor.id, request.capabilities)?;
+    let capabilities =
+        state
+            .storage
+            .put_executor_capabilities(state.tenant_id, executor.id, capabilities)?;
+    let scopes = smart_sentinel_executor_scopes(&state, executor.id, request.scopes)?;
+    let scopes = state
+        .storage
+        .put_executor_scopes(state.tenant_id, executor.id, scopes)?;
+
+    record_executor_event(
+        &state,
+        if reused {
+            "aion:SmartSentinelExecutorUpdated"
+        } else {
+            "aion:SmartSentinelExecutorRegistered"
+        },
+        &executor,
+        None,
+        Some(json!({
+            "capability_count": capabilities.len(),
+            "scope_count": scopes.len(),
+            "source": "smartsentinel_bridge"
+        })),
+    )?;
+
+    Ok((
+        if reused {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        Json(RegisterSmartSentinelExecutorResponse {
+            executor,
+            reused,
+            capabilities,
+            scopes,
+        }),
+    ))
+}
+
+async fn poll_smartsentinel_executor_commands(
+    State(state): State<AppState>,
+    Path(executor_id): Path<Uuid>,
+) -> Result<Json<Vec<SmartSentinelCommandEnvelope>>, ApiError> {
+    let executor = get_executor_agent(&state, executor_id)?;
+    ensure_smartsentinel_executor(&executor)?;
+    let commands = state
+        .storage
+        .query_commands(state.tenant_id, None, Some(CommandStatus::Pending))?
+        .into_iter()
+        .filter(|command| executor_can_run_command(&state, executor_id, command).unwrap_or(false))
+        .map(|command| smartsentinel_command_envelope(&state, command))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(commands))
+}
+
+async fn claim_smartsentinel_executor_command(
+    State(state): State<AppState>,
+    Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
+    request: Option<Json<ExecutorClaimCommandRequest>>,
+) -> Result<Json<SmartSentinelCommandEnvelope>, ApiError> {
+    let executor = get_executor_agent(&state, executor_id)?;
+    ensure_smartsentinel_executor(&executor)?;
+    ensure_executor_can_run_command(&state, executor_id, command_id)?;
+    let request = request.map(|Json(request)| request);
+    let command = claim_command_for_executor(
+        &state,
+        command_id,
+        &executor,
+        request
+            .as_ref()
+            .and_then(|request| request.lease_duration_seconds),
+        request.as_ref().and_then(|request| request.max_retries),
+        request
+            .and_then(|request| request.metadata)
+            .map(|metadata| json!({"source": "smartsentinel_bridge", "metadata": metadata})),
+    )?;
+    record_executor_event(
+        &state,
+        "aion:SmartSentinelCommandClaimed",
+        &executor,
+        Some(&command),
+        Some(json!({"source": "smartsentinel_bridge"})),
+    )?;
+
+    Ok(Json(smartsentinel_command_envelope(&state, command)?))
+}
+
+async fn report_smartsentinel_executor_command(
+    State(state): State<AppState>,
+    Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<SmartSentinelCommandReportRequest>,
+) -> Result<Json<SmartSentinelCommandReportResponse>, ApiError> {
+    let executor = get_executor_agent(&state, executor_id)?;
+    ensure_smartsentinel_executor(&executor)?;
+    let command = get_command_for_executor_mutation(&state, command_id, &executor.agent_key)?;
+    let report_status = request.status.trim();
+    if !matches!(report_status, "executed" | "failed") {
+        return Err(ApiError::bad_request(
+            "status must be either executed or failed",
+        ));
+    }
+    if request.action_type.trim().is_empty() {
+        return Err(ApiError::bad_request("action_type must not be empty"));
+    }
+
+    let now = Utc::now();
+    let metadata = smartsentinel_report_metadata(&executor, &request);
+    let action = Action::new(
+        state.tenant_id,
+        command.id,
+        None,
+        request.action_type.clone(),
+        report_status.to_string(),
+        command.claimed_at,
+        Some(now),
+        Some(metadata.clone()),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let action = state.storage.store_action(action)?;
+    let action_result = ActionResult::new(
+        state.tenant_id,
+        command.id,
+        action.id,
+        report_status.to_string(),
+        request.verified,
+        request.result_payload.clone(),
+        now,
+        Some(metadata.clone()),
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let action_result = state.storage.store_action_result(action_result)?;
+
+    let command = if report_status == "executed" {
+        let command = mutate_command_raw(&state, command_id, |command, now| {
+            command.mark_executed(now)
+        })?;
+        mark_active_lease_completed(&state, command_id, executor_id)?;
+        record_command_event(
+            &state,
+            "aion:CommandExecuted",
+            EventSeverity::Info,
+            &command,
+            request.message.clone(),
+        )?;
+        command
+    } else {
+        let failure_reason = request
+            .message
+            .clone()
+            .unwrap_or_else(|| "SmartSentinel executor reported failure".to_string());
+        let command = mutate_command_raw(&state, command_id, |command, now| {
+            command.mark_failed(failure_reason, now)
+        })?;
+        mark_active_lease_failed(&state, command_id, executor_id)?;
+        record_command_event(
+            &state,
+            "aion:CommandFailed",
+            EventSeverity::Error,
+            &command,
+            request.message.clone(),
+        )?;
+        command
+    };
+
+    let event = record_event(
+        &state,
+        EventDraft {
+            event_type: "aion:SmartSentinelCommandReported".to_string(),
+            severity: if report_status == "executed" {
+                EventSeverity::Info
+            } else {
+                EventSeverity::Error
+            },
+            source_entity_id: None,
+            target_entity_id: Some(command.target_entity_id),
+            message: request.message,
+            occurred_at: now,
+            observed_at: None,
+            correlation_id: request.correlation_id,
+            raw_message_id: None,
+            observation_id: None,
+            command_id: Some(command.id),
+            action_id: Some(action.id),
+            action_result_id: Some(action_result.id),
+            metadata: Some(metadata),
+        },
+    )?;
+
+    Ok(Json(SmartSentinelCommandReportResponse {
+        command,
+        action,
+        action_result,
+        event,
     }))
 }
 
@@ -8659,6 +8972,158 @@ fn get_executor_agent(state: &AppState, executor_id: Uuid) -> Result<ExecutorAge
         .ok_or_else(ApiError::not_found)
 }
 
+fn ensure_smartsentinel_executor(executor: &ExecutorAgent) -> Result<(), ApiError> {
+    if executor.agent_type != "smartsentinel" {
+        return Err(ApiError::bad_request(
+            "executor is not registered as a SmartSentinel executor",
+        ));
+    }
+    Ok(())
+}
+
+fn smart_sentinel_executor_capabilities(
+    executor_id: Uuid,
+    requests: Vec<SmartSentinelExecutorCapabilityRequest>,
+) -> Result<Vec<ExecutorCapability>, ApiError> {
+    requests
+        .into_iter()
+        .map(|request| match request {
+            SmartSentinelExecutorCapabilityRequest::CommandType(command_type) => {
+                ExecutorCapability::new(
+                    executor_id,
+                    command_type,
+                    Some("smartsentinel".to_string()),
+                    Some(json!({"source": "smartsentinel_bridge"})),
+                )
+            }
+            SmartSentinelExecutorCapabilityRequest::Detailed {
+                command_type,
+                protocol,
+                metadata,
+            } => ExecutorCapability::new(
+                executor_id,
+                command_type,
+                protocol.or_else(|| Some("smartsentinel".to_string())),
+                metadata,
+            ),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ApiError::bad_request(err.to_string()))
+}
+
+fn smart_sentinel_executor_scopes(
+    state: &AppState,
+    executor_id: Uuid,
+    requests: Vec<PutExecutorScopeRequest>,
+) -> Result<Vec<ExecutorScope>, ApiError> {
+    let mut scopes = Vec::with_capacity(requests.len());
+    for request in requests {
+        if let Some(target_entity_id) = request.target_entity_id {
+            ensure_entity_exists(state, target_entity_id)?;
+        }
+        scopes.push(ExecutorScope::new(
+            executor_id,
+            request.target_entity_id,
+            request.entity_type,
+            request.relationship_type,
+            request.metadata,
+        ));
+    }
+    Ok(scopes)
+}
+
+fn smartsentinel_command_envelope(
+    state: &AppState,
+    command: Command,
+) -> Result<SmartSentinelCommandEnvelope, ApiError> {
+    let latest_lease = state
+        .storage
+        .get_latest_command_lease(state.tenant_id, command.id)?;
+    let target_entity = state
+        .storage
+        .get_entity(state.tenant_id, command.target_entity_id)?;
+    let recent_provenance = state
+        .storage
+        .query_events(
+            state.tenant_id,
+            EventFilter {
+                target_entity_id: Some(command.target_entity_id),
+                ..Default::default()
+            },
+        )?
+        .into_iter()
+        .filter_map(|event| event.metadata)
+        .filter(smartsentinel_metadata_has_provenance)
+        .take(5)
+        .collect();
+
+    Ok(SmartSentinelCommandEnvelope {
+        command,
+        latest_lease,
+        target_entity,
+        recent_provenance,
+    })
+}
+
+fn smartsentinel_metadata_has_provenance(metadata: &Value) -> bool {
+    metadata.get("smartsentinel").is_some()
+        || metadata.get("evidence_refs").is_some()
+        || metadata.get("incident_id").is_some()
+        || metadata.get("alert_id").is_some()
+        || metadata.get("workflow_id").is_some()
+        || metadata.get("run_id").is_some()
+        || metadata.get("trace_id").is_some()
+        || metadata
+            .get("provenance")
+            .map(|provenance| {
+                provenance.get("run_id").is_some()
+                    || provenance.get("trace_id").is_some()
+                    || provenance.get("workflow_id").is_some()
+            })
+            .unwrap_or(false)
+}
+
+fn smartsentinel_report_metadata(
+    executor: &ExecutorAgent,
+    request: &SmartSentinelCommandReportRequest,
+) -> Value {
+    let mut metadata = json!({
+        "source": "smartsentinel_bridge",
+        "executor_id": executor.id,
+        "agent_key": executor.agent_key,
+        "agent_type": executor.agent_type,
+        "status": request.status.as_str(),
+        "verified": request.verified
+    });
+
+    if let Some(object) = metadata.as_object_mut() {
+        insert_optional_string(object, "incident_id", request.incident_id.as_deref());
+        insert_optional_string(object, "alert_id", request.alert_id.as_deref());
+        insert_optional_string(object, "workflow_id", request.workflow_id.as_deref());
+        insert_optional_string(object, "run_id", request.run_id.as_deref());
+        insert_optional_string(object, "trace_id", request.trace_id.as_deref());
+        insert_optional_string(object, "correlation_id", request.correlation_id.as_deref());
+        if let Some(evidence_refs) = &request.evidence_refs {
+            object.insert("evidence_refs".to_string(), evidence_refs.clone());
+        }
+        if let Some(extra) = &request.metadata {
+            object.insert("metadata".to_string(), extra.clone());
+        }
+    }
+
+    metadata
+}
+
+fn insert_optional_string(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
 fn ensure_executor_can_run_command(
     state: &AppState,
     executor_id: Uuid,
@@ -12697,6 +13162,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registers_smartsentinel_executor_with_capabilities_and_scopes() {
+        let app = app();
+        let service_id = smartsentinel_service_entity(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/executors/register",
+                json!({
+                    "agent_key": "sentinel-agent-register",
+                    "display_name": "Sentinel Agent",
+                    "capabilities": ["sentinel:RestartService", "sentinel:RunDiagnostic"],
+                    "scopes": [
+                        {"target_entity_id": service_id},
+                        {"entity_type": "sentinel:Service"},
+                        {"relationship_type": "sentinel:runs"}
+                    ],
+                    "metadata": {"node_id": "fog-01"}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let registered = to_json(response).await;
+        assert_eq!(registered["executor"]["agent_type"], "smartsentinel");
+        assert_eq!(
+            registered["executor"]["agent_key"],
+            "sentinel-agent-register"
+        );
+        assert_eq!(registered["capabilities"].as_array().unwrap().len(), 2);
+        assert_eq!(registered["scopes"].as_array().unwrap().len(), 3);
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/executors/register",
+                json!({
+                    "agent_key": "sentinel-agent-register",
+                    "display_name": "Sentinel Agent Reused",
+                    "capabilities": ["sentinel:RestartService"],
+                    "scopes": [{"target_entity_id": service_id}]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let reused = to_json(response).await;
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["executor"]["id"], registered["executor"]["id"]);
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_poll_returns_compatible_operational_command() {
+        let app = app();
+        let service_id = smartsentinel_service_entity(&app).await;
+        let command = create_test_command(&app, &service_id, "sentinel:RestartService").await;
+        let executor = register_smartsentinel_executor(
+            &app,
+            "sentinel-agent-poll",
+            &service_id,
+            &["sentinel:RestartService"],
+        )
+        .await;
+        let executor_id = executor["executor"]["id"].as_str().unwrap();
+
+        let commands = poll_smartsentinel_commands(&app, executor_id).await;
+
+        assert!(commands.as_array().unwrap().iter().any(|item| {
+            item["command"]["id"] == command["id"]
+                && item["target_entity"]["entity_type"] == "sentinel:Service"
+                && item["command"]["approval_status"] == "not_required"
+        }));
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_claim_respects_approval_policy() {
+        let app = app();
+        let service_id = smartsentinel_service_entity(&app).await;
+        put_command_policy(&app, &service_id, "sentinel:RestartService", true).await;
+        let command = create_test_command(&app, &service_id, "sentinel:RestartService").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = register_smartsentinel_executor(
+            &app,
+            "sentinel-agent-approval",
+            &service_id,
+            &["sentinel:RestartService"],
+        )
+        .await;
+        let executor_id = executor["executor"]["id"].as_str().unwrap();
+
+        let blocked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/claim"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
+
+        approve_test_command(&app, command_id).await;
+        let claimed = claim_smartsentinel_command(&app, executor_id, command_id).await;
+        assert_eq!(claimed["command"]["status"], "claimed");
+        assert_eq!(claimed["command"]["claimed_by"], "sentinel-agent-approval");
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_report_executed_creates_result_and_event() {
+        let app = app();
+        let service_id = smartsentinel_service_entity(&app).await;
+        let command = create_test_command(&app, &service_id, "sentinel:RunDiagnostic").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = register_smartsentinel_executor(
+            &app,
+            "sentinel-agent-executed",
+            &service_id,
+            &["sentinel:RunDiagnostic"],
+        )
+        .await;
+        let executor_id = executor["executor"]["id"].as_str().unwrap();
+        claim_smartsentinel_command(&app, executor_id, command_id).await;
+
+        let reported =
+            report_smartsentinel_command(&app, executor_id, command_id, "executed").await;
+
+        assert_eq!(reported["command"]["status"], "executed");
+        assert_eq!(reported["action"]["action_type"], "sentinel:RunDiagnostic");
+        assert_eq!(reported["action"]["status"], "executed");
+        assert_eq!(reported["action_result"]["status"], "executed");
+        assert_eq!(reported["action_result"]["verified"], true);
+        assert_eq!(
+            reported["event"]["event_type"],
+            "aion:SmartSentinelCommandReported"
+        );
+        assert_eq!(
+            reported["action_result"]["metadata"]["evidence_refs"],
+            json!(["ev-log-1"])
+        );
+        assert_eq!(reported["event"]["metadata"]["incident_id"], "inc-001");
+        let lease = get_command_lease(&app, command_id).await;
+        assert_eq!(lease["lease_status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_report_failed_marks_command_failed() {
+        let app = app();
+        let service_id = smartsentinel_service_entity(&app).await;
+        let command = create_test_command(&app, &service_id, "sentinel:RestartService").await;
+        let command_id = command["id"].as_str().unwrap();
+        let executor = register_smartsentinel_executor(
+            &app,
+            "sentinel-agent-failed",
+            &service_id,
+            &["sentinel:RestartService"],
+        )
+        .await;
+        let executor_id = executor["executor"]["id"].as_str().unwrap();
+        claim_smartsentinel_command(&app, executor_id, command_id).await;
+
+        let reported = report_smartsentinel_command(&app, executor_id, command_id, "failed").await;
+
+        assert_eq!(reported["command"]["status"], "failed");
+        assert_eq!(
+            reported["command"]["failure_reason"],
+            "SmartSentinel dry-run execution failed"
+        );
+        assert_eq!(reported["action_result"]["status"], "failed");
+        let lease = get_command_lease(&app, command_id).await;
+        assert_eq!(lease["lease_status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_bridge_does_not_change_generic_executor_api() {
+        let app = app();
+        let service_id = smartsentinel_service_entity(&app).await;
+        let command = create_test_command(&app, &service_id, "sentinel:NotifyOperator").await;
+        register_smartsentinel_executor(
+            &app,
+            "sentinel-agent-generic-isolation",
+            &service_id,
+            &["sentinel:NotifyOperator"],
+        )
+        .await;
+        let generic = create_test_executor(&app, "edge-agent-still-generic").await;
+        let generic_id = generic["id"].as_str().unwrap();
+        put_executor_capabilities(&app, generic_id, &["sentinel:NotifyOperator"]).await;
+        put_executor_scope_for_target(&app, generic_id, &service_id).await;
+
+        let generic_commands = poll_executor_commands(&app, generic_id).await;
+
+        assert!(generic_commands
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == command["id"]));
+    }
+
+    #[tokio::test]
     async fn recover_expired_leases_returns_command_to_pending_when_retry_limit_not_exceeded() {
         let app = app();
         let pump_id = create_test_entity(&app, "lease-retry-pump-01", "aion:Pump").await;
@@ -16035,6 +16705,15 @@ mod tests {
     }
 
     async fn put_start_pump_policy(app: &Router, pump_id: &str, requires_approval: bool) -> Value {
+        put_command_policy(app, pump_id, "StartPump", requires_approval).await
+    }
+
+    async fn put_command_policy(
+        app: &Router,
+        target_entity_id: &str,
+        command_type: &str,
+        requires_approval: bool,
+    ) -> Value {
         let response = app
             .clone()
             .oneshot(json_request(
@@ -16042,8 +16721,8 @@ mod tests {
                 "/policies",
                 json!([
                     {
-                        "target_entity_id": pump_id,
-                        "command_type": "StartPump",
+                        "target_entity_id": target_entity_id,
+                        "command_type": command_type,
                         "requires_approval": requires_approval,
                         "auto_execute_allowed": false,
                         "metadata": {
@@ -16051,6 +16730,148 @@ mod tests {
                         }
                     }
                 ]),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn smartsentinel_service_entity(app: &Router) -> String {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_sample_snapshot(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let entities = get_json(app, "/entities").await;
+        entity_id_by_key(&entities, "smartsentinel:fog-01:service:mosquitto")
+    }
+
+    async fn register_smartsentinel_executor(
+        app: &Router,
+        agent_key: &str,
+        target_entity_id: &str,
+        command_types: &[&str],
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/executors/register",
+                json!({
+                    "agent_key": agent_key,
+                    "display_name": agent_key,
+                    "capabilities": command_types,
+                    "scopes": [
+                        {
+                            "target_entity_id": target_entity_id,
+                            "metadata": {"source": "test"}
+                        }
+                    ],
+                    "metadata": {
+                        "test": true
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    async fn poll_smartsentinel_commands(app: &Router, executor_id: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/integrations/smartsentinel/executors/{executor_id}/commands"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn claim_smartsentinel_command(
+        app: &Router,
+        executor_id: &str,
+        command_id: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!(
+                    "/integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/claim"
+                ),
+                json!({
+                    "lease_duration_seconds": 60,
+                    "metadata": {
+                        "source": "test"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn report_smartsentinel_command(
+        app: &Router,
+        executor_id: &str,
+        command_id: &str,
+        status: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!(
+                    "/integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/report"
+                ),
+                json!({
+                    "action_type": if status == "executed" {
+                        "sentinel:RunDiagnostic"
+                    } else {
+                        "sentinel:RestartService"
+                    },
+                    "status": status,
+                    "verified": status == "executed",
+                    "result_payload": {
+                        "dry_run": true,
+                        "detail": "reported by test executor"
+                    },
+                    "evidence_refs": ["ev-log-1"],
+                    "incident_id": "inc-001",
+                    "alert_id": "alert-001",
+                    "workflow_id": "wf-remediate",
+                    "run_id": "run-42",
+                    "trace_id": "trace-abc",
+                    "correlation_id": "corr-123",
+                    "message": if status == "failed" {
+                        "SmartSentinel dry-run execution failed"
+                    } else {
+                        "SmartSentinel dry-run execution reported"
+                    },
+                    "metadata": {
+                        "operator": "test"
+                    }
+                }),
             ))
             .await
             .unwrap();

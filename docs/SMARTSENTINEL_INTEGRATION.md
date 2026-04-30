@@ -362,6 +362,64 @@ Materialize as ActionResults:
 - Remediation partially completed.
 - External tool returned timeout.
 
+## Executor Bridge
+
+Milestone 44 adds SmartSentinel-friendly executor bridge endpoints over the generic ExecutorAgent APIs:
+
+```text
+POST /integrations/smartsentinel/executors/register
+GET /integrations/smartsentinel/executors/{executor_id}/commands
+POST /integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/claim
+POST /integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/report
+```
+
+The bridge is optional. It does not implement a SmartSentinel runtime, does not execute host commands, and does not call Docker, systemctl, kubectl, or any recovery tool. It only lets a SmartSentinel-like external executor discover compatible AionCore Commands, claim them through existing lease semantics, and report attempted outcomes.
+
+Registration creates or reuses an ExecutorAgent with:
+
+- `agent_type = smartsentinel`
+- `agent_key`
+- optional `display_name`
+- optional `metadata`
+
+Registration can also declare command capabilities such as:
+
+- `sentinel:RestartService`
+- `sentinel:RestartContainer`
+- `sentinel:NotifyOperator`
+- `sentinel:RunDiagnostic`
+
+Executor scopes reuse the generic scope model and can target:
+
+- `target_entity_id`
+- `entity_type`
+- `relationship_type`
+
+Polling returns pending compatible commands using the existing executor capability and scope matcher. The SmartSentinel response wraps the command with the latest lease, target entity metadata when available, and a small set of recent provenance/evidence metadata from related events when it is cheap to collect.
+
+Claiming a command reuses the generic command claim path. Commands that require approval remain unclaimable until the normal command approval lifecycle approves them. Active command leases continue to block competing executors.
+
+Reporting accepts:
+
+- `action_type`
+- `status`: `executed` or `failed`
+- `verified`
+- `result_payload`
+- optional `evidence_refs`
+- optional `incident_id`, `alert_id`, `workflow_id`, `run_id`, `trace_id`, `correlation_id`
+- optional `message`
+- optional `metadata`
+
+Reporting creates an Action and ActionResult, marks the command executed or failed through the existing lifecycle, updates the active lease, and records:
+
+```text
+aion:SmartSentinelCommandReported
+```
+
+Provenance and evidence fields are preserved in ActionResult and event metadata. The reported `executed` status means the external executor says it attempted or completed the action; AionCore itself still performs no recovery action.
+
+The generic ExecutorAgent endpoints remain available and unchanged. The SmartSentinel bridge is an ergonomic integration layer, not a separate lifecycle implementation.
+
 ## Metrics Boundary
 
 High-frequency operational metrics should remain in specialized metric backends when needed.
@@ -414,7 +472,7 @@ The SmartSentinel integration should not:
 ## Current Limitations
 
 - No SmartSentinel agent runtime is implemented.
-- No live polling is implemented.
+- No live SmartSentinel runtime polling loop is implemented; only HTTP polling endpoints are available.
 - No authentication is implemented for the integration endpoint.
 - No recovery action execution is implemented.
 - Evidence URIs are never fetched by AionCore.

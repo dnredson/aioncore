@@ -1,0 +1,31 @@
+{
+  "payload_format": "canonical-json",
+  "protocol": "http",
+  "metadata": {
+    "adapter_id": "edge-adapter-demo-01",
+    "connector_id": "00000000-0000-0000-0000-000000000000",
+    "source_protocol": "sdi-12",
+    "source_ref": "bus-1/address-0",
+    "parser_name": "sdi12-water-level",
+    "output_mode": "canonical-json",
+    "dlq_replayed": false
+  },
+  "payload": {
+    "observations": [
+      {
+        "observed_property": "water_level",
+        "value": {
+          "type": "number",
+          "value": 1.42
+        },
+        "unit": "m",
+        "observed_at": "2026-04-30T12:00:00Z",
+        "metadata": {
+          "adapter_id": "edge-adapter-demo-01",
+          "source_protocol": "sdi-12",
+          "parser_name": "sdi12-water-level"
+        }
+      }
+    ]
+  }
+}

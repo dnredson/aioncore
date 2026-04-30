@@ -224,6 +224,10 @@ High-frequency metrics can stay in specialized metric backends. AionCore stores 
 
 ## Optional Integrations
 
+Aion Edge Adapter is a future optional edge/fog component for multiprotocol collection, local parsing, offline buffering, DLQ handling, and publishing into AionCore. It is not required by the AionCore runtime, and server-side ingestion connectors remain valid without it.
+
+See [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md).
+
 SmartSentinel can integrate with AionCore as an optional observer and executor. It is not a core dependency. AionCore can ingest SmartSentinel snapshots as raw messages and materialize selected elements as semantic entities, relationships, observations, events, commands, actions, and action results.
 
 See [SmartSentinel Integration](SMARTSENTINEL_INTEGRATION.md).

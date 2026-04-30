@@ -39,6 +39,7 @@ The architecture should later support distributed deployment, where HTTP ingesti
 - [Domain Model](docs/DOMAIN_MODEL.md)
 - [Observation Model](docs/OBSERVATION_MODEL.md)
 - [Ingestion Model](docs/INGESTION_MODEL.md)
+- [Aion Edge Adapter Model](docs/EDGE_ADAPTER_MODEL.md)
 - [SmartSentinel Integration](docs/SMARTSENTINEL_INTEGRATION.md)
 - [Persistence Model](docs/PERSISTENCE_MODEL.md)
 - [AI and MCP Model](docs/AI_MCP_MODEL.md)
@@ -244,6 +245,14 @@ $raw.connector_id
 $raw.connector_key
 $raw.connector_profile
 ```
+
+## Aion Edge Adapter
+
+The Aion Edge Adapter is future optional work for edge/fog deployments that need local collection from multiple protocols and brokers before publishing to AionCore. It is intended for sources such as MQTT, HTTP, CoAP, serial, SDI-12, CSV, UltraLight, TTN JSON, ChirpStack JSON, and future parser plugins.
+
+The adapter is not required by the AionCore runtime. Current server-side ingestion remains valid: direct HTTP ingestion, connector-aware HTTP ingestion, environment MQTT ingestion, and dynamic MQTT connector workers can continue to run without an edge adapter.
+
+The future adapter model covers local parser plugins, output modes such as `senml-json`, `canonical-json`, and future `aion-observation-batch`, local DLQ/offline buffering, retry/backoff behavior, safe local credential handling, and publishing to AionCore HTTP or MQTT ingestion. See [Aion Edge Adapter Model](docs/EDGE_ADAPTER_MODEL.md).
 
 Optional SmartSentinel snapshot ingestion can be tested without a SmartSentinel runtime. AionCore stores the full snapshot as a raw message and maps selected operational-domain data into domain-agnostic entities, relationships, observations, and events:
 
@@ -463,6 +472,107 @@ $incidentEvents | Select-Object event_type, metadata
 $alertEvents | Select-Object event_type, metadata
 $traceRawMessages | Select-Object raw_message_id, payload_format, connector_profile
 $provenanceSearch.counts
+```
+
+Register a SmartSentinel-like executor bridge and report a dry-run command result. These endpoints do not execute recovery actions inside AionCore and do not call Docker, systemctl, kubectl, or host commands.
+
+```powershell
+$policy = Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/policies" `
+  -ContentType "application/json" `
+  -Body (@(
+    @{
+      target_entity_id = $service.id
+      command_type = "sentinel:RunDiagnostic"
+      requires_approval = $false
+      auto_execute_allowed = $false
+      metadata = @{ source = "readme-smartsentinel-bridge" }
+    }
+  ) | ConvertTo-Json -Depth 8)
+
+$command = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/commands" `
+  -ContentType "application/json" `
+  -Body (@{
+    target_entity_id = $service.id
+    command_type = "sentinel:RunDiagnostic"
+    payload = @{
+      diagnostic = "service-health-summary"
+      dry_run = $true
+    }
+    requested_by = "operator"
+    reason = "Inspect SmartSentinel-mapped service state"
+  } | ConvertTo-Json -Depth 8)
+
+$sentinelExecutor = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/integrations/smartsentinel/executors/register" `
+  -ContentType "application/json" `
+  -Body (@{
+    agent_key = "sentinel-fog-01"
+    display_name = "SmartSentinel fog-01 bridge"
+    capabilities = @("sentinel:RunDiagnostic", "sentinel:RestartService", "sentinel:NotifyOperator")
+    scopes = @(
+      @{ target_entity_id = $service.id }
+      @{ entity_type = "sentinel:Service" }
+      @{ relationship_type = "sentinel:runs" }
+    )
+    metadata = @{
+      node_id = "fog-01"
+      bridge_mode = "report-only"
+    }
+  } | ConvertTo-Json -Depth 10)
+
+$sentinelCommands = Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/integrations/smartsentinel/executors/$($sentinelExecutor.executor.id)/commands"
+
+$claimed = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/integrations/smartsentinel/executors/$($sentinelExecutor.executor.id)/commands/$($command.id)/claim" `
+  -ContentType "application/json" `
+  -Body (@{
+    lease_duration_seconds = 60
+    max_retries = 1
+    metadata = @{ source = "readme-smoke" }
+  } | ConvertTo-Json -Depth 8)
+
+$reported = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/integrations/smartsentinel/executors/$($sentinelExecutor.executor.id)/commands/$($command.id)/report" `
+  -ContentType "application/json" `
+  -Body (@{
+    action_type = "sentinel:RunDiagnostic"
+    status = "executed"
+    verified = $true
+    result_payload = @{
+      dry_run = $true
+      service_state = "healthy"
+      note = "External executor reported result only"
+    }
+    evidence_refs = @("ev-log-1")
+    incident_id = "inc-001"
+    alert_id = "alert-001"
+    workflow_id = "wf-remediate"
+    run_id = "run-42"
+    trace_id = "trace-abc"
+    correlation_id = "corr-123"
+    message = "SmartSentinel bridge reported diagnostic result"
+    metadata = @{ operator = "readme" }
+  } | ConvertTo-Json -Depth 10)
+
+$reported.command.status
+$reported.action_result.metadata
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events?event_type=aion:SmartSentinelCommandReported"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/provenance/search?incident_id=inc-001"
+```
+
+If the command policy requires approval, approve the command before the bridge claim:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($command.id)/approve"
 ```
 
 TTN v3 uplink JSON can be tested locally through connector-aware HTTP ingestion without a live TTN broker. Create existing AionCore entities, a TTN connector, and an explicit device mapping:

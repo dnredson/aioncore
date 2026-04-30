@@ -1,0 +1,26 @@
+{
+  "adapter_metadata": {
+    "adapter_id": "edge-adapter-demo-01",
+    "connector_id": "00000000-0000-0000-0000-000000000000",
+    "source_protocol": "mqtt",
+    "source_ref": "local/site-01/sensor-01",
+    "parser_name": "ultralight-v2",
+    "output_mode": "senml-json",
+    "dlq_replayed": false
+  },
+  "payload_format": "senml-json",
+  "payload": [
+    {
+      "bn": "urn:aion:edge:site-01:sensor-01:",
+      "bt": 1777550400,
+      "n": "temperature",
+      "u": "Cel",
+      "v": 22.4
+    },
+    {
+      "n": "relative_humidity",
+      "u": "%RH",
+      "v": 61.2
+    }
+  ]
+}

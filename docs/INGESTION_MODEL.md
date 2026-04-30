@@ -2,6 +2,8 @@
 
 AionCore ingestion is payload-agnostic. HTTP and MQTT ingestion both preserve the raw message first and then normalize supported payloads into canonical observations.
 
+Future optional edge/fog collection is described in [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md). That adapter model does not replace AionCore server-side ingestion connectors.
+
 ## Core Rule
 
 Raw messages must always be stored before normalization.
