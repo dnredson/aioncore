@@ -1,0 +1,36 @@
+# AionCore Documentation Index
+
+This index groups the main AionCore documentation so model docs, usage guides, ADRs, and validation notes can be reached without relying on the root `README.md`.
+
+## Model Docs
+
+- [Architecture](ARCHITECTURE.md)
+- [Domain Model](DOMAIN_MODEL.md)
+- [Observation Model](OBSERVATION_MODEL.md)
+- [Ingestion Model](INGESTION_MODEL.md)
+- [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md)
+- [SmartSentinel Integration Model](SMARTSENTINEL_INTEGRATION.md)
+- [Persistence Model](PERSISTENCE_MODEL.md)
+- [AI and MCP Model](AI_MCP_MODEL.md)
+- [Action Model](ACTION_MODEL.md)
+- [Security Model](SECURITY_MODEL.md)
+
+## Usage Guides
+
+- [Authentication Usage](AUTH_USAGE.md)
+- [Ingestion Usage](INGESTION_USAGE.md)
+- [TTN Usage](TTN_USAGE.md)
+- [SmartSentinel Usage](SMARTSENTINEL_USAGE.md)
+- [MCP Usage](MCP_USAGE.md)
+- [Commands, Rules, and Executors Usage](COMMANDS_RULES_EXECUTORS_USAGE.md)
+- [Runtime Validation](RUNTIME_VALIDATION.md)
+
+## Planning And ADRs
+
+- [Roadmap](ROADMAP.md)
+- [Architecture Decision Records](ADR)
+
+## Validation And Deployment
+
+- [Runtime Validation](RUNTIME_VALIDATION.md)
+- [README Quick Local Start](../README.md#quick-local-start)

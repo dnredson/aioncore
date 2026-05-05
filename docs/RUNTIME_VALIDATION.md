@@ -4,6 +4,8 @@ These scripts are for local developer validation of the running API. They are
 intended to be simple and Windows-friendly, with PowerShell as the primary
 entrypoint.
 
+For runtime and storage background, see [Persistence Model](PERSISTENCE_MODEL.md) and the [README quick local start](../README.md#quick-local-start).
+
 ## Memory Validation
 
 `scripts/validate-memory-runtime.ps1` assumes `aion-api` is already running on
@@ -135,3 +137,11 @@ Successful runs print a short summary including:
 
 The scripts stop at the first failed assertion and print a PowerShell error with
 the failing condition.
+
+## See Also
+
+- [README Quick Local Start](../README.md#quick-local-start)
+- [Persistence Model](PERSISTENCE_MODEL.md)
+- [Ingestion Usage](INGESTION_USAGE.md)
+- [ADR 0019: PostgreSQL Runtime Readiness](ADR/0019-postgresql-runtime-readiness.md)
+- [ADR 0020: Runtime Validation Scripts](ADR/0020-runtime-validation-scripts.md)

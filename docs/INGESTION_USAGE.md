@@ -2,7 +2,7 @@
 
 This guide collects the operational ingestion examples that were previously embedded in the root `README.md`.
 
-For the architecture background, also see [Ingestion Model](INGESTION_MODEL.md) and [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md).
+For the architecture background, also see [Ingestion Model](INGESTION_MODEL.md), [Observation Model](OBSERVATION_MODEL.md), [Persistence Model](PERSISTENCE_MODEL.md), and [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md).
 
 ## Local Runtime Basics
 
@@ -313,7 +313,7 @@ Status fields include `planned`, `starting`, `running`, `reconnecting`, `stopped
 
 ## Connector Secret Example
 
-Connector MQTT workers can use connector secret references for broker username/password authentication. Secret values are accepted on write, stored outside `IngestionConnector`, and never returned by the API:
+Connector MQTT workers can use connector secret references for broker username/password authentication. Secret values are accepted on write, stored outside the `IngestionConnector` record itself, and never returned by the API:
 
 ```powershell
 $brokerSecret = Invoke-RestMethod `
@@ -373,3 +373,14 @@ The Aion Edge Adapter remains optional future work for edge and fog deployments.
 - dynamic MQTT connector workers
 
 See [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md) for the future adapter contract.
+
+## See Also
+
+- [Ingestion Model](INGESTION_MODEL.md)
+- [Observation Model](OBSERVATION_MODEL.md)
+- [Persistence Model](PERSISTENCE_MODEL.md)
+- [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md)
+- [ADR 0003: Payload-Agnostic Ingestion](ADR/0003-payload-agnostic-ingestion.md)
+- [ADR 0023: Ingestion Connector Registry and Profiles](ADR/0023-ingestion-connector-registry-and-profiles.md)
+- [ADR 0024: PostgreSQL Ingestion Connector Persistence](ADR/0024-postgresql-ingestion-connector-persistence.md)
+- [ADR 0029: Connector Secret References](ADR/0029-connector-secret-references.md)

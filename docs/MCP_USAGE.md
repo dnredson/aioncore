@@ -2,7 +2,7 @@
 
 This guide collects the operational MCP examples that were previously embedded in the root `README.md`.
 
-For the design background, see [AI and MCP Model](AI_MCP_MODEL.md).
+For the design background, see [AI and MCP Model](AI_MCP_MODEL.md) and [Security Model](SECURITY_MODEL.md).
 
 ## Current Local MCP Surface
 
@@ -14,7 +14,7 @@ POST /mcp/tools/{tool_name}
 POST /mcp
 ```
 
-This is a development MCP-style HTTP surface, not a production MCP server.
+This is a development MCP-style tools HTTP surface, not a production MCP server.
 
 Auth behavior:
 
@@ -58,7 +58,7 @@ Invoke-RestMethod `
 
 ## `/mcp` JSON-RPC Examples
 
-List tools through the MCP-style JSON-RPC endpoint:
+List tools through the MCP-style tools JSON-RPC endpoint:
 
 ```powershell
 Invoke-RestMethod `
@@ -141,3 +141,12 @@ Related protected surfaces:
 - `GET /provenance/search` requires `provenance:read`
 
 Those are adjacent AI-facing surfaces but separate from the `mcp:tools` scope.
+
+## See Also
+
+- [AI and MCP Model](AI_MCP_MODEL.md)
+- [Security Model](SECURITY_MODEL.md)
+- [Authentication Usage](AUTH_USAGE.md)
+- [ADR 0005: MCP-Ready AI Integration](ADR/0005-mcp-ready-ai-integration.md)
+- [ADR 0044: Security Model and Auth Roadmap](ADR/0044-security-model-and-auth-roadmap.md)
+- [ADR 0051: MCP, AI, and Provenance Auth Hardening](ADR/0051-mcp-ai-provenance-auth-hardening.md)

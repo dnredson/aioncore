@@ -18,13 +18,15 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Security model: documented principals, credential types, scopes, trust boundaries, and auth roadmap.
 - Milestone 55 auth hardening: `/events*` and `/raw-messages*` now require dedicated read scopes in `token` mode.
 - Milestone 56 auth hardening: broader read-surface coverage now protects selected entity, observation, command, action, rule, policy, capability, and executor-inspection reads in `token` mode.
-- Milestone 57 auth hardening: selected token-mode protected read surfaces now enforce the first tenant/resource ownership skeleton, including tenant-filtered lists and `403` on known cross-tenant detail reads.
+- Milestone 57 auth hardening: selected token mode protected read surfaces now enforce the first tenant/resource ownership skeleton, including tenant-filtered lists and `403` on known cross-tenant detail reads.
+- Milestone 58 documentation simplification: the root `README.md` now stays concise and operational examples live in focused usage guides under `docs/`.
+- Milestone 59 documentation consistency pass: usage guides, model docs, roadmap references, and documentation navigation now use normalized cross-links and terminology.
 
 ## Next
 
-1. Milestone 58: extend tenant-aware authorization to write paths and remaining protected surfaces without introducing cross-tenant sharing yet.
-2. Milestone 59: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
-3. Milestone 60: review whether remaining open write surfaces should split into narrower operator and machine scopes.
+1. Milestone 60: extend tenant-aware authorization to write paths and remaining protected surfaces without introducing cross-tenant sharing yet.
+2. Milestone 61: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+3. Milestone 62: review whether remaining open write surfaces should split into narrower operator and machine scopes.
 
 ## Future
 
@@ -37,4 +39,4 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 ## Notes
 
 - The roadmap is intentionally concise. Canonical details live in the individual model docs and ADRs.
-- Security hardening is staged after the documentation-first model to avoid changing runtime behavior prematurely.
+- Security hardening remains staged after the current documentation pass to avoid changing runtime behavior prematurely.

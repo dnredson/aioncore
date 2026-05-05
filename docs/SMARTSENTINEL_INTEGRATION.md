@@ -2,7 +2,7 @@
 
 SmartSentinel is an optional operational integration for AionCore. It is not a core dependency.
 
-AionCore Core remains domain-agnostic. SmartSentinel can participate as an observer, executor, or evidence source in operational and infrastructure monitoring deployments.
+AionCore remains domain-agnostic. SmartSentinel can participate as an observer, executor, or evidence source in operational and infrastructure monitoring deployments.
 
 ## Integration Roles
 

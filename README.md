@@ -60,7 +60,7 @@ Detailed runtime validation and PostgreSQL testing notes live in [Runtime Valida
 
 `AIONCORE_AUTH_MODE=dev` is still the default when unset. That is acceptable for trusted local development only.
 
-Current token-mode enforcement is intentionally partial:
+Current token mode enforcement is intentionally partial:
 
 - `token` mode protects selected machine-facing, MCP/AI, secret-management, connector, and read-oriented routes.
 - Tenant/resource ownership checks exist only for selected protected read surfaces.
@@ -97,6 +97,7 @@ Operational usage guides:
 Project planning:
 
 - [Roadmap](docs/ROADMAP.md)
+- [Documentation Index](docs/INDEX.md)
 - [Architecture Decision Records](docs/ADR)
 
 ## Important Notes

@@ -2,7 +2,7 @@
 
 This guide collects the SmartSentinel operational examples that were previously embedded in the root `README.md`.
 
-For the design model, see [SmartSentinel Integration Model](SMARTSENTINEL_INTEGRATION.md).
+For the design model, see [SmartSentinel Integration Model](SMARTSENTINEL_INTEGRATION.md), [Action Model](ACTION_MODEL.md), and [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md) for the related optional edge/fog context.
 
 ## Snapshot Ingestion Example
 
@@ -239,7 +239,7 @@ $policy = Invoke-RestMethod `
       command_type = "sentinel:RunDiagnostic"
       requires_approval = $false
       auto_execute_allowed = $false
-      metadata = @{ source = "readme-smartsentinel-bridge" }
+      metadata = @{ source = "smartsentinel-usage-guide" }
     }
   ) | ConvertTo-Json -Depth 8)
 
@@ -292,7 +292,7 @@ $claimed = Invoke-RestMethod `
   -Body (@{
     lease_duration_seconds = 60
     max_retries = 1
-    metadata = @{ source = "readme-smoke" }
+    metadata = @{ source = "smartsentinel-usage-guide" }
   } | ConvertTo-Json -Depth 8)
 
 $reported = Invoke-RestMethod `
@@ -316,7 +316,7 @@ $reported = Invoke-RestMethod `
     trace_id = "trace-abc"
     correlation_id = "corr-123"
     message = "SmartSentinel bridge reported diagnostic result"
-    metadata = @{ operator = "readme" }
+    metadata = @{ operator = "usage-guide" }
   } | ConvertTo-Json -Depth 10)
 
 $reported.command.status
@@ -330,3 +330,15 @@ If the command policy requires approval, approve the command before the bridge c
 ```powershell
 Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($command.id)/approve"
 ```
+
+## See Also
+
+- [SmartSentinel Integration Model](SMARTSENTINEL_INTEGRATION.md)
+- [Action Model](ACTION_MODEL.md)
+- [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md)
+- [AI and MCP Model](AI_MCP_MODEL.md)
+- [ADR 0009: SmartSentinel Optional Operational Integration](ADR/0009-smartsentinel-optional-operational-integration.md)
+- [ADR 0037: SmartSentinel Adapter Skeleton](ADR/0037-smartsentinel-adapter-skeleton.md)
+- [ADR 0039: SmartSentinel Provenance and Evidence](ADR/0039-smartsentinel-provenance-and-evidence.md)
+- [ADR 0040: SmartSentinel Provenance Query Ergonomics](ADR/0040-smartsentinel-provenance-query-ergonomics.md)
+- [ADR 0041: SmartSentinel Command Executor Bridge](ADR/0041-smartsentinel-command-executor-bridge.md)

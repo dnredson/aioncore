@@ -2,7 +2,7 @@
 
 This guide collects the operational authentication examples that were previously in the root `README.md`.
 
-For the architecture and roadmap context, also see [Security Model](SECURITY_MODEL.md).
+For the architecture and roadmap context, also see [Security Model](SECURITY_MODEL.md), [ADR 0044: Security Model and Auth Roadmap](ADR/0044-security-model-and-auth-roadmap.md), [ADR 0045: Auth Middleware Skeleton and Dev Bypass](ADR/0045-auth-middleware-skeleton-dev-bypass.md), [ADR 0046: API Token Principal Model and Hashing](ADR/0046-api-token-principal-model-and-hashing.md), and [ADR 0054: Tenant Resource Ownership Skeleton](ADR/0054-tenant-resource-ownership-skeleton.md).
 
 ## Current Status
 
@@ -425,3 +425,15 @@ Invoke-RestMethod `
   -ContentType "application/json" `
   -Body "{}"
 ```
+
+## See Also
+
+- [Security Model](SECURITY_MODEL.md)
+- [Authentication ADR Roadmap](ADR/0044-security-model-and-auth-roadmap.md)
+- [Auth Middleware Skeleton and Dev Bypass](ADR/0045-auth-middleware-skeleton-dev-bypass.md)
+- [API Token Principal Model and Hashing](ADR/0046-api-token-principal-model-and-hashing.md)
+- [Connector and Ingestion Auth Enforcement](ADR/0048-connector-and-ingestion-auth-enforcement.md)
+- [MCP, AI, and Provenance Auth Hardening](ADR/0051-mcp-ai-provenance-auth-hardening.md)
+- [Events and Raw Messages Auth Hardening](ADR/0052-events-raw-messages-auth-hardening.md)
+- [Broader Read Surface Auth Coverage](ADR/0053-broader-read-surface-auth-coverage.md)
+- [Tenant Resource Ownership Skeleton](ADR/0054-tenant-resource-ownership-skeleton.md)

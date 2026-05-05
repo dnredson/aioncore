@@ -2,7 +2,7 @@
 
 This guide collects command, action, policy, rule, executor, and lease-oriented operational examples that were previously embedded in the root `README.md`.
 
-For the domain background, see [Action Model](ACTION_MODEL.md).
+For the domain background, see [Action Model](ACTION_MODEL.md) and [Security Model](SECURITY_MODEL.md).
 
 ## Commands
 
@@ -47,7 +47,7 @@ $policy = Invoke-RestMethod `
       command_type = "sentinel:RunDiagnostic"
       requires_approval = $false
       auto_execute_allowed = $false
-      metadata = @{ source = "readme-smartsentinel-bridge" }
+      metadata = @{ source = "commands-rules-executors-usage-guide" }
     }
   ) | ConvertTo-Json -Depth 8)
 ```
@@ -127,7 +127,7 @@ $claimed = Invoke-RestMethod `
   -Body (@{
     lease_duration_seconds = 60
     max_retries = 1
-    metadata = @{ source = "readme-smoke" }
+    metadata = @{ source = "commands-rules-executors-usage-guide" }
   } | ConvertTo-Json -Depth 8)
 ```
 
@@ -159,7 +159,7 @@ $reported = Invoke-RestMethod `
     trace_id = "trace-abc"
     correlation_id = "corr-123"
     message = "SmartSentinel bridge reported diagnostic result"
-    metadata = @{ operator = "readme" }
+    metadata = @{ operator = "usage-guide" }
   } | ConvertTo-Json -Depth 10)
 
 $reported.command.status
@@ -181,3 +181,15 @@ If the command policy requires approval, approve the command before the executor
 ```powershell
 Invoke-RestMethod -Method Post -Uri "http://localhost:8080/commands/$($command.id)/approve"
 ```
+
+## See Also
+
+- [Action Model](ACTION_MODEL.md)
+- [Security Model](SECURITY_MODEL.md)
+- [Authentication Usage](AUTH_USAGE.md)
+- [SmartSentinel Integration Model](SMARTSENTINEL_INTEGRATION.md)
+- [ADR 0010: In-Memory Rule Engine Foundation](ADR/0010-in-memory-rule-engine-foundation.md)
+- [ADR 0011: Generic Executor Agent Polling API](ADR/0011-generic-executor-agent-polling-api.md)
+- [ADR 0012: In-Memory Command Lease Expiry and Retry](ADR/0012-in-memory-command-lease-expiry-and-retry.md)
+- [ADR 0017: PostgreSQL Command Rule Lifecycle Storage](ADR/0017-postgresql-command-rule-lifecycle-storage.md)
+- [ADR 0041: SmartSentinel Command Executor Bridge](ADR/0041-smartsentinel-command-executor-bridge.md)

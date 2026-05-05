@@ -2,7 +2,7 @@
 
 This guide collects the TTN operational examples that were previously embedded in the root `README.md`.
 
-For the ingestion architecture behind this flow, see [Ingestion Model](INGESTION_MODEL.md).
+For the ingestion architecture behind this flow, see [Ingestion Model](INGESTION_MODEL.md) and [Persistence Model](PERSISTENCE_MODEL.md).
 
 ## Create TTN Demo Entities
 
@@ -347,3 +347,15 @@ Invoke-RestMethod `
 Duplicate enabled mappings for the same connector, device, and application are rejected with a conflict. Duplicate enabled fallback mappings for the same connector/device are also rejected.
 
 If no enabled mapping matches and the request does not provide a producer entity, AionCore preserves the raw message, marks it failed, emits `aion:TtnDeviceMappingMissing`, and creates no observations.
+
+## See Also
+
+- [Ingestion Model](INGESTION_MODEL.md)
+- [Observation Model](OBSERVATION_MODEL.md)
+- [Persistence Model](PERSISTENCE_MODEL.md)
+- [ADR 0030: TTN v3 Uplink Decoding Foundation](ADR/0030-ttn-v3-uplink-decoding-foundation.md)
+- [ADR 0031: TTN Device-To-Entity Mapping](ADR/0031-ttn-device-to-entity-mapping.md)
+- [ADR 0032: TTN Mapping Operations Hardening](ADR/0032-ttn-mapping-operations-hardening.md)
+- [ADR 0033: TTN Operational Validation Readiness](ADR/0033-ttn-operational-validation-readiness.md)
+- [ADR 0035: TTN Live Readiness Dry Run](ADR/0035-ttn-live-readiness-dry-run.md)
+- [ADR 0036: TTN Live Validation Preflight](ADR/0036-ttn-live-validation-preflight.md)
