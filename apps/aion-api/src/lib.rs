@@ -3987,8 +3987,10 @@ async fn list_edge_adapters(
 
 async fn get_edge_adapter(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(adapter_id): Path<Uuid>,
 ) -> Result<Json<EdgeAdapter>, ApiError> {
+    require_scope(&state, &auth, "/adapters/:adapter_id", "adapters:read")?;
     Ok(Json(get_edge_adapter_record(&state, adapter_id)?))
 }
 
@@ -5617,9 +5619,16 @@ async fn ttn_live_validate_connector(
 
 async fn create_ttn_device_mapping(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
     Json(request): Json<CreateTtnDeviceMappingRequest>,
 ) -> Result<(StatusCode, Json<TtnDeviceMappingResponse>), ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ttn-device-mappings",
+        "connectors:admin",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     ensure_ttn_connector(&connector)?;
     ensure_entity_exists(&state, request.producer_entity_id)?;
@@ -5656,8 +5665,15 @@ async fn create_ttn_device_mapping(
 
 async fn list_ttn_device_mappings(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
 ) -> Result<Json<Vec<TtnDeviceMappingResponse>>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ttn-device-mappings",
+        "connectors:read",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     ensure_ttn_connector(&connector)?;
     let mappings = state
@@ -5671,8 +5687,15 @@ async fn list_ttn_device_mappings(
 
 async fn get_ttn_device_mapping(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<TtnDeviceMappingResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id",
+        "connectors:read",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     ensure_ttn_connector(&connector)?;
     let mapping = state
@@ -5684,9 +5707,16 @@ async fn get_ttn_device_mapping(
 
 async fn update_ttn_device_mapping(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateTtnDeviceMappingRequest>,
 ) -> Result<Json<TtnDeviceMappingResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id",
+        "connectors:admin",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     ensure_ttn_connector(&connector)?;
     let mut mapping = state
@@ -5724,8 +5754,15 @@ async fn update_ttn_device_mapping(
 
 async fn delete_ttn_device_mapping(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id",
+        "connectors:admin",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     ensure_ttn_connector(&connector)?;
     let mapping = state
@@ -5746,15 +5783,29 @@ async fn delete_ttn_device_mapping(
 
 async fn enable_ttn_device_mapping(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<TtnDeviceMappingResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id/enable",
+        "connectors:admin",
+    )?;
     set_ttn_device_mapping_enabled(state, connector_id, mapping_id, true).await
 }
 
 async fn disable_ttn_device_mapping(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((connector_id, mapping_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<TtnDeviceMappingResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ttn-device-mappings/:mapping_id/disable",
+        "connectors:admin",
+    )?;
     set_ttn_device_mapping_enabled(state, connector_id, mapping_id, false).await
 }
 
@@ -6140,8 +6191,10 @@ async fn ingest_http_for_connector(
 
 async fn ingest_http(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<HttpIngestRequest>,
 ) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
+    require_scope(&state, &auth, "/ingest/http", "ingestion:write")?;
     ingest_http_resolved(&state, request, None, None).await
 }
 
@@ -12618,6 +12671,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_ingest_auth_respects_dev_bypass_and_token_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let sensor_id =
+            create_test_entity(&dev_app, "generic-ingest-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "generic-ingest-plot-01", "aion:Plot").await;
+        let body = json!({
+            "producer_entity_id": sensor_id,
+            "feature_of_interest_id": plot_id,
+            "payload_format": "canonical-json",
+            "protocol": "http",
+            "content_type": "application/json",
+            "payload": {
+                "observations": [
+                    {
+                        "observed_property": "aion:SoilMoisture",
+                        "value": {"type": "number", "value": 18.5},
+                        "unit": "%",
+                        "observed_at": "2026-05-05T12:00:00Z"
+                    }
+                ]
+            }
+        });
+
+        let dev_allowed = dev_app
+            .clone()
+            .oneshot(json_request("POST", "/ingest/http", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dev_allowed.status(), StatusCode::CREATED);
+
+        let missing_token = token_app
+            .clone()
+            .oneshot(json_request("POST", "/ingest/http", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_scope = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/ingest/http",
+                body.clone(),
+                &store_api_token(
+                    &storage,
+                    ApiTokenPrincipalType::Service,
+                    Some("generic-ingest-reader"),
+                    &["connectors:read"],
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+        let allowed = token_app
+            .oneshot(auth_json_request(
+                "POST",
+                "/ingest/http",
+                body,
+                &store_api_token(
+                    &storage,
+                    ApiTokenPrincipalType::Service,
+                    Some("generic-ingest-writer"),
+                    &["ingestion:write"],
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
     async fn ttn_live_validation_requires_connectors_admin() {
         let storage = Arc::new(InMemoryStorage::new());
         let dev_app = dev_mode_app_with_storage(storage.clone());
@@ -12661,6 +12788,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ttn_mapping_routes_require_connector_scopes() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&dev_app, "ttn-auth-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "ttn-auth-plot-01", "aion:Plot").await;
+        let connector =
+            create_ttn_connector(&dev_app, "ttn-auth-connector-01", &sensor_id, &plot_id).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        let create_body = json!({
+            "ttn_application_id": "farm-app",
+            "ttn_device_id": "soil-node-01",
+            "producer_entity_id": sensor_id,
+            "feature_of_interest_id": plot_id
+        });
+
+        let missing_token = token_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings"),
+                create_body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);
+
+        let read_only_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("ttn-mapping-reader"),
+            &["connectors:read"],
+        );
+        let create_denied = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings"),
+                create_body.clone(),
+                &read_only_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_denied.status(), StatusCode::FORBIDDEN);
+
+        let admin_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("ttn-mapping-admin"),
+            &["connectors:admin"],
+        );
+        let created = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings"),
+                create_body,
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = to_json(created).await;
+        let mapping_id = created["id"].as_str().unwrap();
+
+        let listed = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings"),
+                &read_only_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+
+        let fetched = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}"),
+                &read_only_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+
+        let patch_denied = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "PATCH",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}"),
+                json!({"enabled": false}),
+                &read_only_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patch_denied.status(), StatusCode::FORBIDDEN);
+
+        let delete_denied = token_app
+            .clone()
+            .oneshot(auth_request(
+                "DELETE",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}"),
+                &read_only_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(delete_denied.status(), StatusCode::FORBIDDEN);
+
+        let admin_all_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Admin,
+            Some("ttn-mapping-break-glass"),
+            &["admin:all"],
+        );
+        let disabled = token_app
+            .clone()
+            .oneshot(auth_request(
+                "PUT",
+                &format!(
+                    "/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/disable"
+                ),
+                &admin_all_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+
+        let deleted = token_app
+            .oneshot(auth_request(
+                "DELETE",
+                &format!("/ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}"),
+                &admin_all_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -12720,6 +12988,18 @@ mod tests {
         let adapter = to_json(adapter).await;
         let adapter_id = adapter["adapter"]["id"].as_str().unwrap();
 
+        let missing_token = token_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/adapters/{adapter_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);
+
         let denied = token_app
             .clone()
             .oneshot(auth_request(
@@ -12748,6 +13028,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed.status(), StatusCode::OK);
+
+        let detail = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/adapters/{adapter_id}"),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
 
         let status = token_app
             .oneshot(auth_request(
@@ -12982,11 +13273,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unprotected_endpoints_still_work_in_token_mode_without_token() {
+    async fn selected_unprotected_endpoints_still_work_in_token_mode_without_token() {
         let storage = Arc::new(InMemoryStorage::new());
         let dev_app = dev_mode_app_with_storage(storage.clone());
         let app = token_mode_app_with_storage(storage);
-        let sensor_id = create_test_entity(&dev_app, "token-open-sensor-01", "aion:Sensor").await;
+        let _sensor_id = create_test_entity(&dev_app, "token-open-sensor-01", "aion:Sensor").await;
         let plot_id = create_test_entity(&dev_app, "token-open-plot-01", "aion:Plot").await;
 
         let entities = app
@@ -13002,29 +13293,17 @@ mod tests {
         assert_eq!(entities.status(), StatusCode::OK);
         assert_eq!(to_json(entities).await.as_array().unwrap().len(), 2);
 
-        let ingest = app
-            .oneshot(json_request(
-                "POST",
-                "/ingest/http",
-                json!({
-                    "producer_entity_id": sensor_id,
-                    "feature_of_interest_id": plot_id,
-                    "payload_format": "senml-json",
-                    "protocol": "http",
-                    "content_type": "application/senml+json",
-                    "payload": [
-                        {
-                            "bn": "urn:aion:test:open-ingest:",
-                            "n": "soil_moisture",
-                            "u": "%",
-                            "v": 21.0
-                        }
-                    ]
-                }),
-            ))
+        let observations = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/observations?feature_of_interest_id={plot_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(ingest.status(), StatusCode::CREATED);
+        assert_eq!(observations.status(), StatusCode::OK);
+        assert!(to_json(observations).await.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

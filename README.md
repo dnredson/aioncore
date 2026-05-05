@@ -75,7 +75,7 @@ The PostgreSQL and TimescaleDB migration foundation now covers the current in-me
 
 AionCore still defaults to unauthenticated local development with `AIONCORE_AUTH_MODE=dev`. This is acceptable for local development and tests only, not for public or production exposure.
 
-Milestone 51 extends selective token enforcement for sensitive machine-facing endpoints in `token` mode, including connector administration, selected connector reads, connector-aware ingestion, SmartSentinel snapshot ingestion, and selected adapter operational reads. It does not broadly protect the entire API yet.
+Milestone 52 closes the remaining known ingestion and connector-related token-mode gaps, including generic HTTP ingestion, TTN device-mapping routes, and adapter detail reads. It does not broadly protect the entire API yet.
 
 Local development warning:
 
@@ -83,7 +83,7 @@ Local development warning:
 - do not expose `/mcp`, `/mcp/tools`, or `/ai/context/*` publicly
 - do not treat current connector-secret redaction as a complete production security model
 
-The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md), [ADR 0047](docs/ADR/0047-selected-machine-endpoint-auth-enforcement.md), and [ADR 0048](docs/ADR/0048-connector-and-ingestion-auth-enforcement.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, selective machine-principal protection, connector and ingestion enforcement, connector-secret protection, and later MCP hardening.
+The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md), [ADR 0047](docs/ADR/0047-selected-machine-endpoint-auth-enforcement.md), [ADR 0048](docs/ADR/0048-connector-and-ingestion-auth-enforcement.md), and [ADR 0049](docs/ADR/0049-remaining-ingestion-connector-auth-enforcement.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, selective machine-principal protection, connector and ingestion enforcement, connector-secret protection, remaining ingestion and connector gap closure, and later MCP hardening.
 
 The auth-mode environment variable is:
 
@@ -122,6 +122,11 @@ Selected protected endpoints in `token` mode:
   - `PATCH /ingestion/connectors/{connector_id}` requires `connectors:admin`
   - `PUT /ingestion/connectors/{connector_id}/enable` requires `connectors:admin`
   - `PUT /ingestion/connectors/{connector_id}/disable` requires `connectors:admin`
+  - `POST /ingestion/connectors/{connector_id}/ttn-device-mappings` requires `connectors:admin`
+  - `PATCH /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}` requires `connectors:admin`
+  - `PUT /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/enable` requires `connectors:admin`
+  - `PUT /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}/disable` requires `connectors:admin`
+  - `DELETE /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}` requires `connectors:admin`
   - `POST /ingestion/workers/reconcile` requires `connectors:admin`
   - `POST /ingestion/connectors/{connector_id}/ttn-live-validate` requires `connectors:admin`
   - `GET /ingestion/connectors`
@@ -129,14 +134,18 @@ Selected protected endpoints in `token` mode:
   - `GET /ingestion/connectors/{connector_id}/status`
   - `GET /ingestion/connectors/{connector_id}/validate`
   - `GET /ingestion/connectors/{connector_id}/ttn-live-readiness-plan`
+  - `GET /ingestion/connectors/{connector_id}/ttn-device-mappings`
+  - `GET /ingestion/connectors/{connector_id}/ttn-device-mappings/{mapping_id}`
   - `GET /ingestion/workers/plan`
   - `GET /ingestion/workers/status`
   - all require `connectors:read`
 - selected machine ingestion:
+  - `POST /ingest/http` requires `ingestion:write`
   - `POST /ingestion/connectors/{connector_id}/ingest` requires `ingestion:write`
   - `POST /integrations/smartsentinel/snapshots` requires `smartsentinel:ingest`
 - selected adapter operational reads:
   - `GET /adapters` requires `adapters:read`
+  - `GET /adapters/{adapter_id}` requires `adapters:read`
   - `GET /adapters/{adapter_id}/status` requires `adapters:read`
 - API token administration:
   - `POST /auth/tokens`
@@ -150,8 +159,8 @@ Scope behavior in `token` mode:
 - missing or invalid bearer token returns structured `401`
 - valid token without the required scope returns structured `403`
 - `admin:all` satisfies any required scope
-- generic `POST /ingest/http` remains intentionally unprotected in this milestone
-- other endpoints remain unchanged in this milestone
+- broader endpoint coverage remains intentionally partial in this milestone
+- executor catalog/detail/capability/scope reads remain unchanged until a dedicated executor read scope is introduced
 
 Token foundations in this milestone:
 
@@ -283,6 +292,19 @@ $ingestionWriteToken = Invoke-RestMethod `
     scopes = @("ingestion:write")
     metadata = @{ purpose = "connector-aware ingestion" }
   } | ConvertTo-Json -Depth 8)
+
+$adapterReadToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "adapter-read"
+    principal_type = "service"
+    principal_id = "adapter-read"
+    scopes = @("adapters:read")
+    metadata = @{ purpose = "adapter inspection" }
+  } | ConvertTo-Json -Depth 8)
 ```
 
 ```powershell
@@ -313,6 +335,15 @@ Invoke-RestMethod `
     status = "online"
     metadata = @{ source = "heartbeat-demo" }
   } | ConvertTo-Json -Depth 8)
+```
+
+```powershell
+$adapterReadHeaders = @{ Authorization = "Bearer $($adapterReadToken.raw_token)" }
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/adapters/$adapterId" `
+  -Headers $adapterReadHeaders
 ```
 
 ```powershell
@@ -1035,6 +1066,7 @@ $ttnConnector = Invoke-RestMethod `
 $ttnFallbackMapping = Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings" `
+  -Headers @{ Authorization = "Bearer $($connectorAdminToken.raw_token)" } `
   -ContentType "application/json" `
   -Body (@{
     ttn_device_id = "soil-node-01"
@@ -1048,6 +1080,7 @@ $ttnFallbackMapping = Invoke-RestMethod `
 $ttnMapping = Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings" `
+  -Headers @{ Authorization = "Bearer $($connectorAdminToken.raw_token)" } `
   -ContentType "application/json" `
   -Body (@{
     ttn_application_id = "farm-app"
@@ -1061,6 +1094,15 @@ $ttnMapping = Invoke-RestMethod `
 ```
 
 The fallback mapping applies to the connector/device when no application-specific mapping exists. The `farm-app` mapping above can coexist with the fallback and is preferred for uplinks whose TTN `application_id` is `farm-app`.
+
+List mappings with a read-only connector token:
+
+```powershell
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings" `
+  -Headers @{ Authorization = "Bearer $($connectorReadToken.raw_token)" }
+```
 
 Ingest a sample TTN uplink without passing `producer_entity_id`; AionCore resolves it through the application-specific mapping:
 
@@ -1258,6 +1300,7 @@ Update and delete mappings explicitly:
 $updatedMapping = Invoke-RestMethod `
   -Method Patch `
   -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings/$($ttnMapping.id)" `
+  -Headers @{ Authorization = "Bearer $($connectorAdminToken.raw_token)" } `
   -ContentType "application/json" `
   -Body (@{
     enabled = $true
@@ -1268,7 +1311,8 @@ $updatedMapping = Invoke-RestMethod `
 
 Invoke-RestMethod `
   -Method Delete `
-  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings/$($ttnMapping.id)"
+  -Uri "http://localhost:8080/ingestion/connectors/$($ttnConnector.id)/ttn-device-mappings/$($ttnMapping.id)" `
+  -Headers @{ Authorization = "Bearer $($connectorAdminToken.raw_token)" }
 ```
 
 Duplicate enabled mappings for the same connector, device, and application are rejected with a conflict. Duplicate enabled fallback mappings for the same connector/device are also rejected:
@@ -1748,6 +1792,7 @@ $ingest = @{
 Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8080/ingest/http" `
+  -Headers @{ Authorization = "Bearer $($ingestionWriteToken.raw_token)" } `
   -ContentType "application/json" `
   -Body $ingest
 ```
