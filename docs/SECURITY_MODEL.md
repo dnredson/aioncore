@@ -2,7 +2,7 @@
 
 This document defines the authentication and authorization architecture for AionCore APIs while runtime enforcement is being introduced incrementally.
 
-Milestone 50 adds selected endpoint enforcement for machine-facing routes, connector secret administration, and token administration. It still does not broadly enforce authentication across the full API, add login, or validate JWTs.
+Milestone 51 adds connector administration, selected connector operational reads, connector-aware ingestion, SmartSentinel snapshot ingestion, and selected adapter operational-read enforcement on top of the Milestone 50 machine-facing foundation. It still does not broadly enforce authentication across the full API, add login, or validate JWTs.
 
 ## Status
 
@@ -12,10 +12,15 @@ Milestone 50 adds selected endpoint enforcement for machine-facing routes, conne
 - Current selected enforcement in `token` mode:
   - `/auth/tokens*` requires `auth:tokens:admin`
   - `/adapters` registration and heartbeat require adapter scopes
+  - `/adapters` list and `/adapters/{adapter_id}/status` require `adapters:read`
   - `/executors` registration, heartbeat, polling, claim, complete, and fail require executor scopes
+  - `/ingestion/connectors` create/update/enable/disable plus `/ingestion/workers/reconcile` and `/ingestion/connectors/{connector_id}/ttn-live-validate` require `connectors:admin`
+  - `/ingestion/connectors` selected reads plus `/ingestion/workers/plan` and `/ingestion/workers/status` require `connectors:read`
+  - `/ingestion/connectors/{connector_id}/ingest` requires `ingestion:write`
   - `/integrations/smartsentinel/executors/*` register, poll, claim, and report require SmartSentinel executor scopes
+  - `/integrations/smartsentinel/snapshots` requires `smartsentinel:ingest`
   - `/secrets/connectors*` requires `secrets:admin`
-- Unprotected in this milestone: the rest of the API surface, including entities, observations, generic commands, rules, connectors, MCP, and SmartSentinel snapshot ingestion.
+- Unprotected in this milestone: the rest of the API surface, including entities, observations, generic commands, rules, MCP, generic `/ingest/http`, and connector TTN device-mapping management.
 
 ## Security Goals
 
@@ -279,6 +284,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `observations:write`
 - `observations:read`
 - `ingestion:write`
+- `connectors:read`
 - `connectors:admin`
 - `secrets:admin`
 - `commands:read`
@@ -305,7 +311,9 @@ Scopes are additive. Principals should receive the minimum set required for thei
 ### Scope Notes
 
 - `entities:write` covers entity, relationship, capability, and payload-profile mutation unless a later split is needed.
-- `connectors:admin` covers connector lifecycle, worker planning, TTN mappings, validation, enable, disable, and configuration updates.
+- `ingestion:write` now protects connector-aware machine writes at `/ingestion/connectors/{connector_id}/ingest`; generic `/ingest/http` remains deferred.
+- `connectors:read` covers selected connector and worker operational reads without granting mutation.
+- `connectors:admin` covers connector lifecycle mutation, worker reconciliation, TTN live validation preflight, validation-related operator actions, enable/disable, and configuration updates.
 - `commands:read` covers command visibility through generic, executor, and AI-context read paths.
 - `commands:create` covers command creation and approval-oriented write flows may later split into narrower scopes such as `commands:approve`.
 - `commands:claim` and `executors:poll` separate execution workflow from broad command administration.
@@ -443,7 +451,9 @@ The table below describes the intended future protection model. It does not chan
 | `/observations` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` for GET, `observations:write` for POST | Direct write path should remain limited; most machine writers should prefer ingestion endpoints. |
 | `/raw-messages` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` | Sensitive because raw payloads and headers may include operational metadata. |
 | `/ingest/http` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Primary generic ingestion write surface. |
-| `/ingestion/connectors/*` | `UserPrincipal`, `AdminPrincipal`, selected `ConnectorPrincipal` or `ServicePrincipal` for narrow validation flows | `connectors:admin` | Includes connector CRUD, enable/disable, status, validate, TTN mappings, worker plan, and connector-aware ingest unless separated later. |
+| `/ingestion/connectors` POST, PATCH, enable, disable, and `/ingestion/workers/reconcile` | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 51 for selected connector administration and worker reconciliation only. |
+| `/ingestion/connectors` selected GET routes and `/ingestion/workers/plan`, `/ingestion/workers/status` | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:read` | Implemented in Milestone 51 for selected connector and worker operational reads only. TTN device-mapping reads and writes remain outside current enforcement. |
+| `/ingestion/connectors/{connector_id}/ingest` | `ConnectorPrincipal`, `DevicePrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `ingestion:write` | Implemented in Milestone 51. Generic `/ingest/http` remains intentionally unprotected for now. |
 | `/secrets/connectors/*` | `UserPrincipal`, `AdminPrincipal` | `secrets:admin` | Implemented in Milestone 50. Highest sensitivity operator surface. |
 | `/commands/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:create` for creation and approval-like writes, `commands:claim` for claim/release flows, `commands:report` for execution result writes where applicable | Approval may later split into its own scope. |
 | `/actions/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:report` for POST | Action reporting is part of execution audit. |
@@ -452,13 +462,14 @@ The table below describes the intended future protection model. It does not chan
 | `/executors/{executor_id}/commands/pending` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:poll` | Implemented in Milestone 50. Existing executor capability and target-scope matching still applies. |
 | `/executors/{executor_id}/commands/{command_id}/claim` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:claim` | Implemented in Milestone 50. Existing executor capability and target-scope matching still applies. |
 | `/executors/{executor_id}/commands/{command_id}/complete` and `/fail` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:report` | Implemented in Milestone 50. Existing executor capability and target-scope matching still applies. |
-| `/integrations/smartsentinel/snapshots` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:ingest` | Still unprotected in Milestone 50. |
+| `/integrations/smartsentinel/snapshots` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:ingest` | Implemented in Milestone 51. |
 | `/integrations/smartsentinel/executors/register` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:executor_register` | Implemented in Milestone 50. |
 | `/integrations/smartsentinel/executors/{executor_id}/commands` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:executor_poll` | Implemented in Milestone 50. |
 | `/integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/claim` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:executor_claim` | Implemented in Milestone 50. |
 | `/integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/report` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:executor_report` | Implemented in Milestone 50. |
-| `/adapters` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:register` for POST | Implemented in Milestone 50 for `POST /adapters` only. |
+| `/adapters` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:register` for POST, `adapters:read` for GET | Implemented in Milestone 50 for `POST /adapters` and Milestone 51 for `GET /adapters`. |
 | `/adapters/{adapter_id}/heartbeat` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:heartbeat` | Implemented in Milestone 50. |
+| `/adapters/{adapter_id}/status` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:read` | Implemented in Milestone 51. |
 | `/mcp` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Production requires auth and Origin validation. |
 | `/mcp/tools` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Includes tool listing and invocation. |
 | `/ai/context/*` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `entities:read`, `observations:read`, and `commands:read` when command context is included | AI context is read-only but aggregates sensitive data. |
@@ -538,7 +549,7 @@ Protect selected machine-facing routes first because they already represent clea
 
 ### Milestone 51
 
-Protect connector secret endpoints and connector administration APIs, including secret attachment and validation flows.
+Protect connector administration, selected connector and worker operational reads, connector-aware ingestion, TTN live validation preflight, SmartSentinel snapshot ingestion, and selected adapter operational reads without broadly protecting the full API.
 
 ### Milestone 52
 

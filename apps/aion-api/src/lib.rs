@@ -3979,7 +3979,9 @@ async fn register_edge_adapter(
 
 async fn list_edge_adapters(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<EdgeAdapter>>, ApiError> {
+    require_scope(&state, &auth, "/adapters", "adapters:read")?;
     Ok(Json(state.storage.list_edge_adapters(state.tenant_id)?))
 }
 
@@ -4067,8 +4069,15 @@ async fn heartbeat_edge_adapter(
 
 async fn get_edge_adapter_status(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(adapter_id): Path<Uuid>,
 ) -> Result<Json<EdgeAdapterStatusResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/adapters/:adapter_id/status",
+        "adapters:read",
+    )?;
     let adapter = get_edge_adapter_record(&state, adapter_id)?;
     let entity = get_edge_adapter_entity(&state, &adapter)?;
     let status = state
@@ -5356,8 +5365,10 @@ async fn delete_connector_secret(
 
 async fn create_ingestion_connector(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateIngestionConnectorRequest>,
 ) -> Result<(StatusCode, Json<IngestionConnector>), ApiError> {
+    require_scope(&state, &auth, "/ingestion/connectors", "connectors:admin")?;
     ensure_connector_secret_exists(&state, request.secret_ref_id)?;
     let connector = IngestionConnector::new(
         state.tenant_id,
@@ -5394,7 +5405,9 @@ async fn create_ingestion_connector(
 
 async fn list_ingestion_connectors(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<IngestionConnector>>, ApiError> {
+    require_scope(&state, &auth, "/ingestion/connectors", "connectors:read")?;
     Ok(Json(
         state.storage.list_ingestion_connectors(state.tenant_id)?,
     ))
@@ -5402,16 +5415,30 @@ async fn list_ingestion_connectors(
 
 async fn get_ingestion_connector(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
 ) -> Result<Json<IngestionConnector>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id",
+        "connectors:read",
+    )?;
     Ok(Json(get_connector(&state, connector_id)?))
 }
 
 async fn update_ingestion_connector(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
     Json(request): Json<UpdateIngestionConnectorRequest>,
 ) -> Result<Json<IngestionConnector>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id",
+        "connectors:admin",
+    )?;
     let mut connector = get_connector(&state, connector_id)?;
     let now = Utc::now();
 
@@ -5473,8 +5500,15 @@ async fn update_ingestion_connector(
 
 async fn enable_ingestion_connector(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
 ) -> Result<Json<IngestionConnector>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/enable",
+        "connectors:admin",
+    )?;
     let mut connector = get_connector(&state, connector_id)?;
     connector.set_enabled(true, Utc::now());
     let connector = state.storage.update_ingestion_connector(connector)?;
@@ -5490,8 +5524,15 @@ async fn enable_ingestion_connector(
 
 async fn disable_ingestion_connector(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
 ) -> Result<Json<IngestionConnector>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/disable",
+        "connectors:admin",
+    )?;
     let mut connector = get_connector(&state, connector_id)?;
     connector.set_enabled(false, Utc::now());
     let connector = state.storage.update_ingestion_connector(connector)?;
@@ -5507,33 +5548,61 @@ async fn disable_ingestion_connector(
 
 async fn get_ingestion_connector_status(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
 ) -> Result<Json<IngestionConnectorStatusResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/status",
+        "connectors:read",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     Ok(Json(connector_status(&state, &connector)))
 }
 
 async fn validate_ingestion_connector(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
 ) -> Result<Json<TtnConnectorValidation>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/validate",
+        "connectors:read",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     Ok(Json(connector_validation(&state, &connector)?))
 }
 
 async fn get_ttn_live_readiness_plan(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
 ) -> Result<Json<TtnLiveReadinessPlan>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ttn-live-readiness-plan",
+        "connectors:read",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     Ok(Json(ttn_live_readiness_plan(&state, &connector)?))
 }
 
 async fn ttn_live_validate_connector(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
     Json(request): Json<TtnLiveValidationRequest>,
 ) -> Result<Json<TtnLiveValidationResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ttn-live-validate",
+        "connectors:admin",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     if connector.connector_profile != ConnectorProfile::TtnV3 {
         return Err(ApiError::bad_request(
@@ -5722,26 +5791,49 @@ async fn set_ttn_device_mapping_enabled(
 
 async fn get_ingestion_worker_plan(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<IngestionWorkerPlan>, ApiError> {
+    require_scope(&state, &auth, "/ingestion/workers/plan", "connectors:read")?;
     Ok(Json(build_ingestion_worker_plan(&state)?))
 }
 
 async fn get_ingestion_workers_status(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<IngestionWorkersStatusResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/workers/status",
+        "connectors:read",
+    )?;
     Ok(Json(connector_workers_status(&state)?))
 }
 
 async fn reconcile_ingestion_workers(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ReconcileConnectorWorkersResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/workers/reconcile",
+        "connectors:admin",
+    )?;
     reconcile_connector_workers(state, true).await.map(Json)
 }
 
 async fn ingest_smartsentinel_snapshot(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(payload): Json<Value>,
 ) -> Result<(StatusCode, Json<SmartSentinelSnapshotResponse>), ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/integrations/smartsentinel/snapshots",
+        "smartsentinel:ingest",
+    )?;
     let received_at = Utc::now();
     let snapshot_id = payload
         .get("snapshot_id")
@@ -5933,9 +6025,16 @@ async fn ingest_smartsentinel_snapshot(
 
 async fn ingest_http_for_connector(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(connector_id): Path<Uuid>,
     Json(request): Json<ConnectorHttpIngestRequest>,
 ) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ingestion/connectors/:connector_id/ingest",
+        "ingestion:write",
+    )?;
     let connector = get_connector(&state, connector_id)?;
     if !connector.enabled {
         return Err(ApiError::bad_request("ingestion connector is disabled"));
@@ -12082,6 +12181,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dev_mode_allows_connector_create_without_token() {
+        let response = app()
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": "dev-connector-01",
+                    "connector_type": "http",
+                    "connector_profile": "custom",
+                    "enabled": true,
+                    "protocol": "http",
+                    "endpoint": "/ingestion/connectors/{connector_id}/ingest",
+                    "http_path": "/ingestion/connectors/{connector_id}/ingest",
+                    "payload_format": "senml-json",
+                    "content_type": "application/senml+json"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
     async fn disabled_mode_allows_protected_adapter_registration_without_token() {
         let app = disabled_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
         let response = app
@@ -12147,6 +12270,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_mode_rejects_connector_create_without_token() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": "token-connector-01",
+                    "connector_type": "http",
+                    "connector_profile": "custom",
+                    "enabled": true,
+                    "protocol": "http",
+                    "endpoint": "/ingestion/connectors/{connector_id}/ingest",
+                    "http_path": "/ingestion/connectors/{connector_id}/ingest",
+                    "payload_format": "senml-json",
+                    "content_type": "application/senml+json"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_json(response).await;
+        assert!(body["error"].as_str().unwrap().contains("bearer token"));
+    }
+
+    #[tokio::test]
     async fn token_mode_rejects_valid_token_without_required_scope() {
         let storage = Arc::new(InMemoryStorage::new());
         let raw_token = store_api_token(
@@ -12177,6 +12327,74 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("adapters:register"));
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_connector_create_with_valid_token_missing_connectors_admin() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("connector-reader"),
+            &["connectors:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+        let response = app
+            .oneshot(auth_json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": "token-connector-02",
+                    "connector_type": "http",
+                    "connector_profile": "custom",
+                    "enabled": true,
+                    "protocol": "http",
+                    "endpoint": "/ingestion/connectors/{connector_id}/ingest",
+                    "http_path": "/ingestion/connectors/{connector_id}/ingest",
+                    "payload_format": "senml-json",
+                    "content_type": "application/senml+json"
+                }),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_json(response).await;
+        assert!(body["error"].as_str().unwrap().contains("connectors:admin"));
+    }
+
+    #[tokio::test]
+    async fn token_mode_allows_connector_create_with_connectors_admin() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("connector-admin"),
+            &["connectors:admin"],
+        );
+        let app = token_mode_app_with_storage(storage);
+        let response = app
+            .oneshot(auth_json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": "token-connector-03",
+                    "connector_type": "http",
+                    "connector_profile": "custom",
+                    "enabled": true,
+                    "protocol": "http",
+                    "endpoint": "/ingestion/connectors/{connector_id}/ingest",
+                    "http_path": "/ingestion/connectors/{connector_id}/ingest",
+                    "payload_format": "senml-json",
+                    "content_type": "application/senml+json"
+                }),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -12250,6 +12468,296 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn admin_all_allows_connector_administration() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Admin,
+            Some("platform-admin"),
+            &["admin:all"],
+        );
+        let app = token_mode_app_with_storage(storage);
+        let response = app
+            .oneshot(auth_json_request(
+                "POST",
+                "/ingestion/connectors",
+                json!({
+                    "connector_key": "admin-connector-01",
+                    "connector_type": "http",
+                    "connector_profile": "custom",
+                    "enabled": true,
+                    "protocol": "http",
+                    "endpoint": "/ingestion/connectors/{connector_id}/ingest",
+                    "http_path": "/ingestion/connectors/{connector_id}/ingest",
+                    "payload_format": "senml-json",
+                    "content_type": "application/senml+json"
+                }),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_allows_connector_read_with_connectors_read() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let connector = create_http_connector(&dev_app, "connector-read-01", None, None).await;
+        let connector_id = connector["id"].as_str().unwrap();
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("connector-reader"),
+            &["connectors:read"],
+        );
+
+        let listed = token_app
+            .clone()
+            .oneshot(auth_request("GET", "/ingestion/connectors", &raw_token))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+
+        let fetched = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/ingestion/connectors/{connector_id}"),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+
+        let status = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/ingestion/connectors/{connector_id}/status"),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+
+        let plan = token_app
+            .oneshot(auth_request("GET", "/ingestion/workers/plan", &raw_token))
+            .await
+            .unwrap();
+        assert_eq!(plan.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn connector_aware_ingestion_requires_ingestion_write() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let sensor_id =
+            create_test_entity(&dev_app, "connector-ingest-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "connector-ingest-plot-01", "aion:Plot").await;
+        let connector = create_http_connector(
+            &dev_app,
+            "connector-ingest-01",
+            Some(&sensor_id),
+            Some(&plot_id),
+        )
+        .await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let denied = token_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": [
+                        {
+                            "bn": "urn:aion:test:connector-ingest:",
+                            "n": "soil_moisture",
+                            "u": "%",
+                            "v": 18.5
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Connector,
+            Some("connector-ingest-01"),
+            &["ingestion:write"],
+        );
+        let allowed = token_app
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ingest"),
+                json!({
+                    "payload": [
+                        {
+                            "bn": "urn:aion:test:connector-ingest:",
+                            "n": "soil_moisture",
+                            "u": "%",
+                            "v": 18.5
+                        }
+                    ]
+                }),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn ttn_live_validation_requires_connectors_admin() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&dev_app, "ttn-live-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "ttn-live-plot-01", "aion:Plot").await;
+        let connector =
+            create_ttn_connector(&dev_app, "ttn-live-auth-01", &sensor_id, &plot_id).await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let denied = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ttn-live-validate"),
+                json!({}),
+                &store_api_token(
+                    &storage,
+                    ApiTokenPrincipalType::Service,
+                    Some("ttn-live-reader"),
+                    &["connectors:read"],
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("ttn-live-admin"),
+            &["connectors:admin"],
+        );
+        let allowed = token_app
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/ingestion/connectors/{connector_id}/ttn-live-validate"),
+                json!({}),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_snapshot_ingestion_requires_smartsentinel_ingest() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let token_app = token_mode_app_with_storage(storage.clone());
+
+        let denied = token_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_sample_snapshot(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("smartsentinel-ingest"),
+            &["smartsentinel:ingest"],
+        );
+        let allowed = token_app
+            .oneshot(auth_json_request(
+                "POST",
+                "/integrations/smartsentinel/snapshots",
+                smartsentinel_sample_snapshot(),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn adapter_status_reads_require_adapters_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let adapter = dev_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": "adapter-read-01",
+                    "display_name": "Adapter Read 01",
+                    "adapter_type": "edge",
+                    "status": "online"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(adapter.status(), StatusCode::CREATED);
+        let adapter = to_json(adapter).await;
+        let adapter_id = adapter["adapter"]["id"].as_str().unwrap();
+
+        let denied = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/adapters/{adapter_id}/status"),
+                &store_api_token(
+                    &storage,
+                    ApiTokenPrincipalType::Service,
+                    Some("adapter-heartbeat-only"),
+                    &["adapters:heartbeat"],
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("adapter-reader"),
+            &["adapters:read"],
+        );
+        let listed = token_app
+            .clone()
+            .oneshot(auth_request("GET", "/adapters", &raw_token))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+
+        let status = token_app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/adapters/{adapter_id}/status"),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -12475,8 +12983,14 @@ mod tests {
 
     #[tokio::test]
     async fn unprotected_endpoints_still_work_in_token_mode_without_token() {
-        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
-        let response = app
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let app = token_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&dev_app, "token-open-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "token-open-plot-01", "aion:Plot").await;
+
+        let entities = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/entities")
@@ -12485,10 +12999,32 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(entities.status(), StatusCode::OK);
+        assert_eq!(to_json(entities).await.as_array().unwrap().len(), 2);
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_json(response).await;
-        assert_eq!(body, json!([]));
+        let ingest = app
+            .oneshot(json_request(
+                "POST",
+                "/ingest/http",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "senml-json",
+                    "protocol": "http",
+                    "content_type": "application/senml+json",
+                    "payload": [
+                        {
+                            "bn": "urn:aion:test:open-ingest:",
+                            "n": "soil_moisture",
+                            "u": "%",
+                            "v": 21.0
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ingest.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]

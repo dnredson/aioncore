@@ -75,7 +75,7 @@ The PostgreSQL and TimescaleDB migration foundation now covers the current in-me
 
 AionCore still defaults to unauthenticated local development with `AIONCORE_AUTH_MODE=dev`. This is acceptable for local development and tests only, not for public or production exposure.
 
-Milestone 50 starts selective token enforcement for sensitive machine-facing endpoints in `token` mode. It does not broadly protect the entire API yet.
+Milestone 51 extends selective token enforcement for sensitive machine-facing endpoints in `token` mode, including connector administration, selected connector reads, connector-aware ingestion, SmartSentinel snapshot ingestion, and selected adapter operational reads. It does not broadly protect the entire API yet.
 
 Local development warning:
 
@@ -83,7 +83,7 @@ Local development warning:
 - do not expose `/mcp`, `/mcp/tools`, or `/ai/context/*` publicly
 - do not treat current connector-secret redaction as a complete production security model
 
-The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md), and [ADR 0047](docs/ADR/0047-selected-machine-endpoint-auth-enforcement.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, selective machine-principal protection, connector-secret protection, and later MCP hardening.
+The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md), [ADR 0047](docs/ADR/0047-selected-machine-endpoint-auth-enforcement.md), and [ADR 0048](docs/ADR/0048-connector-and-ingestion-auth-enforcement.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, selective machine-principal protection, connector and ingestion enforcement, connector-secret protection, and later MCP hardening.
 
 The auth-mode environment variable is:
 
@@ -117,6 +117,27 @@ Selected protected endpoints in `token` mode:
   - `GET /secrets/connectors/{secret_id}`
   - `DELETE /secrets/connectors/{secret_id}`
   - all require `secrets:admin`
+- connector administration and selected operational reads:
+  - `POST /ingestion/connectors` requires `connectors:admin`
+  - `PATCH /ingestion/connectors/{connector_id}` requires `connectors:admin`
+  - `PUT /ingestion/connectors/{connector_id}/enable` requires `connectors:admin`
+  - `PUT /ingestion/connectors/{connector_id}/disable` requires `connectors:admin`
+  - `POST /ingestion/workers/reconcile` requires `connectors:admin`
+  - `POST /ingestion/connectors/{connector_id}/ttn-live-validate` requires `connectors:admin`
+  - `GET /ingestion/connectors`
+  - `GET /ingestion/connectors/{connector_id}`
+  - `GET /ingestion/connectors/{connector_id}/status`
+  - `GET /ingestion/connectors/{connector_id}/validate`
+  - `GET /ingestion/connectors/{connector_id}/ttn-live-readiness-plan`
+  - `GET /ingestion/workers/plan`
+  - `GET /ingestion/workers/status`
+  - all require `connectors:read`
+- selected machine ingestion:
+  - `POST /ingestion/connectors/{connector_id}/ingest` requires `ingestion:write`
+  - `POST /integrations/smartsentinel/snapshots` requires `smartsentinel:ingest`
+- selected adapter operational reads:
+  - `GET /adapters` requires `adapters:read`
+  - `GET /adapters/{adapter_id}/status` requires `adapters:read`
 - API token administration:
   - `POST /auth/tokens`
   - `GET /auth/tokens`
@@ -129,6 +150,7 @@ Scope behavior in `token` mode:
 - missing or invalid bearer token returns structured `401`
 - valid token without the required scope returns structured `403`
 - `admin:all` satisfies any required scope
+- generic `POST /ingest/http` remains intentionally unprotected in this milestone
 - other endpoints remain unchanged in this milestone
 
 Token foundations in this milestone:
@@ -223,6 +245,47 @@ $adapterToken = Invoke-RestMethod `
 ```
 
 ```powershell
+$connectorAdminToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "connector-admin"
+    principal_type = "service"
+    principal_id = "connector-admin"
+    scopes = @("connectors:admin")
+    metadata = @{ purpose = "connector administration" }
+  } | ConvertTo-Json -Depth 8)
+
+$connectorReadToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "connector-read"
+    principal_type = "service"
+    principal_id = "connector-read"
+    scopes = @("connectors:read")
+    metadata = @{ purpose = "connector inspection" }
+  } | ConvertTo-Json -Depth 8)
+
+$ingestionWriteToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "connector-ingest"
+    principal_type = "connector"
+    principal_id = "field-http-01"
+    scopes = @("ingestion:write")
+    metadata = @{ purpose = "connector-aware ingestion" }
+  } | ConvertTo-Json -Depth 8)
+```
+
+```powershell
 $headers = @{ Authorization = "Bearer $($adapterToken.raw_token)" }
 
 $adapterRegistration = Invoke-RestMethod `
@@ -257,6 +320,54 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/auth/whoami" -Headers 
 ```
 
 ```powershell
+$connectorAdminHeaders = @{ Authorization = "Bearer $($connectorAdminToken.raw_token)" }
+$connectorReadHeaders = @{ Authorization = "Bearer $($connectorReadToken.raw_token)" }
+$ingestionHeaders = @{ Authorization = "Bearer $($ingestionWriteToken.raw_token)" }
+
+$connectorCreateBody = @{
+  connector_key = "field-http-01"
+  connector_type = "http"
+  connector_profile = "custom"
+  enabled = $true
+  protocol = "http"
+  endpoint = "/ingestion/connectors/{connector_id}/ingest"
+  http_path = "/ingestion/connectors/{connector_id}/ingest"
+  payload_format = "senml-json"
+  content_type = "application/senml+json"
+} | ConvertTo-Json -Depth 8
+
+$createdConnector = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors" `
+  -Headers $connectorAdminHeaders `
+  -ContentType "application/json" `
+  -Body $connectorCreateBody
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ingestion/connectors/$($createdConnector.id)" `
+  -Headers $connectorReadHeaders
+```
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors/$($createdConnector.id)/ingest" `
+  -Headers $ingestionHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    payload = @(
+      @{
+        bn = "urn:aion:farm:01:soil-sensor:01:"
+        n = "soil_moisture"
+        u = "%"
+        v = 19.4
+      }
+    )
+  } | ConvertTo-Json -Depth 8)
+```
+
+```powershell
 Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8080/auth/tokens/$($tokenResponse.token.id)/revoke" `
@@ -279,6 +390,30 @@ try {
       adapter_type = "edge"
       status = "online"
     } | ConvertTo-Json -Depth 8)
+} catch {
+  ($_.ErrorDetails.Message | ConvertFrom-Json).error
+}
+```
+
+```powershell
+$connectorBody = @{
+  connector_key = "missing-token-connector"
+  connector_type = "http"
+  connector_profile = "custom"
+  enabled = $true
+  protocol = "http"
+  endpoint = "/ingestion/connectors/{connector_id}/ingest"
+  http_path = "/ingestion/connectors/{connector_id}/ingest"
+  payload_format = "senml-json"
+  content_type = "application/senml+json"
+} | ConvertTo-Json -Depth 8
+
+try {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/ingestion/connectors" `
+    -ContentType "application/json" `
+    -Body $connectorBody
 } catch {
   ($_.ErrorDetails.Message | ConvertFrom-Json).error
 }
@@ -308,6 +443,19 @@ try {
       adapter_type = "edge"
       status = "online"
     } | ConvertTo-Json -Depth 8)
+} catch {
+  ($_.ErrorDetails.Message | ConvertFrom-Json).error
+}
+```
+
+```powershell
+try {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/ingestion/connectors" `
+    -Headers @{ Authorization = "Bearer $($wrongScopeToken.raw_token)" } `
+    -ContentType "application/json" `
+    -Body $connectorBody
 } catch {
   ($_.ErrorDetails.Message | ConvertFrom-Json).error
 }
