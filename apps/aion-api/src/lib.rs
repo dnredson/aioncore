@@ -26,7 +26,7 @@ use axum::{
     extract::{Extension, Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::Response,
     routing::{get, post, put},
     Json, Router,
 };
@@ -44,6 +44,7 @@ use tokio::time;
 use uuid::Uuid;
 
 mod auth;
+mod error;
 mod mqtt_ingest;
 
 #[cfg(test)]
@@ -55,6 +56,7 @@ use auth::{
     resolve_auth_context, tenant_for_created_resource, AuthContext, TokenRejectionReason,
 };
 pub use auth::{AuthConfig, AuthEnforcementLevel, AuthMode, PrincipalType};
+use error::ApiError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageBackendName {
@@ -608,7 +610,7 @@ pub struct SmartSentinelSkippedItem {
 }
 
 #[derive(Debug, Clone)]
-struct SmartSentinelValidationReport {
+pub(crate) struct SmartSentinelValidationReport {
     warnings: Vec<SmartSentinelValidationIssue>,
     errors: Vec<SmartSentinelValidationIssue>,
     skipped_items: Vec<SmartSentinelSkippedItem>,
@@ -1502,17 +1504,6 @@ pub struct ProvenanceSearchCounts {
     pub matching_events: usize,
     pub matching_raw_messages: usize,
     pub matching_observations: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    validation_errors: Vec<SmartSentinelValidationIssue>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    validation_warnings: Vec<SmartSentinelValidationIssue>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    skipped_items: Vec<SmartSentinelSkippedItem>,
 }
 
 const DEFAULT_COMMAND_LEASE_SECONDS: i64 = 60;
@@ -12397,115 +12388,6 @@ fn empty_object() -> Value {
 
 fn default_true() -> bool {
     true
-}
-
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    message: String,
-    validation_errors: Vec<SmartSentinelValidationIssue>,
-    validation_warnings: Vec<SmartSentinelValidationIssue>,
-    skipped_items: Vec<SmartSentinelSkippedItem>,
-}
-
-impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            skipped_items: Vec::new(),
-        }
-    }
-
-    fn unauthorized(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: message.into(),
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            skipped_items: Vec::new(),
-        }
-    }
-
-    fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: message.into(),
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            skipped_items: Vec::new(),
-        }
-    }
-
-    fn smartsentinel_validation(
-        message: impl Into<String>,
-        report: SmartSentinelValidationReport,
-    ) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-            validation_errors: report.errors,
-            validation_warnings: report.warnings,
-            skipped_items: report.skipped_items,
-        }
-    }
-
-    fn not_found() -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: "record was not found".to_string(),
-            validation_errors: Vec::new(),
-            validation_warnings: Vec::new(),
-            skipped_items: Vec::new(),
-        }
-    }
-}
-
-impl From<StorageError> for ApiError {
-    fn from(value: StorageError) -> Self {
-        match value {
-            StorageError::NotFound => Self::not_found(),
-            StorageError::Conflict => Self {
-                status: StatusCode::CONFLICT,
-                message: value.to_string(),
-                validation_errors: Vec::new(),
-                validation_warnings: Vec::new(),
-                skipped_items: Vec::new(),
-            },
-            StorageError::ConflictWithMessage(message) => Self {
-                status: StatusCode::CONFLICT,
-                message,
-                validation_errors: Vec::new(),
-                validation_warnings: Vec::new(),
-                skipped_items: Vec::new(),
-            },
-            StorageError::InvalidInput(message) => Self::bad_request(message),
-            StorageError::Backend(message) => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message,
-                validation_errors: Vec::new(),
-                validation_warnings: Vec::new(),
-                skipped_items: Vec::new(),
-            },
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(ErrorResponse {
-                error: self.message,
-                validation_errors: self.validation_errors,
-                validation_warnings: self.validation_warnings,
-                skipped_items: self.skipped_items,
-            }),
-        )
-            .into_response()
-    }
 }
 
 #[cfg(test)]

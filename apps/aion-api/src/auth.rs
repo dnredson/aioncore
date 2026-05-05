@@ -1,7 +1,7 @@
 use crate::{
-    record_auth_access_denied_event, record_auth_scope_denied_event,
+    error::ApiError, record_auth_access_denied_event, record_auth_scope_denied_event,
     record_auth_token_accepted_event, record_token_rejected_event, record_token_used_event,
-    ApiError, ApiTokenRecordResponse, AppState, StartupError,
+    ApiTokenRecordResponse, AppState, StartupError,
 };
 use aion_storage::{ApiToken, ApiTokenPrincipalType};
 use axum::{extract::Request, http::header};

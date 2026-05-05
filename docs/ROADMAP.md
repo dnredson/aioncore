@@ -23,12 +23,13 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 59 documentation consistency pass: usage guides, model docs, roadmap references, and documentation navigation now use normalized cross-links and terminology.
 - Milestone 60 auth hardening: selected token mode write paths now enforce explicit write scopes plus first-pass tenant-aware create/update checks without cross-tenant sharing.
 - Milestone 61 modularization foundation: `apps/aion-api/src/lib.rs` now begins a staged split by extracting cohesive auth code into `src/auth.rs` while preserving runtime behavior and deferring route-level refactors.
+- Milestone 62 modularization foundation: `apps/aion-api/src/lib.rs` now extracts shared API error and response primitives into `src/error.rs` so later route modules can reuse stable HTTP failure behavior without changing endpoint semantics.
 
 ## Next
 
-1. Milestone 62: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
-2. Milestone 63: review whether remaining open write surfaces should split into narrower operator and machine scopes.
-3. Milestone 64: continue `aion-api` route-level modularization by splitting handlers and DTOs into cohesive domain modules without changing endpoint behavior.
+1. Milestone 63: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+2. Milestone 64: review whether remaining open write surfaces should split into narrower operator and machine scopes.
+3. Milestone 65: continue `aion-api` route-level modularization by splitting handlers and DTOs into cohesive domain modules without changing endpoint behavior.
 
 ## Future
 
@@ -42,4 +43,4 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 
 - The roadmap is intentionally concise. Canonical details live in the individual model docs and ADRs.
 - Security hardening remains staged after the current selected write-surface rollout to avoid overreaching beyond verified behavior in one milestone.
-- `aion-api` modularization is intentionally incremental; the auth extraction in Milestone 61 establishes the first safe pattern for later route-level splits.
+- `aion-api` modularization is intentionally incremental; Milestones 61 and 62 establish safe extraction patterns for later route-level splits.
