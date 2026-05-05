@@ -75,13 +75,34 @@ The PostgreSQL and TimescaleDB migration foundation now covers the current in-me
 
 Most current AionCore APIs are unauthenticated. This is acceptable for local development and tests only, not for public or production exposure.
 
+Milestone 49 adds API token issuance, hashing, storage, bearer-token principal resolution, and `/auth/whoami`, but it still does not broadly enforce authentication on existing endpoints.
+
 Local development warning:
 
 - run the API on trusted local networks only
 - do not expose `/mcp`, `/mcp/tools`, or `/ai/context/*` publicly
 - do not treat current connector-secret redaction as a complete production security model
 
-The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md) and [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, machine-principal protection for adapters and executors, connector-secret protection, and MCP hardening.
+The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), and [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, machine-principal protection for adapters and executors, connector-secret protection, and MCP hardening.
+
+The auth-mode environment variable is:
+
+- `AIONCORE_AUTH_MODE=dev|disabled|token`
+
+Current mode behavior:
+
+- `dev`: default when unset; auth middleware is installed, requests are allowed through, and development bypass is reported in readiness.
+- `disabled`: auth is explicitly disabled; requests are still allowed through.
+- `token`: bearer-token parsing and principal resolution are active, but broad endpoint protection is still not enforced in this milestone.
+
+Token foundations in this milestone:
+
+- `POST /auth/tokens` issues opaque API tokens bound to a tenant, principal type, optional principal ID, and scopes.
+- Raw token values are returned only once at creation time.
+- Stored records keep only a token hash plus a short token prefix for lookup and display.
+- `GET /auth/tokens` and `GET /auth/tokens/{token_id}` never return `raw_token` or `token_hash`.
+- `GET /auth/whoami` reports the current auth mode and resolved principal.
+- Broad endpoint authorization is deferred to Milestone 50.
 
 ## Run Locally Without Docker
 
@@ -105,17 +126,55 @@ The backend selection variables are:
 
 - `AIONCORE_STORAGE_BACKEND=memory|postgres`
 - `AIONCORE_DATABASE_URL` when `AIONCORE_STORAGE_BACKEND=postgres`
+- `AIONCORE_AUTH_MODE=dev|disabled|token`
 
-If `AIONCORE_STORAGE_BACKEND` is unset, the API uses memory.
+If `AIONCORE_STORAGE_BACKEND` is unset, the API uses memory. If `AIONCORE_AUTH_MODE` is unset, the API uses `dev`.
 
 Health and readiness:
 
 ```powershell
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/health"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/auth/whoami"
 ```
 
-`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` checks storage and MQTT readiness. In memory mode storage returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable. When MQTT is disabled, `/ready` still succeeds and reports `mqtt.enabled = false`. Connector workers are also disabled by default and reported under `connector_workers.enabled = false`.
+`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` checks storage and MQTT readiness. In memory mode storage returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable. When MQTT is disabled, `/ready` still succeeds and reports `mqtt.enabled = false`. Connector workers are also disabled by default and reported under `connector_workers.enabled = false`. The readiness response now also reports `auth.mode`, `auth.enforced`, and `auth.dev_bypass`.
+
+API token examples:
+
+```powershell
+$tokenResponse = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "local-service"
+    principal_type = "service"
+    principal_id = "local-service"
+    scopes = @("entities:read", "observations:read")
+    metadata = @{ purpose = "local bootstrap" }
+  } | ConvertTo-Json -Depth 8)
+
+$tokenResponse.raw_token
+```
+
+The `raw_token` value is shown only once. AionCore stores only its hash and token prefix.
+
+```powershell
+$headers = @{ Authorization = "Bearer $($tokenResponse.raw_token)" }
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/auth/whoami" -Headers $headers
+```
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens/$($tokenResponse.token.id)/revoke" `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body "{}"
+```
+
+In this milestone, token issuance and revocation exist as foundation work, but scope enforcement on the rest of the API comes later.
 
 MQTT ingestion is optional and remains disabled unless you enable it explicitly:
 

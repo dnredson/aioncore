@@ -215,6 +215,57 @@ fn row_to_connector_secret(row: Row) -> StorageResult<ConnectorSecret> {
     })
 }
 
+fn api_token_principal_type_to_db(principal_type: &ApiTokenPrincipalType) -> &'static str {
+    match principal_type {
+        ApiTokenPrincipalType::User => "user",
+        ApiTokenPrincipalType::Device => "device",
+        ApiTokenPrincipalType::Adapter => "adapter",
+        ApiTokenPrincipalType::Executor => "executor",
+        ApiTokenPrincipalType::Connector => "connector",
+        ApiTokenPrincipalType::Service => "service",
+        ApiTokenPrincipalType::Admin => "admin",
+    }
+}
+
+fn api_token_principal_type_from_db(value: String) -> StorageResult<ApiTokenPrincipalType> {
+    match value.as_str() {
+        "user" => Ok(ApiTokenPrincipalType::User),
+        "device" => Ok(ApiTokenPrincipalType::Device),
+        "adapter" => Ok(ApiTokenPrincipalType::Adapter),
+        "executor" => Ok(ApiTokenPrincipalType::Executor),
+        "connector" => Ok(ApiTokenPrincipalType::Connector),
+        "service" => Ok(ApiTokenPrincipalType::Service),
+        "admin" => Ok(ApiTokenPrincipalType::Admin),
+        other => Err(StorageError::Backend(format!(
+            "unknown api token principal type in database: {other}"
+        ))),
+    }
+}
+
+fn row_to_api_token(row: Row) -> StorageResult<ApiToken> {
+    let Json(scopes) = row.get::<_, Json<Value>>("scopes");
+    let scopes = serde_json::from_value::<Vec<String>>(scopes)
+        .map_err(|err| StorageError::Backend(format!("invalid api token scopes: {err}")))?;
+    Ok(ApiToken {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        token_name: row.get("token_name"),
+        token_prefix: row.get("token_prefix"),
+        token_hash: row.get("token_hash"),
+        principal_type: api_token_principal_type_from_db(row.get::<_, String>("principal_type"))?,
+        principal_id: row.get("principal_id"),
+        scopes,
+        expires_at: row.get("expires_at"),
+        revoked_at: row.get("revoked_at"),
+        last_used_at: row.get("last_used_at"),
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 fn row_to_ttn_device_mapping(row: Row) -> TtnDeviceMapping {
     TtnDeviceMapping {
         id: row.get("id"),
@@ -2564,6 +2615,157 @@ impl ConnectorSecretStore for PostgresStorage {
     }
 }
 
+impl ApiTokenStore for PostgresStorage {
+    fn create_api_token(&self, token: ApiToken) -> StorageResult<ApiToken> {
+        self.with_client(|client| {
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO api_tokens (
+                        id, tenant_id, token_name, token_prefix, token_hash, principal_type,
+                        principal_id, scopes, expires_at, revoked_at, last_used_at, metadata,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    RETURNING id, tenant_id, token_name, token_prefix, token_hash, principal_type,
+                        principal_id, scopes, expires_at, revoked_at, last_used_at, metadata,
+                        created_at, updated_at
+                    ",
+                    &[
+                        &token.id,
+                        &token.tenant_id,
+                        &token.token_name,
+                        &token.token_prefix,
+                        &token.token_hash,
+                        &api_token_principal_type_to_db(&token.principal_type),
+                        &token.principal_id,
+                        &json_serializable(&token.scopes)?,
+                        &token.expires_at,
+                        &token.revoked_at,
+                        &token.last_used_at,
+                        &json_option_column(token.metadata.as_ref()),
+                        &token.created_at,
+                        &token.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row_to_api_token(row)
+        })
+    }
+
+    fn get_api_token(&self, tenant_id: Uuid, token_id: Uuid) -> StorageResult<Option<ApiToken>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, token_name, token_prefix, token_hash, principal_type,
+                        principal_id, scopes, expires_at, revoked_at, last_used_at, metadata,
+                        created_at, updated_at
+                    FROM api_tokens
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &token_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_api_token).transpose()
+        })
+    }
+
+    fn list_api_tokens(&self, tenant_id: Uuid) -> StorageResult<Vec<ApiToken>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, token_name, token_prefix, token_hash, principal_type,
+                        principal_id, scopes, expires_at, revoked_at, last_used_at, metadata,
+                        created_at, updated_at
+                    FROM api_tokens
+                    WHERE tenant_id = $1
+                    ORDER BY token_name ASC, created_at ASC
+                    ",
+                    &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_api_token)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn find_api_token_by_prefix(
+        &self,
+        tenant_id: Uuid,
+        token_prefix: &str,
+    ) -> StorageResult<Option<ApiToken>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, token_name, token_prefix, token_hash, principal_type,
+                        principal_id, scopes, expires_at, revoked_at, last_used_at, metadata,
+                        created_at, updated_at
+                    FROM api_tokens
+                    WHERE tenant_id = $1 AND token_prefix = $2
+                    ",
+                    &[&tenant_id, &token_prefix],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_api_token).transpose()
+        })
+    }
+
+    fn update_api_token_last_used_at(
+        &self,
+        tenant_id: Uuid,
+        token_id: Uuid,
+        last_used_at: DateTime<Utc>,
+    ) -> StorageResult<ApiToken> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE api_tokens
+                    SET last_used_at = $3, updated_at = $3
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING id, tenant_id, token_name, token_prefix, token_hash, principal_type,
+                        principal_id, scopes, expires_at, revoked_at, last_used_at, metadata,
+                        created_at, updated_at
+                    ",
+                    &[&tenant_id, &token_id, &last_used_at],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_api_token)
+                .transpose()?
+                .ok_or(StorageError::NotFound)
+        })
+    }
+
+    fn revoke_api_token(
+        &self,
+        tenant_id: Uuid,
+        token_id: Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> StorageResult<ApiToken> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE api_tokens
+                    SET revoked_at = $3, updated_at = $3
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING id, tenant_id, token_name, token_prefix, token_hash, principal_type,
+                        principal_id, scopes, expires_at, revoked_at, last_used_at, metadata,
+                        created_at, updated_at
+                    ",
+                    &[&tenant_id, &token_id, &revoked_at],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_api_token)
+                .transpose()?
+                .ok_or(StorageError::NotFound)
+        })
+    }
+}
+
 impl TtnDeviceMappingStore for PostgresStorage {
     fn create_ttn_device_mapping(
         &self,
@@ -3553,6 +3755,22 @@ mod tests {
         .expect("valid connector secret")
     }
 
+    fn build_api_token(tenant_id: Uuid, suffix: &str) -> ApiToken {
+        ApiToken::new(
+            tenant_id,
+            format!("api-token-{suffix}"),
+            format!("prefix-{suffix}"),
+            format!("hash-{suffix}"),
+            ApiTokenPrincipalType::Service,
+            Some(format!("service-{suffix}")),
+            vec!["entities:read".to_string(), "observations:read".to_string()],
+            None,
+            Some(json!({"suite": "postgres", "suffix": suffix})),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
+        )
+        .expect("valid api token")
+    }
+
     fn build_ttn_device_mapping(
         tenant_id: Uuid,
         connector_id: Uuid,
@@ -3783,6 +4001,60 @@ mod tests {
                     .expect("missing edge adapter status"),
                 status
             );
+        }
+    }
+
+    #[test]
+    fn postgres_api_token_parity() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+        let token = build_api_token(tenant.id, &suffix);
+        let now = Utc.with_ymd_and_hms(2026, 4, 27, 12, 30, 0).unwrap();
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store
+                .create_tenant(tenant.clone())
+                .expect("failed to create tenant");
+        }
+
+        for store in [&in_memory as &dyn ApiTokenStore, &pg as &dyn ApiTokenStore] {
+            assert_eq!(
+                store
+                    .create_api_token(token.clone())
+                    .expect("create api token"),
+                token
+            );
+            assert_eq!(
+                store
+                    .get_api_token(tenant.id, token.id)
+                    .expect("get api token")
+                    .expect("missing api token"),
+                token
+            );
+            assert_eq!(
+                store
+                    .find_api_token_by_prefix(tenant.id, &token.token_prefix)
+                    .expect("find api token by prefix")
+                    .expect("missing api token by prefix"),
+                token
+            );
+
+            let listed = store.list_api_tokens(tenant.id).expect("list api tokens");
+            assert!(listed.iter().any(|entry| entry.id == token.id));
+
+            let used = store
+                .update_api_token_last_used_at(tenant.id, token.id, now)
+                .expect("update api token last_used_at");
+            assert_eq!(used.last_used_at, Some(now));
+
+            let revoked = store
+                .revoke_api_token(tenant.id, token.id, now)
+                .expect("revoke api token");
+            assert_eq!(revoked.revoked_at, Some(now));
         }
     }
 

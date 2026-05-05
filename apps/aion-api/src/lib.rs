@@ -15,14 +15,15 @@ use aion_raw_message::{NormalizationStatus, RawMessage, RawMessageSource};
 use aion_relationship::Relationship;
 use aion_rule::{Rule, RuleAction, RuleCondition, RuleEvaluationResult, RuleTriggerType};
 use aion_storage::{
-    ConnectorProfile, ConnectorSecret, ConnectorSecretType, EventFilter, InMemoryStorage,
-    IngestionConnector, IngestionConnectorType, PayloadProfile, PostgresStorage,
-    PostgresStorageConfig, StorageBackend, StorageError, TtnDeviceMapping,
+    ApiToken, ApiTokenPrincipalType, ConnectorProfile, ConnectorSecret, ConnectorSecretType,
+    EventFilter, InMemoryStorage, IngestionConnector, IngestionConnectorType, PayloadProfile,
+    PostgresStorage, PostgresStorageConfig, StorageBackend, StorageError, TtnDeviceMapping,
 };
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Extension, Path, Query, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
@@ -30,6 +31,7 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -37,6 +39,7 @@ use std::{
     sync::{Arc, RwLock},
     time::Instant,
 };
+use subtle::ConstantTimeEq;
 use tokio::time;
 use uuid::Uuid;
 
@@ -53,6 +56,156 @@ impl StorageBackendName {
         match self {
             Self::Memory => "memory",
             Self::Postgres => "postgres",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    Dev,
+    Disabled,
+    Token,
+}
+
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Disabled => "disabled",
+            Self::Token => "token",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthConfig {
+    pub mode: AuthMode,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthMode::Dev,
+        }
+    }
+}
+
+impl AuthConfig {
+    pub fn from_env() -> Result<Self, StartupError> {
+        Self::from_env_vars(env::var("AIONCORE_AUTH_MODE").ok())
+    }
+
+    pub fn from_env_vars(mode: Option<String>) -> Result<Self, StartupError> {
+        match mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            None => Ok(Self::default()),
+            Some("dev") => Ok(Self {
+                mode: AuthMode::Dev,
+            }),
+            Some("disabled") => Ok(Self {
+                mode: AuthMode::Disabled,
+            }),
+            Some("token") => Ok(Self {
+                mode: AuthMode::Token,
+            }),
+            Some(other) => Err(StartupError::unknown_auth_mode(other.to_string())),
+        }
+    }
+
+    pub fn enforced(&self) -> bool {
+        false
+    }
+
+    pub fn dev_bypass(&self) -> bool {
+        matches!(self.mode, AuthMode::Dev)
+    }
+
+    pub fn ensure_supported(&self) -> Result<(), StartupError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalType {
+    Anonymous,
+    User,
+    Device,
+    Adapter,
+    Executor,
+    Connector,
+    Service,
+    Admin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Principal {
+    pub principal_type: PrincipalType,
+    pub principal_id: Option<String>,
+    pub tenant_id: Option<Uuid>,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthContext {
+    pub mode: AuthMode,
+    pub enforced: bool,
+    pub dev_bypass: bool,
+    pub authenticated: bool,
+    pub auth_valid: bool,
+    pub token_id: Option<Uuid>,
+    pub principal: Principal,
+}
+
+impl AuthContext {
+    fn from_config(config: &AuthConfig) -> Self {
+        let principal_id = match config.mode {
+            AuthMode::Dev => Some("dev-bypass".to_string()),
+            AuthMode::Disabled => Some("auth-disabled".to_string()),
+            AuthMode::Token => Some("token-anonymous".to_string()),
+        };
+
+        Self {
+            mode: config.mode,
+            enforced: config.enforced(),
+            dev_bypass: config.dev_bypass(),
+            authenticated: false,
+            auth_valid: false,
+            token_id: None,
+            principal: Principal {
+                principal_type: PrincipalType::Anonymous,
+                principal_id,
+                tenant_id: None,
+                scopes: Vec::new(),
+            },
+        }
+    }
+
+    fn authenticated_token(
+        config: &AuthConfig,
+        token_id: Uuid,
+        principal_type: PrincipalType,
+        principal_id: Option<String>,
+        tenant_id: Uuid,
+        scopes: Vec<String>,
+    ) -> Self {
+        Self {
+            mode: config.mode,
+            enforced: config.enforced(),
+            dev_bypass: config.dev_bypass(),
+            authenticated: true,
+            auth_valid: true,
+            token_id: Some(token_id),
+            principal: Principal {
+                principal_type,
+                principal_id,
+                tenant_id: Some(tenant_id),
+                scopes,
+            },
         }
     }
 }
@@ -125,6 +278,12 @@ impl StartupError {
         Self::new("AIONCORE_DATABASE_URL is required when AIONCORE_STORAGE_BACKEND=postgres")
     }
 
+    fn unknown_auth_mode(value: String) -> Self {
+        Self::new(format!(
+            "unknown AIONCORE_AUTH_MODE value '{value}'; expected dev, disabled, or token"
+        ))
+    }
+
     fn backend_initialization(message: impl Into<String>) -> Self {
         Self::new(message)
     }
@@ -142,6 +301,7 @@ impl std::error::Error for StartupError {}
 pub struct AppState {
     storage: Arc<dyn StorageBackend>,
     storage_backend: StorageBackendName,
+    auth: AuthConfig,
     tenant_id: Uuid,
     mqtt_state: Arc<RwLock<mqtt_ingest::MqttWorkerState>>,
     connector_workers_enabled: Arc<RwLock<bool>>,
@@ -171,19 +331,28 @@ pub struct StartupDiagnostics {
     pub storage_backend: StorageBackendName,
     pub database_url_provided: bool,
     pub migrations_applied: Option<bool>,
+    pub auth_mode: AuthMode,
+    pub auth_enforced: bool,
+    pub auth_dev_bypass: bool,
 }
 
 impl AppState {
     pub fn local() -> Self {
-        Self::with_backend_storage(
+        Self::with_backend_storage_and_auth(
             Arc::new(InMemoryStorage::new()),
             StorageBackendName::Memory,
+            AuthConfig::default(),
             Uuid::nil(),
         )
     }
 
     pub fn with_storage(storage: InMemoryStorage, tenant_id: Uuid) -> Self {
-        Self::with_backend_storage(Arc::new(storage), StorageBackendName::Memory, tenant_id)
+        Self::with_backend_storage_and_auth(
+            Arc::new(storage),
+            StorageBackendName::Memory,
+            AuthConfig::default(),
+            tenant_id,
+        )
     }
 
     pub fn with_backend_storage(
@@ -191,9 +360,24 @@ impl AppState {
         storage_backend: StorageBackendName,
         tenant_id: Uuid,
     ) -> Self {
+        Self::with_backend_storage_and_auth(
+            storage,
+            storage_backend,
+            AuthConfig::default(),
+            tenant_id,
+        )
+    }
+
+    pub fn with_backend_storage_and_auth(
+        storage: Arc<dyn StorageBackend>,
+        storage_backend: StorageBackendName,
+        auth: AuthConfig,
+        tenant_id: Uuid,
+    ) -> Self {
         Self {
             storage,
             storage_backend,
+            auth,
             tenant_id,
             mqtt_state: Arc::new(RwLock::new(mqtt_ingest::MqttWorkerState::default())),
             connector_workers_enabled: Arc::new(RwLock::new(false)),
@@ -203,19 +387,42 @@ impl AppState {
     }
 
     pub fn from_config(config: StorageBackendConfig) -> Result<Self, StartupError> {
-        Self::from_config_with_diagnostics(config).map(|(state, _)| state)
+        Self::from_config_and_auth(config, AuthConfig::from_env()?)
     }
 
     pub fn from_config_with_diagnostics(
         config: StorageBackendConfig,
     ) -> Result<(Self, StartupDiagnostics), StartupError> {
+        Self::from_config_and_auth_with_diagnostics(config, AuthConfig::from_env()?)
+    }
+
+    pub fn from_config_and_auth(
+        config: StorageBackendConfig,
+        auth: AuthConfig,
+    ) -> Result<Self, StartupError> {
+        Self::from_config_and_auth_with_diagnostics(config, auth).map(|(state, _)| state)
+    }
+
+    pub fn from_config_and_auth_with_diagnostics(
+        config: StorageBackendConfig,
+        auth: AuthConfig,
+    ) -> Result<(Self, StartupDiagnostics), StartupError> {
+        auth.ensure_supported()?;
         match config {
             StorageBackendConfig::Memory => Ok((
-                Self::local(),
+                Self::with_backend_storage_and_auth(
+                    Arc::new(InMemoryStorage::new()),
+                    StorageBackendName::Memory,
+                    auth.clone(),
+                    Uuid::nil(),
+                ),
                 StartupDiagnostics {
                     storage_backend: StorageBackendName::Memory,
                     database_url_provided: false,
                     migrations_applied: None,
+                    auth_mode: auth.mode,
+                    auth_enforced: auth.enforced(),
+                    auth_dev_bypass: auth.dev_bypass(),
                 },
             )),
             StorageBackendConfig::Postgres { database_url } => {
@@ -231,15 +438,19 @@ impl AppState {
                     ))
                 })?;
                 Ok((
-                    Self::with_backend_storage(
+                    Self::with_backend_storage_and_auth(
                         Arc::new(storage),
                         StorageBackendName::Postgres,
+                        auth.clone(),
                         Uuid::nil(),
                     ),
                     StartupDiagnostics {
                         storage_backend: StorageBackendName::Postgres,
                         database_url_provided: true,
                         migrations_applied: Some(true),
+                        auth_mode: auth.mode,
+                        auth_enforced: auth.enforced(),
+                        auth_dev_bypass: auth.dev_bypass(),
                     },
                 ))
             }
@@ -252,6 +463,214 @@ impl AppState {
 
     pub fn from_env_with_diagnostics() -> Result<(Self, StartupDiagnostics), StartupError> {
         Self::from_config_with_diagnostics(StorageBackendConfig::from_env()?)
+    }
+
+    fn auth_context(&self) -> AuthContext {
+        AuthContext::from_config(&self.auth)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IssuedApiToken {
+    raw_token: String,
+    token_prefix: String,
+    token_hash: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TokenRejectionReason {
+    Malformed,
+    NotFound,
+    HashMismatch,
+    Revoked,
+    Expired,
+}
+
+impl TokenRejectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::NotFound => "not_found",
+            Self::HashMismatch => "hash_mismatch",
+            Self::Revoked => "revoked",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+fn issue_api_token() -> IssuedApiToken {
+    let prefix = Uuid::new_v4().simple().to_string()[..8].to_string();
+    let secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let raw_token = format!("aion_{prefix}_{secret}");
+    IssuedApiToken {
+        token_hash: hash_token_value(&raw_token),
+        raw_token,
+        token_prefix: prefix,
+    }
+}
+
+fn hash_token_value(raw_token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw_token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn token_hash_matches(stored_hash: &str, candidate_raw_token: &str) -> bool {
+    let candidate_hash = hash_token_value(candidate_raw_token);
+    stored_hash
+        .as_bytes()
+        .ct_eq(candidate_hash.as_bytes())
+        .into()
+}
+
+fn parse_bearer_token(request: &Request) -> Option<String> {
+    let header_value = request.headers().get(header::AUTHORIZATION)?;
+    let value = header_value.to_str().ok()?.trim();
+    let token = value.strip_prefix("Bearer ")?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn parse_token_prefix(raw_token: &str) -> Option<String> {
+    let mut parts = raw_token.split('_');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("aion"), Some(prefix), Some(secret), None)
+            if !prefix.trim().is_empty() && !secret.trim().is_empty() =>
+        {
+            Some(prefix.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn map_principal_type_to_storage(value: PrincipalType) -> Option<ApiTokenPrincipalType> {
+    match value {
+        PrincipalType::Anonymous => None,
+        PrincipalType::User => Some(ApiTokenPrincipalType::User),
+        PrincipalType::Device => Some(ApiTokenPrincipalType::Device),
+        PrincipalType::Adapter => Some(ApiTokenPrincipalType::Adapter),
+        PrincipalType::Executor => Some(ApiTokenPrincipalType::Executor),
+        PrincipalType::Connector => Some(ApiTokenPrincipalType::Connector),
+        PrincipalType::Service => Some(ApiTokenPrincipalType::Service),
+        PrincipalType::Admin => Some(ApiTokenPrincipalType::Admin),
+    }
+}
+
+fn map_principal_type_from_storage(value: ApiTokenPrincipalType) -> PrincipalType {
+    match value {
+        ApiTokenPrincipalType::User => PrincipalType::User,
+        ApiTokenPrincipalType::Device => PrincipalType::Device,
+        ApiTokenPrincipalType::Adapter => PrincipalType::Adapter,
+        ApiTokenPrincipalType::Executor => PrincipalType::Executor,
+        ApiTokenPrincipalType::Connector => PrincipalType::Connector,
+        ApiTokenPrincipalType::Service => PrincipalType::Service,
+        ApiTokenPrincipalType::Admin => PrincipalType::Admin,
+    }
+}
+
+fn api_token_record_response(token: ApiToken) -> ApiTokenRecordResponse {
+    ApiTokenRecordResponse {
+        id: token.id,
+        tenant_id: token.tenant_id,
+        token_name: token.token_name,
+        token_prefix: token.token_prefix,
+        principal_type: map_principal_type_from_storage(token.principal_type),
+        principal_id: token.principal_id,
+        scopes: token.scopes,
+        expires_at: token.expires_at,
+        revoked_at: token.revoked_at,
+        last_used_at: token.last_used_at,
+        metadata: token.metadata,
+        created_at: token.created_at,
+        updated_at: token.updated_at,
+    }
+}
+
+fn resolve_auth_context(state: &AppState, request: &Request) -> AuthContext {
+    match state.auth.mode {
+        AuthMode::Dev | AuthMode::Disabled => state.auth_context(),
+        AuthMode::Token => resolve_token_auth_context(state, request),
+    }
+}
+
+fn resolve_token_auth_context(state: &AppState, request: &Request) -> AuthContext {
+    let Some(raw_token) = parse_bearer_token(request) else {
+        return state.auth_context();
+    };
+    let Some(prefix) = parse_token_prefix(&raw_token) else {
+        record_token_rejected_event(state, None, TokenRejectionReason::Malformed);
+        return state.auth_context();
+    };
+
+    let token = match state
+        .storage
+        .find_api_token_by_prefix(state.tenant_id, &prefix)
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            record_token_rejected_event(state, Some(prefix), TokenRejectionReason::NotFound);
+            return state.auth_context();
+        }
+        Err(_) => return state.auth_context(),
+    };
+
+    if !token_hash_matches(&token.token_hash, &raw_token) {
+        record_token_rejected_event(
+            state,
+            Some(token.token_prefix.clone()),
+            TokenRejectionReason::HashMismatch,
+        );
+        return state.auth_context();
+    }
+
+    if token.revoked_at.is_some() {
+        record_token_rejected_event(
+            state,
+            Some(token.token_prefix.clone()),
+            TokenRejectionReason::Revoked,
+        );
+        return state.auth_context();
+    }
+
+    if token
+        .expires_at
+        .map(|value| value <= Utc::now())
+        .unwrap_or(false)
+    {
+        record_token_rejected_event(
+            state,
+            Some(token.token_prefix.clone()),
+            TokenRejectionReason::Expired,
+        );
+        return state.auth_context();
+    }
+
+    let now = Utc::now();
+    let _ = state
+        .storage
+        .update_api_token_last_used_at(state.tenant_id, token.id, now);
+    record_token_used_event(state, &token);
+    AuthContext::authenticated_token(
+        &state.auth,
+        token.id,
+        map_principal_type_from_storage(token.principal_type),
+        token.principal_id.clone(),
+        token.tenant_id,
+        token.scopes.clone(),
+    )
+}
+
+fn require_token_management_access(auth: &AuthContext) -> Result<(), ApiError> {
+    match auth.mode {
+        AuthMode::Dev | AuthMode::Disabled => Ok(()),
+        AuthMode::Token if auth.authenticated && auth.auth_valid => Ok(()),
+        AuthMode::Token => Err(ApiError::unauthorized(
+            "valid bearer token is required for token management in token mode",
+        )),
     }
 }
 
@@ -268,11 +687,66 @@ struct ReadyResponse {
     status: &'static str,
     service: &'static str,
     storage: &'static str,
+    auth: ReadyAuthResponse,
     mqtt: mqtt_ingest::MqttReadiness,
     worker_plan: ReadyWorkerPlanSummary,
     connector_workers: ConnectorWorkersReadiness,
     migrations_ready: Option<bool>,
     details: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadyAuthResponse {
+    mode: &'static str,
+    enforced: bool,
+    dev_bypass: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateApiTokenRequest {
+    pub token_name: String,
+    pub principal_type: PrincipalType,
+    pub principal_id: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiTokenRecordResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub token_name: String,
+    pub token_prefix: String,
+    pub principal_type: PrincipalType,
+    pub principal_id: Option<String>,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateApiTokenResponse {
+    pub token: ApiTokenRecordResponse,
+    pub raw_token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WhoAmIResponse {
+    pub auth_mode: &'static str,
+    pub authenticated: bool,
+    pub auth_valid: bool,
+    pub dev_bypass: bool,
+    pub principal_type: PrincipalType,
+    pub principal_id: Option<String>,
+    pub tenant_id: Option<Uuid>,
+    pub scopes: Vec<String>,
+    pub token_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1413,6 +1887,10 @@ pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/auth/whoami", get(whoami))
+        .route("/auth/tokens", post(create_api_token).get(list_api_tokens))
+        .route("/auth/tokens/:token_id", get(get_api_token))
+        .route("/auth/tokens/:token_id/revoke", post(revoke_api_token))
         .route("/entities", post(create_entity).get(list_entities))
         .route("/entities/:entity_id", get(get_entity))
         .route("/entities/:entity_id/context", get(get_entity_context))
@@ -1607,7 +2085,21 @@ pub fn app_with_state(state: AppState) -> Router {
             "/observations",
             post(create_observation).get(query_observations),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_context_middleware,
+        ))
         .with_state(state)
+}
+
+async fn auth_context_middleware(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let auth_context = resolve_auth_context(&state, &request);
+    request.extensions_mut().insert(auth_context);
+    next.run(request).await
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -1651,6 +2143,11 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse
             status: if ready { "ready" } else { "not_ready" },
             service: "aion-api",
             storage: state.storage_backend.as_str(),
+            auth: ReadyAuthResponse {
+                mode: state.auth.mode.as_str(),
+                enforced: state.auth.enforced(),
+                dev_bypass: state.auth.dev_bypass(),
+            },
             mqtt,
             worker_plan,
             connector_workers,
@@ -1662,6 +2159,96 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse
             details,
         }),
     )
+}
+
+async fn whoami(Extension(auth): Extension<AuthContext>) -> Json<WhoAmIResponse> {
+    Json(WhoAmIResponse {
+        auth_mode: auth.mode.as_str(),
+        authenticated: auth.authenticated,
+        auth_valid: auth.auth_valid,
+        dev_bypass: auth.dev_bypass,
+        principal_type: auth.principal.principal_type,
+        principal_id: auth.principal.principal_id,
+        tenant_id: auth.principal.tenant_id,
+        scopes: auth.principal.scopes,
+        token_id: auth.token_id,
+    })
+}
+
+async fn create_api_token(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<CreateApiTokenRequest>,
+) -> Result<(StatusCode, Json<CreateApiTokenResponse>), ApiError> {
+    require_token_management_access(&auth)?;
+
+    let principal_type = map_principal_type_to_storage(request.principal_type)
+        .ok_or_else(|| ApiError::bad_request("principal_type must not be anonymous"))?;
+    let issued = issue_api_token();
+    let now = Utc::now();
+    let token = ApiToken::new(
+        state.tenant_id,
+        request.token_name,
+        issued.token_prefix.clone(),
+        issued.token_hash,
+        principal_type,
+        request.principal_id,
+        request.scopes,
+        request.expires_at,
+        request.metadata,
+        now,
+    )?;
+    let token = state.storage.create_api_token(token)?;
+    record_api_token_created_event(&state, &token);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateApiTokenResponse {
+            token: api_token_record_response(token),
+            raw_token: issued.raw_token,
+        }),
+    ))
+}
+
+async fn list_api_tokens(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<ApiTokenRecordResponse>>, ApiError> {
+    require_token_management_access(&auth)?;
+    Ok(Json(
+        state
+            .storage
+            .list_api_tokens(state.tenant_id)?
+            .into_iter()
+            .map(api_token_record_response)
+            .collect(),
+    ))
+}
+
+async fn get_api_token(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(token_id): Path<Uuid>,
+) -> Result<Json<ApiTokenRecordResponse>, ApiError> {
+    require_token_management_access(&auth)?;
+    let token = state
+        .storage
+        .get_api_token(state.tenant_id, token_id)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(api_token_record_response(token)))
+}
+
+async fn revoke_api_token(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(token_id): Path<Uuid>,
+) -> Result<Json<ApiTokenRecordResponse>, ApiError> {
+    require_token_management_access(&auth)?;
+    let token = state
+        .storage
+        .revoke_api_token(state.tenant_id, token_id, Utc::now())?;
+    record_api_token_revoked_event(&state, &token);
+    Ok(Json(api_token_record_response(token)))
 }
 
 async fn create_entity(
@@ -10126,6 +10713,100 @@ fn record_event(state: &AppState, draft: EventDraft) -> Result<Event, ApiError> 
     Ok(state.storage.store_event(event)?)
 }
 
+fn record_auth_event(
+    state: &AppState,
+    event_type: &str,
+    severity: EventSeverity,
+    message: Option<String>,
+    metadata: Option<Value>,
+) {
+    let now = Utc::now();
+    let event = Event::new(
+        state.tenant_id,
+        event_type,
+        severity,
+        None,
+        None,
+        message,
+        now,
+        Some(now),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        metadata,
+        now,
+    );
+    if let Ok(event) = event {
+        let _ = state.storage.store_event(event);
+    }
+}
+
+fn record_api_token_created_event(state: &AppState, token: &ApiToken) {
+    record_auth_event(
+        state,
+        "aion:ApiTokenCreated",
+        EventSeverity::Info,
+        Some(format!("api token '{}' created", token.token_name)),
+        Some(json!({
+            "token_id": token.id,
+            "token_prefix": token.token_prefix,
+            "principal_type": map_principal_type_from_storage(token.principal_type),
+            "principal_id": token.principal_id,
+            "scopes": token.scopes,
+        })),
+    );
+}
+
+fn record_api_token_revoked_event(state: &AppState, token: &ApiToken) {
+    record_auth_event(
+        state,
+        "aion:ApiTokenRevoked",
+        EventSeverity::Info,
+        Some(format!("api token '{}' revoked", token.token_name)),
+        Some(json!({
+            "token_id": token.id,
+            "token_prefix": token.token_prefix,
+            "principal_type": map_principal_type_from_storage(token.principal_type),
+            "principal_id": token.principal_id,
+        })),
+    );
+}
+
+fn record_token_used_event(state: &AppState, token: &ApiToken) {
+    record_auth_event(
+        state,
+        "aion:ApiTokenUsed",
+        EventSeverity::Info,
+        Some(format!("api token '{}' used", token.token_name)),
+        Some(json!({
+            "token_id": token.id,
+            "token_prefix": token.token_prefix,
+            "principal_type": map_principal_type_from_storage(token.principal_type),
+            "principal_id": token.principal_id,
+        })),
+    );
+}
+
+fn record_token_rejected_event(
+    state: &AppState,
+    token_prefix: Option<String>,
+    reason: TokenRejectionReason,
+) {
+    record_auth_event(
+        state,
+        "aion:ApiTokenRejected",
+        EventSeverity::Warning,
+        Some(format!("api token rejected: {}", reason.as_str())),
+        Some(json!({
+            "token_prefix": token_prefix,
+            "reason": reason.as_str(),
+        })),
+    );
+}
+
 struct EventDraft {
     event_type: String,
     severity: EventSeverity,
@@ -10647,6 +11328,16 @@ impl ApiError {
         }
     }
 
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+            validation_errors: Vec::new(),
+            validation_warnings: Vec::new(),
+            skipped_items: Vec::new(),
+        }
+    }
+
     fn smartsentinel_validation(
         message: impl Into<String>,
         report: SmartSentinelValidationReport,
@@ -10719,6 +11410,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_storage::ApiTokenStore;
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
@@ -10762,8 +11454,376 @@ mod tests {
         let body = to_json(response).await;
         assert_eq!(body["ready"], true);
         assert_eq!(body["storage"], "memory");
+        assert_eq!(body["auth"]["mode"], "dev");
+        assert_eq!(body["auth"]["enforced"], false);
+        assert_eq!(body["auth"]["dev_bypass"], true);
         assert_eq!(body["mqtt"]["enabled"], false);
         assert_eq!(body["migrations_ready"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn ready_reports_disabled_auth_mode_without_enforcement() {
+        let state = AppState::with_backend_storage_and_auth(
+            Arc::new(InMemoryStorage::new()),
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Disabled,
+            },
+            Uuid::nil(),
+        );
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_json(response).await;
+        assert_eq!(body["auth"]["mode"], "disabled");
+        assert_eq!(body["auth"]["enforced"], false);
+        assert_eq!(body["auth"]["dev_bypass"], false);
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_dev_mode_context() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/whoami")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body["auth_mode"], "dev");
+        assert_eq!(body["authenticated"], false);
+        assert_eq!(body["dev_bypass"], true);
+        assert_eq!(body["principal_type"], "anonymous");
+    }
+
+    #[tokio::test]
+    async fn create_token_returns_raw_token_once_and_stored_record_hides_hash() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/auth/tokens",
+                json!({
+                    "token_name": "ops",
+                    "principal_type": "service",
+                    "principal_id": "service-01",
+                    "scopes": ["entities:read"],
+                    "metadata": {"purpose": "test"}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = to_json(response).await;
+        assert!(created["raw_token"].as_str().unwrap().starts_with("aion_"));
+        assert!(created["token"].get("token_hash").is_none());
+        assert!(created["token"].get("raw_token").is_none());
+
+        let token_id = created["token"]["id"].as_str().unwrap();
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/tokens")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let listed = to_json(list_response).await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert!(listed[0].get("token_hash").is_none());
+        assert!(listed[0].get("raw_token").is_none());
+        assert_eq!(listed[0]["id"], token_id);
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/auth/tokens/{token_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let fetched = to_json(get_response).await;
+        assert!(fetched.get("token_hash").is_none());
+        assert!(fetched.get("raw_token").is_none());
+        assert_eq!(fetched["token_prefix"], created["token"]["token_prefix"]);
+    }
+
+    #[tokio::test]
+    async fn token_mode_whoami_resolves_valid_bearer_token_and_revoke_blocks_later_use() {
+        let bootstrap_app = app();
+        let create_response = bootstrap_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/auth/tokens",
+                json!({
+                    "token_name": "bootstrap",
+                    "principal_type": "service",
+                    "principal_id": "bootstrap-service",
+                    "scopes": ["entities:read", "observations:read"]
+                }),
+            ))
+            .await
+            .unwrap();
+        let created = to_json(create_response).await;
+        let raw_token = created["raw_token"].as_str().unwrap().to_string();
+        let token_id = created["token"]["id"].as_str().unwrap().to_string();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let copied = bootstrap_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/auth/tokens/{token_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let copied = to_json(copied).await;
+        let token_record = ApiToken::new(
+            Uuid::nil(),
+            copied["token_name"].as_str().unwrap(),
+            copied["token_prefix"].as_str().unwrap(),
+            hash_token_value(&raw_token),
+            ApiTokenPrincipalType::Service,
+            copied["principal_id"].as_str().map(ToOwned::to_owned),
+            copied["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect(),
+            None,
+            copied.get("metadata").cloned(),
+            Utc::now(),
+        )
+        .unwrap();
+        let token_record = ApiToken {
+            id: Uuid::parse_str(&token_id).unwrap(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            ..token_record
+        };
+        storage.create_api_token(token_record).unwrap();
+
+        let token_app = app_with_state(AppState::with_backend_storage_and_auth(
+            storage.clone(),
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Token,
+            },
+            Uuid::nil(),
+        ));
+
+        let whoami = token_app
+            .clone()
+            .oneshot(auth_request("GET", "/auth/whoami", &raw_token))
+            .await
+            .unwrap();
+        assert_eq!(whoami.status(), StatusCode::OK);
+        let body = to_json(whoami).await;
+        assert_eq!(body["auth_mode"], "token");
+        assert_eq!(body["authenticated"], true);
+        assert_eq!(body["principal_type"], "service");
+        assert_eq!(body["principal_id"], "bootstrap-service");
+
+        let revoke = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/auth/tokens/{token_id}/revoke"),
+                json!({}),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::OK);
+
+        let rejected = token_app
+            .clone()
+            .oneshot(auth_request("GET", "/auth/whoami", &raw_token))
+            .await
+            .unwrap();
+        let rejected = to_json(rejected).await;
+        assert_eq!(rejected["authenticated"], false);
+        assert_eq!(rejected["principal_type"], "anonymous");
+    }
+
+    #[tokio::test]
+    async fn invalid_and_expired_tokens_do_not_authenticate_and_do_not_expose_secrets() {
+        let now = Utc::now();
+        let storage = Arc::new(InMemoryStorage::new());
+        let valid_token = "aion_expired01_deadbeef";
+        let expired = ApiToken::new(
+            Uuid::nil(),
+            "expired",
+            "expired01",
+            hash_token_value(valid_token),
+            ApiTokenPrincipalType::Service,
+            Some("service-expired".to_string()),
+            vec!["entities:read".to_string()],
+            Some(now - Duration::minutes(1)),
+            None,
+            now,
+        )
+        .unwrap();
+        storage.create_api_token(expired).unwrap();
+
+        let app = app_with_state(AppState::with_backend_storage_and_auth(
+            storage,
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Token,
+            },
+            Uuid::nil(),
+        ));
+
+        let invalid = app
+            .clone()
+            .oneshot(auth_request("GET", "/auth/whoami", "aion_invalid01_secret"))
+            .await
+            .unwrap();
+        let invalid = to_json(invalid).await;
+        assert_eq!(invalid["authenticated"], false);
+        assert!(!invalid.to_string().contains("invalid01"));
+
+        let expired = app
+            .clone()
+            .oneshot(auth_request("GET", "/auth/whoami", valid_token))
+            .await
+            .unwrap();
+        let expired = to_json(expired).await;
+        assert_eq!(expired["authenticated"], false);
+        assert_eq!(expired["principal_type"], "anonymous");
+    }
+
+    #[tokio::test]
+    async fn token_mode_requires_bearer_for_token_management_but_not_for_existing_endpoints() {
+        let state = AppState::with_backend_storage_and_auth(
+            Arc::new(InMemoryStorage::new()),
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Token,
+            },
+            Uuid::nil(),
+        );
+        let app = app_with_state(state);
+
+        let whoami = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/whoami")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(whoami.status(), StatusCode::OK);
+
+        let create_token = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/auth/tokens",
+                json!({
+                    "token_name": "blocked",
+                    "principal_type": "service",
+                    "scopes": []
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_token.status(), StatusCode::UNAUTHORIZED);
+
+        let entities = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/entities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entities.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn existing_endpoints_still_work_without_credentials_in_dev_mode() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/entities",
+                json!({
+                    "entity_key": "dev-sensor-01",
+                    "entity_type": "aion:Sensor",
+                    "jsonld": {
+                        "@context": {
+                            "aion": "https://aioncore.ai/ontology#"
+                        },
+                        "@id": "urn:aion:test:dev-sensor-01",
+                        "@type": "aion:Sensor",
+                        "name": "Development Sensor"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn disabled_mode_still_allows_existing_endpoints_without_credentials() {
+        let state = AppState::with_backend_storage_and_auth(
+            Arc::new(InMemoryStorage::new()),
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Disabled,
+            },
+            Uuid::nil(),
+        );
+        let app = app_with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/entities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body, json!([]));
     }
 
     #[tokio::test]
@@ -11650,6 +12710,60 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unknown AIONCORE_STORAGE_BACKEND"));
+    }
+
+    #[test]
+    fn auth_config_defaults_to_dev() {
+        assert_eq!(AuthConfig::from_env_vars(None).unwrap().mode, AuthMode::Dev);
+    }
+
+    #[test]
+    fn auth_config_accepts_explicit_dev() {
+        assert_eq!(
+            AuthConfig::from_env_vars(Some("dev".to_string()))
+                .unwrap()
+                .mode,
+            AuthMode::Dev
+        );
+    }
+
+    #[test]
+    fn auth_config_accepts_explicit_disabled() {
+        assert_eq!(
+            AuthConfig::from_env_vars(Some("disabled".to_string()))
+                .unwrap()
+                .mode,
+            AuthMode::Disabled
+        );
+    }
+
+    #[test]
+    fn auth_config_recognizes_token_mode() {
+        assert_eq!(
+            AuthConfig::from_env_vars(Some("token".to_string()))
+                .unwrap()
+                .mode,
+            AuthMode::Token
+        );
+    }
+
+    #[test]
+    fn auth_config_rejects_unknown_mode() {
+        let error = AuthConfig::from_env_vars(Some("jwt".to_string()))
+            .expect_err("unknown auth mode should fail");
+        assert!(error.to_string().contains("unknown AIONCORE_AUTH_MODE"));
+    }
+
+    #[test]
+    fn token_auth_mode_initializes_successfully() {
+        let state = AppState::from_config_and_auth(
+            StorageBackendConfig::Memory,
+            AuthConfig {
+                mode: AuthMode::Token,
+            },
+        )
+        .expect("token auth mode should initialize");
+        assert_eq!(state.auth.mode, AuthMode::Token);
     }
 
     #[tokio::test]
@@ -18525,6 +19639,25 @@ mod tests {
         Request::builder()
             .method(method)
             .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn auth_request(method: &str, uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn auth_json_request(method: &str, uri: &str, body: Value, token: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()

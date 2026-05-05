@@ -44,6 +44,8 @@ pub const MIGRATION_0010_HARDEN_TTN_DEVICE_MAPPING_UNIQUENESS: &str =
     include_str!("../../../migrations/0010_harden_ttn_device_mapping_uniqueness.sql");
 pub const MIGRATION_0011_CREATE_EDGE_ADAPTERS: &str =
     include_str!("../../../migrations/0011_create_edge_adapters.sql");
+pub const MIGRATION_0012_CREATE_API_TOKENS: &str =
+    include_str!("../../../migrations/0012_create_api_tokens.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -83,6 +85,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0011_create_edge_adapters.sql",
         MIGRATION_0011_CREATE_EDGE_ADAPTERS,
+    ),
+    (
+        "0012_create_api_tokens.sql",
+        MIGRATION_0012_CREATE_API_TOKENS,
     ),
 ];
 
@@ -191,6 +197,92 @@ impl ConnectorSecret {
             secret_type,
             username,
             secret_value,
+            metadata,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiTokenPrincipalType {
+    User,
+    Device,
+    Adapter,
+    Executor,
+    Connector,
+    Service,
+    Admin,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiToken {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub token_name: String,
+    pub token_prefix: String,
+    pub token_hash: String,
+    pub principal_type: ApiTokenPrincipalType,
+    pub principal_id: Option<String>,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ApiToken {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tenant_id: Uuid,
+        token_name: impl Into<String>,
+        token_prefix: impl Into<String>,
+        token_hash: impl Into<String>,
+        principal_type: ApiTokenPrincipalType,
+        principal_id: Option<String>,
+        scopes: Vec<String>,
+        expires_at: Option<DateTime<Utc>>,
+        metadata: Option<Value>,
+        now: DateTime<Utc>,
+    ) -> StorageResult<Self> {
+        let token_name = token_name.into();
+        if token_name.trim().is_empty() {
+            return Err(StorageError::InvalidInput(
+                "token_name must not be empty".to_string(),
+            ));
+        }
+
+        let token_prefix = token_prefix.into();
+        if token_prefix.trim().is_empty() {
+            return Err(StorageError::InvalidInput(
+                "token_prefix must not be empty".to_string(),
+            ));
+        }
+
+        let token_hash = token_hash.into();
+        if token_hash.trim().is_empty() {
+            return Err(StorageError::InvalidInput(
+                "token_hash must not be empty".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            tenant_id,
+            token_name,
+            token_prefix,
+            token_hash,
+            principal_type,
+            principal_id: principal_id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            scopes,
+            expires_at,
+            revoked_at: None,
+            last_used_at: None,
             metadata,
             created_at: now,
             updated_at: now,
@@ -587,6 +679,29 @@ pub trait ConnectorSecretStore {
     fn delete_connector_secret(&self, tenant_id: Uuid, secret_id: Uuid) -> StorageResult<()>;
 }
 
+pub trait ApiTokenStore {
+    fn create_api_token(&self, token: ApiToken) -> StorageResult<ApiToken>;
+    fn get_api_token(&self, tenant_id: Uuid, token_id: Uuid) -> StorageResult<Option<ApiToken>>;
+    fn list_api_tokens(&self, tenant_id: Uuid) -> StorageResult<Vec<ApiToken>>;
+    fn find_api_token_by_prefix(
+        &self,
+        tenant_id: Uuid,
+        token_prefix: &str,
+    ) -> StorageResult<Option<ApiToken>>;
+    fn update_api_token_last_used_at(
+        &self,
+        tenant_id: Uuid,
+        token_id: Uuid,
+        last_used_at: DateTime<Utc>,
+    ) -> StorageResult<ApiToken>;
+    fn revoke_api_token(
+        &self,
+        tenant_id: Uuid,
+        token_id: Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> StorageResult<ApiToken>;
+}
+
 pub trait TtnDeviceMappingStore {
     fn create_ttn_device_mapping(
         &self,
@@ -786,6 +901,7 @@ pub trait ControlPlaneStore:
     + PayloadProfileStore
     + IngestionConnectorStore
     + ConnectorSecretStore
+    + ApiTokenStore
     + TtnDeviceMappingStore
     + EdgeAdapterStore
     + CapabilityStore
@@ -806,6 +922,7 @@ impl<T> ControlPlaneStore for T where
         + PayloadProfileStore
         + IngestionConnectorStore
         + ConnectorSecretStore
+        + ApiTokenStore
         + TtnDeviceMappingStore
         + EdgeAdapterStore
         + CapabilityStore
@@ -876,6 +993,8 @@ struct InMemoryState {
     ingestion_connector_key_index: HashMap<(Uuid, String), Uuid>,
     connector_secrets: HashMap<Uuid, ConnectorSecret>,
     connector_secret_key_index: HashMap<(Uuid, String), Uuid>,
+    api_tokens: HashMap<Uuid, ApiToken>,
+    api_token_prefix_index: HashMap<(Uuid, String), Uuid>,
     ttn_device_mappings: HashMap<Uuid, TtnDeviceMapping>,
     capabilities: HashMap<(Uuid, Uuid), Vec<Capability>>,
     executors: HashMap<Uuid, ExecutorAgent>,
@@ -1382,6 +1501,92 @@ impl ConnectorSecretStore for InMemoryStorage {
             }
         }
         Ok(())
+    }
+}
+
+impl ApiTokenStore for InMemoryStorage {
+    fn create_api_token(&self, token: ApiToken) -> StorageResult<ApiToken> {
+        let mut state = self.write_state()?;
+        let index_key = (token.tenant_id, token.token_prefix.clone());
+        if state.api_tokens.contains_key(&token.id)
+            || state.api_token_prefix_index.contains_key(&index_key)
+        {
+            return Err(StorageError::Conflict);
+        }
+
+        state.api_token_prefix_index.insert(index_key, token.id);
+        state.api_tokens.insert(token.id, token.clone());
+        Ok(token)
+    }
+
+    fn get_api_token(&self, tenant_id: Uuid, token_id: Uuid) -> StorageResult<Option<ApiToken>> {
+        Ok(self
+            .read_state()?
+            .api_tokens
+            .get(&token_id)
+            .filter(|token| token.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn list_api_tokens(&self, tenant_id: Uuid) -> StorageResult<Vec<ApiToken>> {
+        let mut tokens = self
+            .read_state()?
+            .api_tokens
+            .values()
+            .filter(|token| token.tenant_id == tenant_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        tokens.sort_by(|left, right| left.token_name.cmp(&right.token_name));
+        Ok(tokens)
+    }
+
+    fn find_api_token_by_prefix(
+        &self,
+        tenant_id: Uuid,
+        token_prefix: &str,
+    ) -> StorageResult<Option<ApiToken>> {
+        let state = self.read_state()?;
+        Ok(state
+            .api_token_prefix_index
+            .get(&(tenant_id, token_prefix.to_string()))
+            .and_then(|token_id| state.api_tokens.get(token_id))
+            .filter(|token| token.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn update_api_token_last_used_at(
+        &self,
+        tenant_id: Uuid,
+        token_id: Uuid,
+        last_used_at: DateTime<Utc>,
+    ) -> StorageResult<ApiToken> {
+        let mut state = self.write_state()?;
+        let token = state
+            .api_tokens
+            .get_mut(&token_id)
+            .filter(|token| token.tenant_id == tenant_id)
+            .ok_or(StorageError::NotFound)?;
+        token.last_used_at = Some(last_used_at);
+        token.updated_at = last_used_at;
+        Ok(token.clone())
+    }
+
+    fn revoke_api_token(
+        &self,
+        tenant_id: Uuid,
+        token_id: Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> StorageResult<ApiToken> {
+        let mut state = self.write_state()?;
+        let token = state
+            .api_tokens
+            .get_mut(&token_id)
+            .filter(|token| token.tenant_id == tenant_id)
+            .ok_or(StorageError::NotFound)?;
+        token.revoked_at = Some(revoked_at);
+        token.updated_at = revoked_at;
+        Ok(token.clone())
     }
 }
 
@@ -2168,10 +2373,11 @@ impl RuleStore for InMemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 11);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 12);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
@@ -2192,6 +2398,7 @@ mod tests {
             "0010_harden_ttn_device_mapping_uniqueness.sql"
         );
         assert_eq!(ORDERED_MIGRATIONS[10].0, "0011_create_edge_adapters.sql");
+        assert_eq!(ORDERED_MIGRATIONS[11].0, "0012_create_api_tokens.sql");
     }
 
     #[test]
@@ -2224,6 +2431,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS rules",
             "CREATE TABLE IF NOT EXISTS ingestion_connectors",
             "CREATE TABLE IF NOT EXISTS connector_secrets",
+            "CREATE TABLE IF NOT EXISTS api_tokens",
             "CREATE TABLE IF NOT EXISTS ttn_device_mappings",
         ] {
             assert!(
@@ -2341,6 +2549,52 @@ mod tests {
         assert_control_plane::<InMemoryStorage>();
         assert_telemetry::<InMemoryStorage>();
         assert_ai_context::<InMemoryStorage>();
+    }
+
+    #[test]
+    fn in_memory_storage_stores_and_revokes_api_tokens() {
+        use serde_json::json;
+
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let now = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap();
+        let token = ApiToken::new(
+            tenant_id,
+            "operator token",
+            "abcd1234",
+            "deadbeef",
+            ApiTokenPrincipalType::Service,
+            Some("service-01".to_string()),
+            vec!["entities:read".to_string()],
+            None,
+            Some(json!({"suite": "memory"})),
+            now,
+        )
+        .expect("valid api token");
+
+        assert_eq!(
+            storage
+                .create_api_token(token.clone())
+                .expect("create api token"),
+            token
+        );
+        assert_eq!(
+            storage
+                .find_api_token_by_prefix(tenant_id, "abcd1234")
+                .expect("find api token by prefix")
+                .expect("missing api token by prefix"),
+            token
+        );
+
+        let updated = storage
+            .update_api_token_last_used_at(tenant_id, token.id, now)
+            .expect("update api token last used at");
+        assert_eq!(updated.last_used_at, Some(now));
+
+        let revoked = storage
+            .revoke_api_token(tenant_id, token.id, now)
+            .expect("revoke api token");
+        assert_eq!(revoked.revoked_at, Some(now));
     }
 
     #[test]

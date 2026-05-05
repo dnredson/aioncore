@@ -1,14 +1,15 @@
 # AionCore Security Model
 
-This document defines the authentication and authorization architecture for AionCore APIs before runtime enforcement is added.
+This document defines the authentication and authorization architecture for AionCore APIs while runtime enforcement is being introduced incrementally.
 
-Milestone 47 is documentation only. It does not add middleware, sessions, JWT handling, token issuance, secret generation, or any API behavior changes.
+Milestone 49 adds API token issuance, hashing, storage, principal resolution, `/auth/tokens`, and `/auth/whoami`. It still does not broadly enforce authentication or scopes on existing endpoints, add login, or validate JWTs.
 
 ## Status
 
-- Current local runtime behavior: most APIs are unauthenticated.
+- Current local runtime behavior: most APIs are still effectively unauthenticated unless a route opts into token-management checks.
 - Current production suitability: not suitable for exposed production deployment without additional protection in front of the API.
-- Intended next step: introduce auth incrementally behind a development-mode bypass.
+- Current runtime auth foundation: middleware installed with development-mode bypass, explicit disabled mode, or token principal resolution.
+- Intended next step: introduce endpoint protection incrementally behind the existing development-mode bypass and token model.
 
 ## Security Goals
 
@@ -23,13 +24,13 @@ Milestone 47 is documentation only. It does not add middleware, sessions, JWT ha
 
 ## Non-Goals For This Milestone
 
-- No authentication enforcement.
+- No broad authentication enforcement.
 - No login UI, browser session flow, or password-based user auth.
-- No JWT minting or token storage implementation.
+- No JWT minting.
 - No secret manager, KMS, or Vault integration.
 - No mTLS implementation.
 - No OAuth/OIDC provider integration.
-- No endpoint behavior change.
+- No broad scope enforcement.
 
 ## Threat Model
 
@@ -179,12 +180,21 @@ These are the planned credential mechanisms. Not all should be implemented at on
 
 Opaque token for simple machine or operator access. Recommended as the first implementation for AionCore-managed access.
 
-Expected handling:
+Implemented handling in Milestone 49:
 
-- issued out of band
-- stored server-side as a hash, never in plaintext after creation
+- issued by `POST /auth/tokens`
+- formatted as `aion_<prefix>_<secret>`
+- stored server-side as a SHA-256 hash, never in plaintext after creation
+- looked up by `token_prefix` and validated against the stored hash
 - bound to one principal and one tenant
 - scoped and revocable
+- returned in plaintext only once in the creation response
+
+Current limitations:
+
+- token issuance is foundational and not yet a full operator-hardening story
+- scope enforcement on business endpoints is deferred to Milestone 50
+- local bootstrap flows may still rely on `dev` mode or other trusted local administration paths
 
 ### JWT Access Token
 
@@ -306,7 +316,7 @@ Devices, adapters, executors, connectors, and bridges should use dedicated machi
 
 ### Secret Storage For API Credentials
 
-When AionCore starts storing API tokens, only hashed or otherwise non-recoverable server-side representations should be persisted for bearer-style credentials. Plaintext display should be one-time only at issuance in a future milestone.
+For bearer-style API credentials, only hashed or otherwise non-recoverable server-side representations should be persisted. Plaintext display must remain one-time only at issuance.
 
 ## Device Credentials
 
@@ -393,6 +403,7 @@ Never include:
 
 High-value audit events include:
 
+- API token create, revoke, use, and rejection
 - command create, approve, reject, claim, complete, and fail
 - rule create, enable, disable, and evaluate
 - connector create, update, enable, disable, validate, and secret attachment changes
@@ -433,11 +444,28 @@ The table below describes the intended future protection model. It does not chan
 
 ### Development Mode
 
-- Authentication disabled by default for local work.
+- `AIONCORE_AUTH_MODE=dev` is the default for local work.
+- Auth middleware is installed.
+- Requests are allowed through with an anonymous development-bypass auth context attached internally.
 - Startup logs and README must clearly warn that the API is unauthenticated.
 - Intended for localhost, tests, and integration prototyping.
 - MCP local tool layer may remain available for local development.
 - Secret values still must remain redacted even when auth is disabled.
+
+### Explicit Disabled Mode
+
+- `AIONCORE_AUTH_MODE=disabled` keeps auth middleware plumbing available but explicitly disables auth for the runtime.
+- Requests are allowed through with an anonymous auth-disabled context attached internally.
+- This mode is useful for tests and local demos where operators want the bypass to be intentional rather than implicit.
+
+### Token Mode Foundation
+
+- `AIONCORE_AUTH_MODE=token` now starts successfully.
+- Middleware attempts to resolve `Authorization: Bearer <token>` against stored API tokens.
+- Valid tokens attach tenant, principal type, principal ID, scopes, and token ID into the internal `AuthContext`.
+- Successful validation updates `last_used_at` and emits `aion:ApiTokenUsed`.
+- Invalid, expired, revoked, or malformed presented tokens resolve to an anonymous context and emit `aion:ApiTokenRejected`.
+- This milestone does not broadly protect business endpoints yet. Existing development behavior remains intentionally unchanged outside the new token-management surface.
 
 ### Production Mode
 
@@ -455,13 +483,22 @@ The table below describes the intended future protection model. It does not chan
 
 Add auth middleware skeleton with request principal extraction, explicit development-mode bypass, and no broad behavior change beyond optional enforcement hooks.
 
+Implemented shape:
+
+- parse `AIONCORE_AUTH_MODE=dev|disabled|token`
+- default to `dev` when unset
+- attach an internal `AuthContext` with `AuthMode`, `Principal`, and `PrincipalType`
+- report auth diagnostics in `/ready`
+- keep `auth.enforced = false` for all current modes
+- keep existing endpoints working in development mode without credentials
+
 ### Milestone 49
 
-Add API token principal model, token hashing, storage model, and operator-managed token issuance or bootstrap path.
+Add API token principal model, token hashing, storage model, operator-managed token issuance, `/auth/whoami`, and token-mode principal resolution without broad endpoint enforcement.
 
 ### Milestone 50
 
-Protect adapter and executor endpoints first because they are machine-facing and already represent clear principal boundaries.
+Protect adapter and executor endpoints first because they are machine-facing and already represent clear principal boundaries. This milestone should start real endpoint authentication and scope checks using the token model introduced in Milestone 49.
 
 ### Milestone 51
 
