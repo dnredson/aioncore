@@ -2,11 +2,11 @@
 
 This document defines the authentication and authorization architecture for AionCore APIs while runtime enforcement is being introduced incrementally.
 
-Milestone 56 broadens token-mode protection across selected read surfaces on top of the Milestone 50 through 55 foundation. It still does not broadly enforce authentication across the full API, add login, validate JWTs, or enforce tenant/resource ownership.
+Milestone 57 adds the first tenant/resource ownership skeleton for selected token-mode protected read surfaces on top of the Milestone 50 through 56 foundation. It still does not broadly enforce authentication across the full API, add login, validate JWTs, or implement full authorization.
 
 ## Status
 
-- Current local runtime behavior: `dev` remains the default and still bypasses auth; `token` mode now enforces selected machine-facing, broader read, MCP/AI, and secret-management routes only.
+- Current local runtime behavior: `dev` remains the default and still bypasses auth; `token` mode now enforces selected machine-facing, broader read, MCP/AI, and secret-management routes, with first-pass tenant/resource ownership checks on selected protected reads only.
 - Current production suitability: not suitable for exposed production deployment without additional protection in front of the API.
 - Current runtime auth foundation: middleware installed with development-mode bypass, explicit disabled mode, or token principal resolution.
 - Current selected enforcement in `token` mode:
@@ -34,7 +34,7 @@ Milestone 56 broadens token-mode protection across selected read surfaces on top
   - `/entities/{entity_id}/capabilities` requires `capabilities:read`
   - `/executors`, `/executors/{executor_id}`, `/executors/{executor_id}/capabilities`, and `/executors/{executor_id}/scopes` require `executors:read`
   - `/secrets/connectors*` requires `secrets:admin`
-- Unprotected in this milestone: the rest of the API surface, including broad write paths for entities, observations, commands, actions, rules, policies, and capabilities, plus tenant/resource ownership enforcement across both read and write routes.
+- Unprotected in this milestone: the rest of the API surface, including broad write paths for entities, observations, commands, actions, rules, policies, and capabilities, plus tenant-aware writes and ownership enforcement for remaining routes outside the selected protected reads.
 
 ## Security Goals
 
@@ -120,6 +120,22 @@ Connector secret values, future token hashes, private keys, and broker credentia
 - Resource identifiers from another tenant must resolve as not found or forbidden without disclosing existence details.
 - Connector secrets, adapters, executor agents, commands, rules, and provenance queries must all remain tenant-scoped.
 - Platform admin behavior should be explicit and rare. It must not be the default for service-to-service traffic.
+
+Milestone 57 current rule for selected protected token-mode reads:
+
+- `admin:all` bypasses tenant/resource ownership checks for the selected protected read routes covered by Milestones 55 through 57.
+- Otherwise, the authenticated principal tenant must match the resource `tenant_id`.
+- Selected list/query endpoints return only resources for the principal tenant.
+- Selected detail endpoints return `403` for known cross-tenant access.
+- `dev` and `disabled` modes keep the existing bypass behavior unchanged.
+
+Current Milestone 57 limitations:
+
+- This is only a first ownership skeleton for selected read routes.
+- Write paths are not yet broadly tenant-authorized beyond existing storage scoping.
+- Cross-tenant sharing is not implemented.
+- Relationship-based authorization is not implemented.
+- Some routes still rely on direct resource `tenant_id` rather than richer graph-aware ownership rules.
 
 ## Principal Types
 
@@ -668,11 +684,36 @@ Implemented shape:
 - extend `GET /ready` `protected_endpoint_groups` with `entities`, `observations`, `commands`, `actions`, `rules`, `policies`, `capabilities`, and `executors_read`
 - explicitly leave tenant/resource ownership enforcement and broad write-surface protection for later milestones
 
+### Milestone 57
+
+Add the first tenant/resource ownership skeleton for selected token-mode protected read surfaces without changing dev/disabled behavior or attempting full authorization.
+
+Implemented shape:
+
+- keep `dev` as the default auth mode and keep `dev` and `disabled` bypass behavior unchanged
+- keep `admin:all` as the break-glass bypass for both scope checks and the new selected read-route ownership checks
+- for selected protected read routes in `token` mode, require the principal tenant to match the resource `tenant_id` unless `admin:all` is present
+- return only same-tenant resources for selected list/query reads in `token` mode unless `admin:all` is present
+- return `403` for known cross-tenant detail reads on the selected protected surfaces
+- apply this first-pass ownership enforcement to:
+  - `/entities`, `/entities/{entity_id}`, `/entities/{entity_id}/context`
+  - `/observations`
+  - `/commands`, `/commands/{command_id}`
+  - `/actions`, `/actions/{action_id}`, `/action-results`
+  - `/rules`, `/rules/{rule_id}`
+  - `/policies`
+  - `/entities/{entity_id}/capabilities`
+  - `/executors`, `/executors/{executor_id}`, `/executors/{executor_id}/capabilities`, `/executors/{executor_id}/scopes`
+  - `/events`, `/events/{event_id}`, `/raw-messages`, `/raw-messages/{raw_message_id}`
+- filter entity-context relationships so inconsistent cross-tenant references do not leak through context reads
+- explicitly leave tenant-aware writes, cross-tenant sharing, relationship-based authorization, and remaining route coverage for later milestones
+
 ## Open Questions For Later Milestones
 
 - Whether command approval should get its own dedicated scope.
 - Whether connector-aware ingestion should distinguish connector administration from connector write traffic with a separate scope.
 - Whether `ready` should be fully authenticated in all production deployments or only kept network-private.
+- How the future write-authorization model should compose tenant ownership, role scopes, and policy decisions without overfitting the current modular-monolith deployment.
 - Whether device credentials should bind directly to entity IDs, connector IDs, or both.
 - Whether service-to-service auth should start with API tokens or skip directly to mTLS in distributed mode.
 - How and when tenant/resource ownership checks should be layered onto the newly protected read surfaces.

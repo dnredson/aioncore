@@ -1044,6 +1044,22 @@ impl EntityStore for PostgresStorage {
         })
     }
 
+    fn get_entity_any_tenant(&self, entity_id: Uuid) -> StorageResult<Option<Entity>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, entity_key, entity_type, jsonld, created_at, updated_at
+                    FROM entities
+                    WHERE id = $1
+                    ",
+                    &[&entity_id],
+                )
+                .map_err(map_postgres_error)?;
+            Ok(row.map(row_to_entity))
+        })
+    }
+
     fn get_entity_by_key(
         &self,
         tenant_id: Uuid,
@@ -1079,6 +1095,22 @@ impl EntityStore for PostgresStorage {
             let mut entities = rows.into_iter().map(row_to_entity).collect::<Vec<_>>();
             entities.sort_by(|left, right| left.entity_key.cmp(&right.entity_key));
             Ok(entities)
+        })
+    }
+
+    fn list_all_entities(&self) -> StorageResult<Vec<Entity>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, entity_key, entity_type, jsonld, created_at, updated_at
+                    FROM entities
+                    ORDER BY tenant_id ASC, entity_key ASC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
+            Ok(rows.into_iter().map(row_to_entity).collect())
         })
     }
 }
@@ -1224,6 +1256,28 @@ impl RawMessageStore for PostgresStorage {
         })
     }
 
+    fn get_raw_message_any_tenant(
+        &self,
+        raw_message_id: Uuid,
+    ) -> StorageResult<Option<RawMessage>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    FROM raw_messages
+                    WHERE id = $1
+                    ",
+                    &[&raw_message_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_raw_message(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn list_raw_messages(&self, tenant_id: Uuid) -> StorageResult<Vec<RawMessage>> {
         self.with_client(|client| {
             let rows = client
@@ -1235,6 +1289,24 @@ impl RawMessageStore for PostgresStorage {
                     ORDER BY received_at DESC
                     ",
                     &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_raw_message)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn list_all_raw_messages(&self) -> StorageResult<Vec<RawMessage>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    FROM raw_messages
+                    ORDER BY received_at DESC
+                    ",
+                    &[],
                 )
                 .map_err(map_postgres_error)?;
             rows.into_iter()
@@ -1442,6 +1514,30 @@ impl ObservationStore for PostgresStorage {
         })
     }
 
+    fn get_observation_any_tenant(
+        &self,
+        observation_id: Uuid,
+    ) -> StorageResult<Option<Observation>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, producer_entity_id, feature_of_interest_id, observed_property, value_number, value_string, value_bool, value_json, unit, observed_at, received_at, protocol, payload_format, raw_message_id, quality, metadata
+                    FROM observations
+                    WHERE id = $1
+                    ORDER BY observed_at DESC
+                    LIMIT 1
+                    ",
+                    &[&observation_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_observation(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn query_observations(
         &self,
         tenant_id: Uuid,
@@ -1495,6 +1591,24 @@ impl ObservationStore for PostgresStorage {
             params.push(&limit);
 
             let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_observation)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn list_all_observations(&self) -> StorageResult<Vec<Observation>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, producer_entity_id, feature_of_interest_id, observed_property, value_number, value_string, value_bool, value_json, unit, observed_at, received_at, protocol, payload_format, raw_message_id, quality, metadata
+                    FROM observations
+                    ORDER BY observed_at DESC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
             rows.into_iter()
                 .map(row_to_observation)
                 .collect::<StorageResult<Vec<_>>>()
@@ -1573,6 +1687,25 @@ impl EventStore for PostgresStorage {
         })
     }
 
+    fn get_event_any_tenant(&self, event_id: Uuid) -> StorageResult<Option<Event>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, event_type, severity, source_entity_id, target_entity_id, message, occurred_at, observed_at, correlation_id, raw_message_id, observation_id, command_id, action_id, action_result_id, metadata, created_at
+                    FROM events
+                    WHERE id = $1
+                    ",
+                    &[&event_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_event(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn query_events(&self, tenant_id: Uuid, filter: EventFilter) -> StorageResult<Vec<Event>> {
         self.with_client(|client| {
             let mut sql = String::from(
@@ -1635,6 +1768,24 @@ impl EventStore for PostgresStorage {
 
             sql.push_str(" ORDER BY occurred_at DESC");
             let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_event)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn list_all_events(&self) -> StorageResult<Vec<Event>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, event_type, severity, source_entity_id, target_entity_id, message, occurred_at, observed_at, correlation_id, raw_message_id, observation_id, command_id, action_id, action_result_id, metadata, created_at
+                    FROM events
+                    ORDER BY occurred_at DESC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
             rows.into_iter()
                 .map(row_to_event)
                 .collect::<StorageResult<Vec<_>>>()
@@ -1784,6 +1935,25 @@ impl CommandStore for PostgresStorage {
         })
     }
 
+    fn get_command_any_tenant(&self, command_id: Uuid) -> StorageResult<Option<Command>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, target_entity_id, command_type, payload, status, requested_by, reason, claimed_by, claimed_at, completed_at, failure_reason, approval_status, policy_decision, retry_count, max_retries, lease_expires_at, last_claimed_by, last_failure_reason, created_at, updated_at
+                    FROM commands
+                    WHERE id = $1
+                    ",
+                    &[&command_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_command(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn query_commands(
         &self,
         tenant_id: Uuid,
@@ -1816,6 +1986,24 @@ impl CommandStore for PostgresStorage {
 
             sql.push_str(" ORDER BY created_at DESC");
             let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_command)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn list_all_commands(&self) -> StorageResult<Vec<Command>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, target_entity_id, command_type, payload, status, requested_by, reason, claimed_by, claimed_at, completed_at, failure_reason, approval_status, policy_decision, retry_count, max_retries, lease_expires_at, last_claimed_by, last_failure_reason, created_at, updated_at
+                    FROM commands
+                    ORDER BY created_at DESC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
             rows.into_iter()
                 .map(row_to_command)
                 .collect::<StorageResult<Vec<_>>>()
@@ -2044,6 +2232,22 @@ impl ActionStore for PostgresStorage {
         })
     }
 
+    fn get_action_any_tenant(&self, action_id: Uuid) -> StorageResult<Option<Action>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, command_id, executor_entity_id, action_type, status, started_at, finished_at, metadata
+                    FROM actions
+                    WHERE id = $1
+                    ",
+                    &[&action_id],
+                )
+                .map_err(map_postgres_error)?;
+            Ok(row.map(row_to_action))
+        })
+    }
+
     fn query_actions(
         &self,
         tenant_id: Uuid,
@@ -2065,6 +2269,22 @@ impl ActionStore for PostgresStorage {
             }
             sql.push_str(" ORDER BY started_at ASC NULLS FIRST, id ASC");
             let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            Ok(rows.into_iter().map(row_to_action).collect())
+        })
+    }
+
+    fn list_all_actions(&self) -> StorageResult<Vec<Action>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, command_id, executor_entity_id, action_type, status, started_at, finished_at, metadata
+                    FROM actions
+                    ORDER BY started_at DESC NULLS LAST, id DESC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
             Ok(rows.into_iter().map(row_to_action).collect())
         })
     }
@@ -2139,6 +2359,22 @@ impl ActionResultStore for PostgresStorage {
 
             sql.push_str(" ORDER BY observed_at DESC");
             let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            Ok(rows.into_iter().map(row_to_action_result).collect())
+        })
+    }
+
+    fn list_all_action_results(&self) -> StorageResult<Vec<ActionResult>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, command_id, action_id, status, verified, result_payload, observed_at, metadata
+                    FROM action_results
+                    ORDER BY observed_at DESC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
             Ok(rows.into_iter().map(row_to_action_result).collect())
         })
     }
@@ -2256,6 +2492,25 @@ impl RuleStore for PostgresStorage {
         })
     }
 
+    fn get_rule_any_tenant(&self, rule_id: Uuid) -> StorageResult<Option<Rule>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, name, description, enabled, trigger_type, target_entity_id, observed_property, event_type, condition, action, metadata, created_at, updated_at
+                    FROM rules
+                    WHERE id = $1
+                    ",
+                    &[&rule_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_rule(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn list_rules(&self, tenant_id: Uuid) -> StorageResult<Vec<Rule>> {
         self.with_client(|client| {
             let rows = client
@@ -2267,6 +2522,24 @@ impl RuleStore for PostgresStorage {
                     ORDER BY created_at ASC
                     ",
                     &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_rule)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn list_all_rules(&self) -> StorageResult<Vec<Rule>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, name, description, enabled, trigger_type, target_entity_id, observed_property, event_type, condition, action, metadata, created_at, updated_at
+                    FROM rules
+                    ORDER BY created_at ASC
+                    ",
+                    &[],
                 )
                 .map_err(map_postgres_error)?;
             rows.into_iter()
@@ -2713,6 +2986,27 @@ impl ApiTokenStore for PostgresStorage {
         })
     }
 
+    fn find_api_token_by_prefix_any_tenant(
+        &self,
+        token_prefix: &str,
+    ) -> StorageResult<Option<ApiToken>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, token_name, token_prefix, token_hash, principal_type,
+                        principal_id, scopes, expires_at, revoked_at, last_used_at, metadata,
+                        created_at, updated_at
+                    FROM api_tokens
+                    WHERE token_prefix = $1
+                    ",
+                    &[&token_prefix],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_api_token).transpose()
+        })
+    }
+
     fn update_api_token_last_used_at(
         &self,
         tenant_id: Uuid,
@@ -3123,6 +3417,49 @@ impl PolicyStore for PostgresStorage {
             Ok(policies)
         })
     }
+
+    fn list_all_policies(&self) -> StorageResult<Vec<Policy>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, target_entity_id, command_type, requires_approval, auto_execute_allowed, metadata
+                    FROM policies
+                    ORDER BY tenant_id ASC, id ASC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
+
+            let mut policies = rows
+                .into_iter()
+                .map(|row| {
+                    let metadata = row
+                        .get::<_, Option<Json<Value>>>("metadata")
+                        .map(|Json(value)| value);
+                    Policy {
+                        id: row.get("id"),
+                        tenant_id: row.get("tenant_id"),
+                        target_entity_id: row.get("target_entity_id"),
+                        command_type: row.get("command_type"),
+                        requires_approval: row.get("requires_approval"),
+                        auto_execute_allowed: row.get("auto_execute_allowed"),
+                        metadata,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            policies.sort_by_key(|policy| {
+                (
+                    policy.tenant_id,
+                    policy.target_entity_id.is_none(),
+                    policy.command_type.is_none(),
+                    policy.id,
+                )
+            });
+            Ok(policies)
+        })
+    }
 }
 
 impl ExecutorStore for PostgresStorage {
@@ -3219,6 +3556,25 @@ impl ExecutorStore for PostgresStorage {
         })
     }
 
+    fn get_executor_any_tenant(&self, executor_id: Uuid) -> StorageResult<Option<ExecutorAgent>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, agent_key, agent_type, display_name, status, last_seen_at, metadata, created_at, updated_at
+                    FROM executor_agents
+                    WHERE id = $1
+                    ",
+                    &[&executor_id],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_executor(row).map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn list_executors(&self, tenant_id: Uuid) -> StorageResult<Vec<ExecutorAgent>> {
         self.with_client(|client| {
             let rows = client
@@ -3236,6 +3592,31 @@ impl ExecutorStore for PostgresStorage {
                 .map(row_to_executor)
                 .collect::<StorageResult<Vec<_>>>()?;
             executors.sort_by(|left, right| left.agent_key.cmp(&right.agent_key));
+            Ok(executors)
+        })
+    }
+
+    fn list_all_executors(&self) -> StorageResult<Vec<ExecutorAgent>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, agent_key, agent_type, display_name, status, last_seen_at, metadata, created_at, updated_at
+                    FROM executor_agents
+                    ORDER BY tenant_id ASC, agent_key ASC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
+            let mut executors = rows
+                .into_iter()
+                .map(row_to_executor)
+                .collect::<StorageResult<Vec<_>>>()?;
+            executors.sort_by(|left, right| {
+                left.tenant_id
+                    .cmp(&right.tenant_id)
+                    .then_with(|| left.agent_key.cmp(&right.agent_key))
+            });
             Ok(executors)
         })
     }

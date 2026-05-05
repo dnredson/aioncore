@@ -724,10 +724,7 @@ fn resolve_token_auth_context(state: &AppState, request: &Request) -> AuthContex
         return state.auth_context();
     };
 
-    let token = match state
-        .storage
-        .find_api_token_by_prefix(state.tenant_id, &prefix)
-    {
+    let token = match state.storage.find_api_token_by_prefix_any_tenant(&prefix) {
         Ok(Some(token)) => token,
         Ok(None) => {
             record_token_rejected_event(state, Some(prefix), TokenRejectionReason::NotFound);
@@ -770,7 +767,7 @@ fn resolve_token_auth_context(state: &AppState, request: &Request) -> AuthContex
     let now = Utc::now();
     let _ = state
         .storage
-        .update_api_token_last_used_at(state.tenant_id, token.id, now);
+        .update_api_token_last_used_at(token.tenant_id, token.id, now);
     record_auth_token_accepted_event(
         state,
         Some(token.id),
@@ -807,6 +804,46 @@ fn auth_has_scope(auth: &AuthContext, scope: &str) -> bool {
         .scopes
         .iter()
         .any(|value| value == "admin:all" || value == scope)
+}
+
+fn is_admin_all(auth: &AuthContext) -> bool {
+    matches!(auth.mode, AuthMode::Token) && auth_has_scope(auth, "admin:all")
+}
+
+fn principal_tenant_id(auth: &AuthContext) -> Result<Uuid, ApiError> {
+    auth.principal
+        .tenant_id
+        .ok_or_else(|| ApiError::forbidden("authenticated token is missing tenant context"))
+}
+
+#[allow(dead_code)]
+fn require_same_tenant(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    resource_tenant_id: Uuid,
+) -> Result<(), ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) || is_admin_all(auth) {
+        return Ok(());
+    }
+
+    let principal_tenant_id = principal_tenant_id(auth)?;
+    if principal_tenant_id == resource_tenant_id {
+        return Ok(());
+    }
+
+    record_auth_access_denied_event(state, endpoint, Some("tenant_mismatch"), auth);
+    Err(ApiError::forbidden(format!(
+        "principal tenant does not own the resource for {endpoint}"
+    )))
+}
+
+#[allow(dead_code)]
+fn read_tenant_id(state: &AppState, auth: &AuthContext) -> Result<Uuid, ApiError> {
+    match auth.mode {
+        AuthMode::Dev | AuthMode::Disabled => Ok(state.tenant_id),
+        AuthMode::Token => principal_tenant_id(auth),
+    }
 }
 
 fn require_authenticated(
@@ -2569,10 +2606,30 @@ async fn get_entity(
     Path(entity_id): Path<Uuid>,
 ) -> Result<Json<Entity>, ApiError> {
     require_scope(&state, &auth, "/entities/:entity_id", "entities:read")?;
-    let entity = state
-        .storage
-        .get_entity(state.tenant_id, entity_id)?
-        .ok_or_else(ApiError::not_found)?;
+    let entity = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_entity(state.tenant_id, entity_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_entity_any_tenant(entity_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_entity(tenant_id, entity_id)? {
+            Some(entity) => entity,
+            None => {
+                if state.storage.get_entity_any_tenant(entity_id)?.is_some() {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /entities/:entity_id",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
 
     Ok(Json(entity))
 }
@@ -2582,7 +2639,14 @@ async fn list_entities(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<Entity>>, ApiError> {
     require_scope(&state, &auth, "/entities", "entities:read")?;
-    Ok(Json(state.storage.list_entities(state.tenant_id)?))
+    let entities = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state.storage.list_entities(state.tenant_id)?
+    } else if is_admin_all(&auth) {
+        state.storage.list_all_entities()?
+    } else {
+        state.storage.list_entities(principal_tenant_id(&auth)?)?
+    };
+    Ok(Json(entities))
 }
 
 async fn create_relationship(
@@ -2651,19 +2715,69 @@ async fn get_entity_context(
         "/entities/:entity_id/context",
         "entities:read",
     )?;
-    let entity = state
-        .storage
-        .get_entity(state.tenant_id, entity_id)?
-        .ok_or_else(ApiError::not_found)?;
+    let entity = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_entity(state.tenant_id, entity_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_entity_any_tenant(entity_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_entity(tenant_id, entity_id)? {
+            Some(entity) => entity,
+            None => {
+                if state.storage.get_entity_any_tenant(entity_id)?.is_some() {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /entities/:entity_id/context",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
 
-    let outgoing_relationships =
-        state
-            .storage
-            .list_relationships(state.tenant_id, Some(entity_id), None)?;
-    let incoming_relationships =
-        state
-            .storage
-            .list_relationships(state.tenant_id, None, Some(entity_id))?;
+    let outgoing_relationships = state
+        .storage
+        .list_relationships(entity.tenant_id, Some(entity_id), None)?
+        .into_iter()
+        .filter(|relationship| {
+            state
+                .storage
+                .get_entity(relationship.tenant_id, relationship.source_entity_id)
+                .ok()
+                .flatten()
+                .is_some()
+                && state
+                    .storage
+                    .get_entity(relationship.tenant_id, relationship.target_entity_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+        })
+        .collect::<Vec<_>>();
+    let incoming_relationships = state
+        .storage
+        .list_relationships(entity.tenant_id, None, Some(entity_id))?
+        .into_iter()
+        .filter(|relationship| {
+            state
+                .storage
+                .get_entity(relationship.tenant_id, relationship.source_entity_id)
+                .ok()
+                .flatten()
+                .is_some()
+                && state
+                    .storage
+                    .get_entity(relationship.tenant_id, relationship.target_entity_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+        })
+        .collect::<Vec<_>>();
 
     Ok(Json(EntityContextResponse {
         entity,
@@ -3511,11 +3625,34 @@ async fn get_capabilities(
         "/entities/:entity_id/capabilities",
         "capabilities:read",
     )?;
-    ensure_entity_exists(&state, entity_id)?;
+    let entity = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_entity(state.tenant_id, entity_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_entity_any_tenant(entity_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_entity(tenant_id, entity_id)? {
+            Some(entity) => entity,
+            None => {
+                if state.storage.get_entity_any_tenant(entity_id)?.is_some() {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /entities/:entity_id/capabilities",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
     Ok(Json(
         state
             .storage
-            .list_capabilities(state.tenant_id, entity_id)?,
+            .list_capabilities(entity.tenant_id, entity_id)?,
     ))
 }
 
@@ -3554,11 +3691,39 @@ async fn query_policies(
     Query(query): Query<PolicyQuery>,
 ) -> Result<Json<Vec<Policy>>, ApiError> {
     require_scope(&state, &auth, "/policies", "policies:read")?;
-    Ok(Json(state.storage.query_policies(
-        state.tenant_id,
-        query.target_entity_id,
-        query.command_type.as_deref(),
-    )?))
+    let policies = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state.storage.query_policies(
+            state.tenant_id,
+            query.target_entity_id,
+            query.command_type.as_deref(),
+        )?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .list_all_policies()?
+            .into_iter()
+            .filter(|policy| {
+                query
+                    .target_entity_id
+                    .map(|id| policy.target_entity_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|policy| {
+                query
+                    .command_type
+                    .as_deref()
+                    .map(|command_type| policy.command_type.as_deref() == Some(command_type))
+                    .unwrap_or(true)
+            })
+            .collect()
+    } else {
+        state.storage.query_policies(
+            principal_tenant_id(&auth)?,
+            query.target_entity_id,
+            query.command_type.as_deref(),
+        )?
+    };
+    Ok(Json(policies))
 }
 
 async fn create_rule(
@@ -3594,7 +3759,14 @@ async fn list_rules(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<Rule>>, ApiError> {
     require_scope(&state, &auth, "/rules", "rules:read")?;
-    Ok(Json(state.storage.list_rules(state.tenant_id)?))
+    let rules = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state.storage.list_rules(state.tenant_id)?
+    } else if is_admin_all(&auth) {
+        state.storage.list_all_rules()?
+    } else {
+        state.storage.list_rules(principal_tenant_id(&auth)?)?
+    };
+    Ok(Json(rules))
 }
 
 async fn get_rule(
@@ -3603,12 +3775,31 @@ async fn get_rule(
     Path(rule_id): Path<Uuid>,
 ) -> Result<Json<Rule>, ApiError> {
     require_scope(&state, &auth, "/rules/:rule_id", "rules:read")?;
-    Ok(Json(
+    let rule = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
         state
             .storage
             .get_rule(state.tenant_id, rule_id)?
-            .ok_or_else(ApiError::not_found)?,
-    ))
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_rule_any_tenant(rule_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_rule(tenant_id, rule_id)? {
+            Some(rule) => rule,
+            None => {
+                if state.storage.get_rule_any_tenant(rule_id)?.is_some() {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /rules/:rule_id",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
+    Ok(Json(rule))
 }
 
 async fn enable_rule(
@@ -3696,7 +3887,14 @@ async fn list_executors(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<ExecutorAgent>>, ApiError> {
     require_scope(&state, &auth, "/executors", "executors:read")?;
-    Ok(Json(state.storage.list_executors(state.tenant_id)?))
+    let executors = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state.storage.list_executors(state.tenant_id)?
+    } else if is_admin_all(&auth) {
+        state.storage.list_all_executors()?
+    } else {
+        state.storage.list_executors(principal_tenant_id(&auth)?)?
+    };
+    Ok(Json(executors))
 }
 
 async fn get_executor(
@@ -3705,7 +3903,35 @@ async fn get_executor(
     Path(executor_id): Path<Uuid>,
 ) -> Result<Json<ExecutorAgent>, ApiError> {
     require_scope(&state, &auth, "/executors/:executor_id", "executors:read")?;
-    Ok(Json(get_executor_agent(&state, executor_id)?))
+    let executor = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_executor(state.tenant_id, executor_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_executor_any_tenant(executor_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_executor(tenant_id, executor_id)? {
+            Some(executor) => executor,
+            None => {
+                if state
+                    .storage
+                    .get_executor_any_tenant(executor_id)?
+                    .is_some()
+                {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /executors/:executor_id",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
+    Ok(Json(executor))
 }
 
 async fn heartbeat_executor(
@@ -3777,9 +4003,36 @@ async fn get_executor_capabilities(
         "/executors/:executor_id/capabilities",
         "executors:read",
     )?;
-    ensure_executor_exists(&state, executor_id)?;
+    let executor = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_executor(state.tenant_id, executor_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_executor_any_tenant(executor_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_executor(tenant_id, executor_id)? {
+            Some(executor) => executor,
+            None => {
+                if state
+                    .storage
+                    .get_executor_any_tenant(executor_id)?
+                    .is_some()
+                {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /executors/:executor_id/capabilities",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
     Ok(Json(state.storage.list_executor_capabilities(
-        state.tenant_id,
+        executor.tenant_id,
         executor_id,
     )?))
 }
@@ -3825,11 +4078,38 @@ async fn get_executor_scopes(
         "/executors/:executor_id/scopes",
         "executors:read",
     )?;
-    ensure_executor_exists(&state, executor_id)?;
+    let executor = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_executor(state.tenant_id, executor_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_executor_any_tenant(executor_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_executor(tenant_id, executor_id)? {
+            Some(executor) => executor,
+            None => {
+                if state
+                    .storage
+                    .get_executor_any_tenant(executor_id)?
+                    .is_some()
+                {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /executors/:executor_id/scopes",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
     Ok(Json(
         state
             .storage
-            .list_executor_scopes(state.tenant_id, executor_id)?,
+            .list_executor_scopes(executor.tenant_id, executor_id)?,
     ))
 }
 
@@ -4743,10 +5023,30 @@ async fn get_command(
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
     require_scope(&state, &auth, "/commands/:command_id", "commands:read")?;
-    let command = state
-        .storage
-        .get_command(state.tenant_id, command_id)?
-        .ok_or_else(ApiError::not_found)?;
+    let command = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_command(state.tenant_id, command_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_command_any_tenant(command_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_command(tenant_id, command_id)? {
+            Some(command) => command,
+            None => {
+                if state.storage.get_command_any_tenant(command_id)?.is_some() {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /commands/:command_id",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
 
     Ok(Json(command))
 }
@@ -4757,11 +5057,37 @@ async fn query_commands(
     Query(query): Query<CommandQuery>,
 ) -> Result<Json<Vec<Command>>, ApiError> {
     require_scope(&state, &auth, "/commands", "commands:read")?;
-    Ok(Json(state.storage.query_commands(
-        state.tenant_id,
-        query.target_entity_id,
-        query.status,
-    )?))
+    let commands = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .query_commands(state.tenant_id, query.target_entity_id, query.status)?
+    } else if is_admin_all(&auth) {
+        let status = query.status.clone();
+        state
+            .storage
+            .list_all_commands()?
+            .into_iter()
+            .filter(|command| {
+                query
+                    .target_entity_id
+                    .map(|id| command.target_entity_id == id)
+                    .unwrap_or(true)
+            })
+            .filter(|command| {
+                status
+                    .as_ref()
+                    .map(|value| command.status == *value)
+                    .unwrap_or(true)
+            })
+            .collect()
+    } else {
+        state.storage.query_commands(
+            principal_tenant_id(&auth)?,
+            query.target_entity_id,
+            query.status,
+        )?
+    };
+    Ok(Json(commands))
 }
 
 async fn create_action(
@@ -4795,10 +5121,30 @@ async fn get_action(
     Path(action_id): Path<Uuid>,
 ) -> Result<Json<Action>, ApiError> {
     require_scope(&state, &auth, "/actions/:action_id", "actions:read")?;
-    let action = state
-        .storage
-        .get_action(state.tenant_id, action_id)?
-        .ok_or_else(ApiError::not_found)?;
+    let action = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_action(state.tenant_id, action_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_action_any_tenant(action_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_action(tenant_id, action_id)? {
+            Some(action) => action,
+            None => {
+                if state.storage.get_action_any_tenant(action_id)?.is_some() {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /actions/:action_id",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
 
     Ok(Json(action))
 }
@@ -4809,11 +5155,28 @@ async fn query_actions(
     Query(query): Query<ActionQuery>,
 ) -> Result<Json<Vec<Action>>, ApiError> {
     require_scope(&state, &auth, "/actions", "actions:read")?;
-    Ok(Json(
+    let actions = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
         state
             .storage
-            .query_actions(state.tenant_id, query.command_id)?,
-    ))
+            .query_actions(state.tenant_id, query.command_id)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .list_all_actions()?
+            .into_iter()
+            .filter(|action| {
+                query
+                    .command_id
+                    .map(|id| action.command_id == id)
+                    .unwrap_or(true)
+            })
+            .collect()
+    } else {
+        state
+            .storage
+            .query_actions(principal_tenant_id(&auth)?, query.command_id)?
+    };
+    Ok(Json(actions))
 }
 
 async fn create_action_result(
@@ -4853,11 +5216,36 @@ async fn query_action_results(
     Query(query): Query<ActionResultQuery>,
 ) -> Result<Json<Vec<ActionResult>>, ApiError> {
     require_scope(&state, &auth, "/action-results", "actions:read")?;
-    Ok(Json(state.storage.query_action_results(
-        state.tenant_id,
-        query.action_id,
-        query.command_id,
-    )?))
+    let results = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .query_action_results(state.tenant_id, query.action_id, query.command_id)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .list_all_action_results()?
+            .into_iter()
+            .filter(|result| {
+                query
+                    .action_id
+                    .map(|id| result.action_id == id)
+                    .unwrap_or(true)
+            })
+            .filter(|result| {
+                query
+                    .command_id
+                    .map(|id| result.command_id == id)
+                    .unwrap_or(true)
+            })
+            .collect()
+    } else {
+        state.storage.query_action_results(
+            principal_tenant_id(&auth)?,
+            query.action_id,
+            query.command_id,
+        )?
+    };
+    Ok(Json(results))
 }
 
 async fn create_event(
@@ -4914,10 +5302,30 @@ async fn get_event(
     Path(event_id): Path<Uuid>,
 ) -> Result<Json<Event>, ApiError> {
     require_scope(&state, &auth, "/events/:event_id", "events:read")?;
-    let event = state
-        .storage
-        .get_event(state.tenant_id, event_id)?
-        .ok_or_else(ApiError::not_found)?;
+    let event = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_event(state.tenant_id, event_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_event_any_tenant(event_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_event(tenant_id, event_id)? {
+            Some(event) => event,
+            None => {
+                if state.storage.get_event_any_tenant(event_id)?.is_some() {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /events/:event_id",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
 
     Ok(Json(event))
 }
@@ -4928,18 +5336,75 @@ async fn query_events(
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
     require_scope(&state, &auth, "/events", "events:read")?;
-    let events = state.storage.query_events(
-        state.tenant_id,
-        EventFilter {
-            source_entity_id: query.source_entity_id,
-            target_entity_id: query.target_entity_id,
-            event_type: query.event_type.clone(),
-            severity: query.severity.clone(),
-            command_id: query.command_id,
-            raw_message_id: query.raw_message_id,
-            correlation_id: query.correlation_id.clone(),
-        },
-    )?;
+    let filter = EventFilter {
+        source_entity_id: query.source_entity_id,
+        target_entity_id: query.target_entity_id,
+        event_type: query.event_type.clone(),
+        severity: query.severity.clone(),
+        command_id: query.command_id,
+        raw_message_id: query.raw_message_id,
+        correlation_id: query.correlation_id.clone(),
+    };
+    let events = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .query_events(state.tenant_id, filter.clone())?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .list_all_events()?
+            .into_iter()
+            .filter(|event| {
+                filter
+                    .source_entity_id
+                    .map(|id| event.source_entity_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .target_entity_id
+                    .map(|id| event.target_entity_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .event_type
+                    .as_deref()
+                    .map(|event_type| event.event_type == event_type)
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .severity
+                    .as_ref()
+                    .map(|severity| event.severity == *severity)
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .command_id
+                    .map(|id| event.command_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .raw_message_id
+                    .map(|id| event.raw_message_id == Some(id))
+                    .unwrap_or(true)
+            })
+            .filter(|event| {
+                filter
+                    .correlation_id
+                    .as_deref()
+                    .map(|correlation_id| event.correlation_id.as_deref() == Some(correlation_id))
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        state
+            .storage
+            .query_events(principal_tenant_id(&auth)?, filter.clone())?
+    };
     let events = events
         .into_iter()
         .filter(|event| event_matches_metadata_filters(event, &query))
@@ -4983,14 +5448,36 @@ async fn query_observations(
     Query(query): Query<ObservationQuery>,
 ) -> Result<Json<Vec<Observation>>, ApiError> {
     require_scope(&state, &auth, "/observations", "observations:read")?;
-    let observations = state.storage.query_observations(
-        state.tenant_id,
-        query.feature_of_interest_id,
-        query.observed_property.as_deref(),
-        None,
-        None,
-        query.limit.unwrap_or(100),
-    )?;
+    let observations = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state.storage.query_observations(
+            state.tenant_id,
+            query.feature_of_interest_id,
+            query.observed_property.as_deref(),
+            None,
+            None,
+            query.limit.unwrap_or(100),
+        )?
+    } else if is_admin_all(&auth) {
+        let mut observations = state.storage.list_all_observations()?;
+        if let Some(feature_of_interest_id) = query.feature_of_interest_id {
+            observations
+                .retain(|observation| observation.feature_of_interest_id == feature_of_interest_id);
+        }
+        if let Some(observed_property) = query.observed_property.as_deref() {
+            observations.retain(|observation| observation.observed_property == observed_property);
+        }
+        observations.truncate(query.limit.unwrap_or(100) as usize);
+        observations
+    } else {
+        state.storage.query_observations(
+            principal_tenant_id(&auth)?,
+            query.feature_of_interest_id,
+            query.observed_property.as_deref(),
+            None,
+            None,
+            query.limit.unwrap_or(100),
+        )?
+    };
     let observations = if let Some(raw_message_id) = query.raw_message_id {
         observations
             .into_iter()
@@ -5014,10 +5501,34 @@ async fn get_raw_message(
         "/raw-messages/:raw_message_id",
         "raw-messages:read",
     )?;
-    let raw_message = state
-        .storage
-        .get_raw_message(state.tenant_id, raw_message_id)?
-        .ok_or_else(ApiError::not_found)?;
+    let raw_message = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state
+            .storage
+            .get_raw_message(state.tenant_id, raw_message_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else if is_admin_all(&auth) {
+        state
+            .storage
+            .get_raw_message_any_tenant(raw_message_id)?
+            .ok_or_else(ApiError::not_found)?
+    } else {
+        let tenant_id = principal_tenant_id(&auth)?;
+        match state.storage.get_raw_message(tenant_id, raw_message_id)? {
+            Some(raw_message) => raw_message,
+            None => {
+                if state
+                    .storage
+                    .get_raw_message_any_tenant(raw_message_id)?
+                    .is_some()
+                {
+                    return Err(ApiError::forbidden(
+                        "principal tenant does not own the resource for /raw-messages/:raw_message_id",
+                    ));
+                }
+                return Err(ApiError::not_found());
+            }
+        }
+    };
 
     Ok(Json(raw_message_response(raw_message)))
 }
@@ -5028,66 +5539,70 @@ async fn query_raw_messages(
     Query(query): Query<RawMessageQuery>,
 ) -> Result<Json<Vec<RawMessageResponse>>, ApiError> {
     require_scope(&state, &auth, "/raw-messages", "raw-messages:read")?;
-    let raw_messages = state
-        .storage
-        .list_raw_messages(state.tenant_id)?
-        .into_iter()
-        .filter(|raw_message| {
-            query
-                .producer_entity_id
-                .map(|id| raw_message_uuid_header(raw_message, "producer_entity_id") == Some(id))
-                .unwrap_or(true)
-        })
-        .filter(|raw_message| {
-            query
-                .feature_of_interest_id
-                .map(|id| {
-                    raw_message_uuid_header(raw_message, "feature_of_interest_id") == Some(id)
-                })
-                .unwrap_or(true)
-        })
-        .filter(|raw_message| {
-            query
-                .payload_format
-                .as_deref()
-                .map(|payload_format| {
-                    raw_message_string_header(raw_message, "payload_format")
-                        .map(|value| value.eq_ignore_ascii_case(payload_format))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true)
-        })
-        .filter(|raw_message| {
-            query
-                .connector_id
-                .map(|id| raw_message_uuid_header(raw_message, "connector_id") == Some(id))
-                .unwrap_or(true)
-        })
-        .filter(|raw_message| {
-            query
-                .connector_key
-                .as_deref()
-                .map(|connector_key| {
-                    raw_message_string_header(raw_message, "connector_key")
-                        .map(|value| value == connector_key)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true)
-        })
-        .filter(|raw_message| {
-            query
-                .connector_profile
-                .as_deref()
-                .map(|connector_profile| {
-                    raw_message_string_header(raw_message, "connector_profile")
-                        .map(|value| value.eq_ignore_ascii_case(connector_profile))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true)
-        })
-        .filter(|raw_message| raw_message_matches_provenance_filters(raw_message, &query))
-        .map(raw_message_response)
-        .collect::<Vec<_>>();
+    let raw_messages = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        state.storage.list_raw_messages(state.tenant_id)?
+    } else if is_admin_all(&auth) {
+        state.storage.list_all_raw_messages()?
+    } else {
+        state
+            .storage
+            .list_raw_messages(principal_tenant_id(&auth)?)?
+    }
+    .into_iter()
+    .filter(|raw_message| {
+        query
+            .producer_entity_id
+            .map(|id| raw_message_uuid_header(raw_message, "producer_entity_id") == Some(id))
+            .unwrap_or(true)
+    })
+    .filter(|raw_message| {
+        query
+            .feature_of_interest_id
+            .map(|id| raw_message_uuid_header(raw_message, "feature_of_interest_id") == Some(id))
+            .unwrap_or(true)
+    })
+    .filter(|raw_message| {
+        query
+            .payload_format
+            .as_deref()
+            .map(|payload_format| {
+                raw_message_string_header(raw_message, "payload_format")
+                    .map(|value| value.eq_ignore_ascii_case(payload_format))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
+    })
+    .filter(|raw_message| {
+        query
+            .connector_id
+            .map(|id| raw_message_uuid_header(raw_message, "connector_id") == Some(id))
+            .unwrap_or(true)
+    })
+    .filter(|raw_message| {
+        query
+            .connector_key
+            .as_deref()
+            .map(|connector_key| {
+                raw_message_string_header(raw_message, "connector_key")
+                    .map(|value| value == connector_key)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
+    })
+    .filter(|raw_message| {
+        query
+            .connector_profile
+            .as_deref()
+            .map(|connector_profile| {
+                raw_message_string_header(raw_message, "connector_profile")
+                    .map(|value| value.eq_ignore_ascii_case(connector_profile))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
+    })
+    .filter(|raw_message| raw_message_matches_provenance_filters(raw_message, &query))
+    .map(raw_message_response)
+    .collect::<Vec<_>>();
 
     Ok(Json(raw_messages))
 }
@@ -12015,7 +12530,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aion_storage::ApiTokenStore;
+    use aion_storage::{ApiTokenStore, RelationshipStore};
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
@@ -14498,6 +15013,529 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "uri={uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn dev_mode_keeps_cross_tenant_bypass_behavior_for_entity_reads() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let entity_id =
+            create_test_entity(&tenant_a_app, "tenant-a-dev-bypass-entity", "aion:Sensor").await;
+        let tenant_b_token = store_api_token_for_tenant(
+            &storage,
+            tenant_b,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-b-reader"),
+            &["entities:read"],
+        );
+
+        let response = tenant_a_app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/entities/{entity_id}"),
+                &tenant_b_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_enforces_tenant_ownership_for_entities_and_admin_bypass() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let entity_a = create_test_entity(&tenant_a_app, "tenant-a-entity-01", "aion:Sensor").await;
+        let entity_b = create_test_entity(&tenant_b_app, "tenant-b-entity-01", "aion:Sensor").await;
+        let tenant_a_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-reader"),
+            &["entities:read"],
+        );
+        let tenant_b_token = store_api_token_for_tenant(
+            &storage,
+            tenant_b,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-b-reader"),
+            &["entities:read"],
+        );
+        let admin_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Admin,
+            Some("platform-admin"),
+            &["admin:all"],
+        );
+
+        let allowed = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/entities/{entity_a}"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let denied = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/entities/{entity_a}"),
+                &tenant_b_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let tenant_a_entities = to_json(
+            app.clone()
+                .oneshot(auth_request("GET", "/entities", &tenant_a_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(tenant_a_entities.as_array().unwrap().len(), 1);
+        assert_eq!(tenant_a_entities[0]["id"], entity_a);
+
+        let admin_entities = to_json(
+            app.clone()
+                .oneshot(auth_request("GET", "/entities", &admin_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(admin_entities.as_array().unwrap().len(), 2);
+
+        let admin_detail = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/entities/{entity_b}"),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(admin_detail.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn entity_context_filters_cross_tenant_relationships() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let source_id =
+            create_test_entity(&tenant_a_app, "tenant-a-context-source", "aion:Pump").await;
+        let same_tenant_target =
+            create_test_entity(&tenant_a_app, "tenant-a-context-target", "aion:Valve").await;
+        let cross_tenant_target =
+            create_test_entity(&tenant_b_app, "tenant-b-context-target", "aion:Valve").await;
+        let source_uuid = Uuid::parse_str(&source_id).unwrap();
+        let same_tenant_target_uuid = Uuid::parse_str(&same_tenant_target).unwrap();
+        let cross_tenant_target_uuid = Uuid::parse_str(&cross_tenant_target).unwrap();
+
+        storage
+            .create_relationship(
+                Relationship::new(
+                    tenant_a,
+                    source_uuid,
+                    "aion:connectedTo".to_string(),
+                    same_tenant_target_uuid,
+                    json!({"@type": "aion:Relationship"}),
+                    Utc::now(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        storage
+            .create_relationship(
+                Relationship::new(
+                    tenant_a,
+                    source_uuid,
+                    "aion:connectedTo".to_string(),
+                    cross_tenant_target_uuid,
+                    json!({"@type": "aion:Relationship"}),
+                    Utc::now(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let admin_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Admin,
+            Some("platform-admin"),
+            &["admin:all"],
+        );
+        let response = to_json(
+            app.oneshot(auth_request(
+                "GET",
+                &format!("/entities/{source_id}/context"),
+                &admin_token,
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+
+        let outgoing = response["outgoing_relationships"].as_array().unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0]["target_entity_id"], same_tenant_target);
+    }
+
+    #[tokio::test]
+    async fn token_mode_filters_observations_commands_actions_rules_policies_and_events_by_tenant()
+    {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let sensor_a =
+            create_test_entity(&tenant_a_app, "tenant-a-obs-sensor", "aion:Sensor").await;
+        let plot_a = create_test_entity(&tenant_a_app, "tenant-a-obs-plot", "aion:Plot").await;
+        let sensor_b =
+            create_test_entity(&tenant_b_app, "tenant-b-obs-sensor", "aion:Sensor").await;
+        let plot_b = create_test_entity(&tenant_b_app, "tenant-b-obs-plot", "aion:Plot").await;
+        let ingest_a = ingest_test_senml(&tenant_a_app, &sensor_a, &plot_a).await;
+        let ingest_b = ingest_test_senml(&tenant_b_app, &sensor_b, &plot_b).await;
+        let command_a = create_test_command(&tenant_a_app, &plot_a, "StartPump").await;
+        let command_b = create_test_command(&tenant_b_app, &plot_b, "StartPump").await;
+        let command_a_id = command_a["id"].as_str().unwrap();
+        let command_b_id = command_b["id"].as_str().unwrap();
+        let action_a = to_json(
+            tenant_a_app
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/actions",
+                    json!({
+                        "command_id": command_a_id,
+                        "action_type": "StartPump",
+                        "status": "completed",
+                        "started_at": "2026-05-05T12:00:00Z",
+                        "finished_at": "2026-05-05T12:01:00Z"
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let action_b = to_json(
+            tenant_b_app
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/actions",
+                    json!({
+                        "command_id": command_b_id,
+                        "action_type": "StartPump",
+                        "status": "completed",
+                        "started_at": "2026-05-05T12:00:00Z",
+                        "finished_at": "2026-05-05T12:01:00Z"
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let action_a_id = action_a["id"].as_str().unwrap();
+        let action_b_id = action_b["id"].as_str().unwrap();
+        tenant_a_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/action-results",
+                json!({
+                    "command_id": command_a_id,
+                    "action_id": action_a_id,
+                    "status": "succeeded",
+                    "verified": true,
+                    "result_payload": {"ok": true},
+                    "observed_at": "2026-05-05T12:01:30Z"
+                }),
+            ))
+            .await
+            .unwrap();
+        tenant_b_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/action-results",
+                json!({
+                    "command_id": command_b_id,
+                    "action_id": action_b_id,
+                    "status": "succeeded",
+                    "verified": true,
+                    "result_payload": {"ok": true},
+                    "observed_at": "2026-05-05T12:01:30Z"
+                }),
+            ))
+            .await
+            .unwrap();
+        let tank_a =
+            create_test_entity(&tenant_a_app, "tenant-a-rule-tank", "aion:WaterTank").await;
+        let pump_a = create_test_entity(&tenant_a_app, "tenant-a-rule-pump", "aion:Pump").await;
+        let tank_b =
+            create_test_entity(&tenant_b_app, "tenant-b-rule-tank", "aion:WaterTank").await;
+        let pump_b = create_test_entity(&tenant_b_app, "tenant-b-rule-pump", "aion:Pump").await;
+        create_low_water_command_rule(&tenant_a_app, &tank_a, &pump_a, true, 20.0).await;
+        create_low_water_command_rule(&tenant_b_app, &tank_b, &pump_b, true, 20.0).await;
+        put_start_pump_policy(&tenant_a_app, &plot_a, true).await;
+        put_start_pump_policy(&tenant_b_app, &plot_b, true).await;
+
+        let tenant_a_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-reader"),
+            &[
+                "observations:read",
+                "commands:read",
+                "actions:read",
+                "rules:read",
+                "policies:read",
+                "events:read",
+                "raw-messages:read",
+            ],
+        );
+
+        let observations = to_json(
+            app.clone()
+                .oneshot(auth_request("GET", "/observations", &tenant_a_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(observations.as_array().unwrap().len(), 2);
+
+        let commands = to_json(
+            app.clone()
+                .oneshot(auth_request("GET", "/commands", &tenant_a_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(commands.as_array().unwrap().len(), 1);
+        assert_eq!(commands[0]["id"], command_a_id);
+
+        let denied_command_detail = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/commands/{command_b_id}"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_command_detail.status(), StatusCode::FORBIDDEN);
+
+        let actions = to_json(
+            app.clone()
+                .oneshot(auth_request(
+                    "GET",
+                    &format!("/actions?command_id={command_a_id}"),
+                    &tenant_a_token,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(actions.as_array().unwrap().len(), 1);
+
+        let action_results = to_json(
+            app.clone()
+                .oneshot(auth_request(
+                    "GET",
+                    &format!("/action-results?command_id={command_a_id}"),
+                    &tenant_a_token,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(action_results.as_array().unwrap().len(), 1);
+
+        let rules = to_json(
+            app.clone()
+                .oneshot(auth_request("GET", "/rules", &tenant_a_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(rules.as_array().unwrap().len(), 1);
+
+        let policies = to_json(
+            app.clone()
+                .oneshot(auth_request("GET", "/policies", &tenant_a_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(policies.as_array().unwrap().len(), 1);
+
+        let raw_messages = to_json(
+            app.clone()
+                .oneshot(auth_request("GET", "/raw-messages", &tenant_a_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(raw_messages.as_array().unwrap().len(), 1);
+
+        let tenant_a_events = to_json(
+            app.clone()
+                .oneshot(auth_request(
+                    "GET",
+                    &format!(
+                        "/events?raw_message_id={}",
+                        ingest_a["raw_message_id"].as_str().unwrap()
+                    ),
+                    &tenant_a_token,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!tenant_a_events.as_array().unwrap().is_empty());
+
+        let cross_tenant_event_id = query_events_by_raw_message(
+            &tenant_b_app,
+            ingest_b["raw_message_id"].as_str().unwrap(),
+        )
+        .await[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let denied_event = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/events/{cross_tenant_event_id}"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_event.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_enforces_tenant_ownership_for_capabilities_and_executor_reads() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let entity_b =
+            create_test_entity(&tenant_b_app, "tenant-b-capability-entity", "aion:Pump").await;
+        tenant_b_app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/entities/{entity_b}/capabilities"),
+                json!([
+                    {
+                        "capability_name": "pump:start",
+                        "command_type": "StartPump",
+                        "protocol": "http"
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+        let executor_b = create_test_executor(&tenant_b_app, "tenant-b-executor-01").await;
+        let executor_b_id = executor_b["id"].as_str().unwrap();
+        tenant_b_app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/executors/{executor_b_id}/capabilities"),
+                json!([
+                    {
+                        "command_type": "StartPump",
+                        "protocol": "http"
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+        tenant_b_app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/executors/{executor_b_id}/scopes"),
+                json!([
+                    {
+                        "entity_type": "aion:Pump",
+                        "metadata": {"source": "test"}
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+
+        let tenant_a_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-reader"),
+            &["capabilities:read", "executors:read"],
+        );
+
+        let capability_denied = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/entities/{entity_b}/capabilities"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(capability_denied.status(), StatusCode::FORBIDDEN);
+
+        let executor_denied = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/executors/{executor_b_id}"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(executor_denied.status(), StatusCode::FORBIDDEN);
+
+        let executor_caps_denied = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/executors/{executor_b_id}/capabilities"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(executor_caps_denied.status(), StatusCode::FORBIDDEN);
+
+        let executor_scopes_denied = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/executors/{executor_b_id}/scopes"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(executor_scopes_denied.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -22274,6 +23312,18 @@ mod tests {
         ))
     }
 
+    fn dev_mode_app_with_storage_for_tenant(
+        storage: Arc<InMemoryStorage>,
+        tenant_id: Uuid,
+    ) -> Router {
+        app_with_state(AppState::with_backend_storage_and_auth(
+            storage,
+            StorageBackendName::Memory,
+            AuthConfig::default(),
+            tenant_id,
+        ))
+    }
+
     fn dev_mode_app_with_storage(storage: Arc<InMemoryStorage>) -> Router {
         app_with_state(AppState::with_backend_storage_and_auth(
             storage,
@@ -22316,9 +23366,19 @@ mod tests {
         principal_id: Option<&str>,
         scopes: &[&str],
     ) -> String {
+        store_api_token_for_tenant(storage, Uuid::nil(), principal_type, principal_id, scopes)
+    }
+
+    fn store_api_token_for_tenant(
+        storage: &Arc<InMemoryStorage>,
+        tenant_id: Uuid,
+        principal_type: ApiTokenPrincipalType,
+        principal_id: Option<&str>,
+        scopes: &[&str],
+    ) -> String {
         let issued = issue_api_token();
         let token = ApiToken::new(
-            Uuid::nil(),
+            tenant_id,
             "test-token",
             issued.token_prefix.clone(),
             issued.token_hash,

@@ -577,9 +577,11 @@ pub trait EntityStore {
     fn create_entity(&self, entity: Entity) -> StorageResult<Entity>;
     fn update_entity(&self, entity: Entity) -> StorageResult<Entity>;
     fn get_entity(&self, tenant_id: Uuid, entity_id: Uuid) -> StorageResult<Option<Entity>>;
+    fn get_entity_any_tenant(&self, entity_id: Uuid) -> StorageResult<Option<Entity>>;
     fn get_entity_by_key(&self, tenant_id: Uuid, entity_key: &str)
         -> StorageResult<Option<Entity>>;
     fn list_entities(&self, tenant_id: Uuid) -> StorageResult<Vec<Entity>>;
+    fn list_all_entities(&self) -> StorageResult<Vec<Entity>>;
 }
 
 pub trait RelationshipStore {
@@ -599,7 +601,10 @@ pub trait RawMessageStore {
         tenant_id: Uuid,
         raw_message_id: Uuid,
     ) -> StorageResult<Option<RawMessage>>;
+    fn get_raw_message_any_tenant(&self, raw_message_id: Uuid)
+        -> StorageResult<Option<RawMessage>>;
     fn list_raw_messages(&self, tenant_id: Uuid) -> StorageResult<Vec<RawMessage>>;
+    fn list_all_raw_messages(&self) -> StorageResult<Vec<RawMessage>>;
     fn query_raw_messages(
         &self,
         tenant_id: Uuid,
@@ -627,6 +632,10 @@ pub trait ObservationStore {
         tenant_id: Uuid,
         observation_id: Uuid,
     ) -> StorageResult<Option<Observation>>;
+    fn get_observation_any_tenant(
+        &self,
+        observation_id: Uuid,
+    ) -> StorageResult<Option<Observation>>;
     fn query_observations(
         &self,
         tenant_id: Uuid,
@@ -636,6 +645,7 @@ pub trait ObservationStore {
         to: Option<DateTime<Utc>>,
         limit: u32,
     ) -> StorageResult<Vec<Observation>>;
+    fn list_all_observations(&self) -> StorageResult<Vec<Observation>>;
 }
 
 pub trait PayloadProfileStore {
@@ -686,6 +696,10 @@ pub trait ApiTokenStore {
     fn find_api_token_by_prefix(
         &self,
         tenant_id: Uuid,
+        token_prefix: &str,
+    ) -> StorageResult<Option<ApiToken>>;
+    fn find_api_token_by_prefix_any_tenant(
+        &self,
         token_prefix: &str,
     ) -> StorageResult<Option<ApiToken>>;
     fn update_api_token_last_used_at(
@@ -756,7 +770,9 @@ pub trait ExecutorStore {
         tenant_id: Uuid,
         executor_id: Uuid,
     ) -> StorageResult<Option<ExecutorAgent>>;
+    fn get_executor_any_tenant(&self, executor_id: Uuid) -> StorageResult<Option<ExecutorAgent>>;
     fn list_executors(&self, tenant_id: Uuid) -> StorageResult<Vec<ExecutorAgent>>;
+    fn list_all_executors(&self) -> StorageResult<Vec<ExecutorAgent>>;
     fn put_executor_capabilities(
         &self,
         tenant_id: Uuid,
@@ -811,12 +827,14 @@ pub trait CommandStore {
     fn store_command(&self, command: Command) -> StorageResult<Command>;
     fn update_command(&self, command: Command) -> StorageResult<Command>;
     fn get_command(&self, tenant_id: Uuid, command_id: Uuid) -> StorageResult<Option<Command>>;
+    fn get_command_any_tenant(&self, command_id: Uuid) -> StorageResult<Option<Command>>;
     fn query_commands(
         &self,
         tenant_id: Uuid,
         target_entity_id: Option<Uuid>,
         status: Option<CommandStatus>,
     ) -> StorageResult<Vec<Command>>;
+    fn list_all_commands(&self) -> StorageResult<Vec<Command>>;
 }
 
 pub trait CommandLeaseStore {
@@ -848,16 +866,19 @@ pub trait PolicyStore {
         target_entity_id: Option<Uuid>,
         command_type: Option<&str>,
     ) -> StorageResult<Vec<Policy>>;
+    fn list_all_policies(&self) -> StorageResult<Vec<Policy>>;
 }
 
 pub trait ActionStore {
     fn store_action(&self, action: Action) -> StorageResult<Action>;
     fn get_action(&self, tenant_id: Uuid, action_id: Uuid) -> StorageResult<Option<Action>>;
+    fn get_action_any_tenant(&self, action_id: Uuid) -> StorageResult<Option<Action>>;
     fn query_actions(
         &self,
         tenant_id: Uuid,
         command_id: Option<Uuid>,
     ) -> StorageResult<Vec<Action>>;
+    fn list_all_actions(&self) -> StorageResult<Vec<Action>>;
 }
 
 pub trait ActionResultStore {
@@ -868,6 +889,7 @@ pub trait ActionResultStore {
         action_id: Option<Uuid>,
         command_id: Option<Uuid>,
     ) -> StorageResult<Vec<ActionResult>>;
+    fn list_all_action_results(&self) -> StorageResult<Vec<ActionResult>>;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -884,14 +906,18 @@ pub struct EventFilter {
 pub trait EventStore {
     fn store_event(&self, event: Event) -> StorageResult<Event>;
     fn get_event(&self, tenant_id: Uuid, event_id: Uuid) -> StorageResult<Option<Event>>;
+    fn get_event_any_tenant(&self, event_id: Uuid) -> StorageResult<Option<Event>>;
     fn query_events(&self, tenant_id: Uuid, filter: EventFilter) -> StorageResult<Vec<Event>>;
+    fn list_all_events(&self) -> StorageResult<Vec<Event>>;
 }
 
 pub trait RuleStore {
     fn store_rule(&self, rule: Rule) -> StorageResult<Rule>;
     fn update_rule(&self, rule: Rule) -> StorageResult<Rule>;
     fn get_rule(&self, tenant_id: Uuid, rule_id: Uuid) -> StorageResult<Option<Rule>>;
+    fn get_rule_any_tenant(&self, rule_id: Uuid) -> StorageResult<Option<Rule>>;
     fn list_rules(&self, tenant_id: Uuid) -> StorageResult<Vec<Rule>>;
+    fn list_all_rules(&self) -> StorageResult<Vec<Rule>>;
 }
 
 pub trait ControlPlaneStore:
@@ -1105,6 +1131,10 @@ impl EntityStore for InMemoryStorage {
             .cloned())
     }
 
+    fn get_entity_any_tenant(&self, entity_id: Uuid) -> StorageResult<Option<Entity>> {
+        Ok(self.read_state()?.entities.get(&entity_id).cloned())
+    }
+
     fn get_entity_by_key(
         &self,
         tenant_id: Uuid,
@@ -1128,6 +1158,22 @@ impl EntityStore for InMemoryStorage {
             .collect::<Vec<_>>();
 
         entities.sort_by(|left, right| left.entity_key.cmp(&right.entity_key));
+        Ok(entities)
+    }
+
+    fn list_all_entities(&self) -> StorageResult<Vec<Entity>> {
+        let mut entities = self
+            .read_state()?
+            .entities
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        entities.sort_by(|left, right| {
+            left.tenant_id
+                .cmp(&right.tenant_id)
+                .then_with(|| left.entity_key.cmp(&right.entity_key))
+        });
         Ok(entities)
     }
 }
@@ -1202,6 +1248,17 @@ impl RawMessageStore for InMemoryStorage {
             .cloned())
     }
 
+    fn get_raw_message_any_tenant(
+        &self,
+        raw_message_id: Uuid,
+    ) -> StorageResult<Option<RawMessage>> {
+        Ok(self
+            .read_state()?
+            .raw_messages
+            .get(&raw_message_id)
+            .cloned())
+    }
+
     fn list_raw_messages(&self, tenant_id: Uuid) -> StorageResult<Vec<RawMessage>> {
         let mut raw_messages = self
             .read_state()?
@@ -1212,6 +1269,23 @@ impl RawMessageStore for InMemoryStorage {
             .collect::<Vec<_>>();
 
         raw_messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
+        Ok(raw_messages)
+    }
+
+    fn list_all_raw_messages(&self) -> StorageResult<Vec<RawMessage>> {
+        let mut raw_messages = self
+            .read_state()?
+            .raw_messages
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        raw_messages.sort_by(|left, right| {
+            right
+                .received_at
+                .cmp(&left.received_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
         Ok(raw_messages)
     }
 
@@ -1310,6 +1384,17 @@ impl ObservationStore for InMemoryStorage {
             .cloned())
     }
 
+    fn get_observation_any_tenant(
+        &self,
+        observation_id: Uuid,
+    ) -> StorageResult<Option<Observation>> {
+        Ok(self
+            .read_state()?
+            .observations
+            .get(&observation_id)
+            .cloned())
+    }
+
     fn query_observations(
         &self,
         tenant_id: Uuid,
@@ -1344,6 +1429,23 @@ impl ObservationStore for InMemoryStorage {
 
         observations.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
         observations.truncate(limit as usize);
+        Ok(observations)
+    }
+
+    fn list_all_observations(&self) -> StorageResult<Vec<Observation>> {
+        let mut observations = self
+            .read_state()?
+            .observations
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        observations.sort_by(|left, right| {
+            right
+                .observed_at
+                .cmp(&left.observed_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
         Ok(observations)
     }
 }
@@ -1552,6 +1654,18 @@ impl ApiTokenStore for InMemoryStorage {
             .get(&(tenant_id, token_prefix.to_string()))
             .and_then(|token_id| state.api_tokens.get(token_id))
             .filter(|token| token.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn find_api_token_by_prefix_any_tenant(
+        &self,
+        token_prefix: &str,
+    ) -> StorageResult<Option<ApiToken>> {
+        Ok(self
+            .read_state()?
+            .api_tokens
+            .values()
+            .find(|token| token.token_prefix == token_prefix)
             .cloned())
     }
 
@@ -1784,6 +1898,10 @@ impl ExecutorStore for InMemoryStorage {
             .cloned())
     }
 
+    fn get_executor_any_tenant(&self, executor_id: Uuid) -> StorageResult<Option<ExecutorAgent>> {
+        Ok(self.read_state()?.executors.get(&executor_id).cloned())
+    }
+
     fn list_executors(&self, tenant_id: Uuid) -> StorageResult<Vec<ExecutorAgent>> {
         let mut executors = self
             .read_state()?
@@ -1794,6 +1912,22 @@ impl ExecutorStore for InMemoryStorage {
             .collect::<Vec<_>>();
 
         executors.sort_by(|left, right| left.agent_key.cmp(&right.agent_key));
+        Ok(executors)
+    }
+
+    fn list_all_executors(&self) -> StorageResult<Vec<ExecutorAgent>> {
+        let mut executors = self
+            .read_state()?
+            .executors
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        executors.sort_by(|left, right| {
+            left.tenant_id
+                .cmp(&right.tenant_id)
+                .then_with(|| left.agent_key.cmp(&right.agent_key))
+        });
         Ok(executors)
     }
 
@@ -2011,6 +2145,10 @@ impl CommandStore for InMemoryStorage {
             .cloned())
     }
 
+    fn get_command_any_tenant(&self, command_id: Uuid) -> StorageResult<Option<Command>> {
+        Ok(self.read_state()?.commands.get(&command_id).cloned())
+    }
+
     fn query_commands(
         &self,
         tenant_id: Uuid,
@@ -2037,6 +2175,23 @@ impl CommandStore for InMemoryStorage {
             .collect::<Vec<_>>();
 
         commands.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        Ok(commands)
+    }
+
+    fn list_all_commands(&self) -> StorageResult<Vec<Command>> {
+        let mut commands = self
+            .read_state()?
+            .commands
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        commands.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
         Ok(commands)
     }
 }
@@ -2172,6 +2327,25 @@ impl PolicyStore for InMemoryStorage {
         });
         Ok(policies)
     }
+
+    fn list_all_policies(&self) -> StorageResult<Vec<Policy>> {
+        let mut policies = self
+            .read_state()?
+            .policies
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        policies.sort_by_key(|policy| {
+            (
+                policy.tenant_id,
+                policy.target_entity_id.is_none(),
+                policy.command_type.is_none(),
+                policy.id,
+            )
+        });
+        Ok(policies)
+    }
 }
 
 impl ActionStore for InMemoryStorage {
@@ -2194,6 +2368,10 @@ impl ActionStore for InMemoryStorage {
             .cloned())
     }
 
+    fn get_action_any_tenant(&self, action_id: Uuid) -> StorageResult<Option<Action>> {
+        Ok(self.read_state()?.actions.get(&action_id).cloned())
+    }
+
     fn query_actions(
         &self,
         tenant_id: Uuid,
@@ -2209,6 +2387,23 @@ impl ActionStore for InMemoryStorage {
             .collect::<Vec<_>>();
 
         actions.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+        Ok(actions)
+    }
+
+    fn list_all_actions(&self) -> StorageResult<Vec<Action>> {
+        let mut actions = self
+            .read_state()?
+            .actions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        actions.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
         Ok(actions)
     }
 }
@@ -2243,6 +2438,23 @@ impl ActionResultStore for InMemoryStorage {
         results.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
         Ok(results)
     }
+
+    fn list_all_action_results(&self) -> StorageResult<Vec<ActionResult>> {
+        let mut results = self
+            .read_state()?
+            .action_results
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        results.sort_by(|left, right| {
+            right
+                .observed_at
+                .cmp(&left.observed_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(results)
+    }
 }
 
 impl EventStore for InMemoryStorage {
@@ -2263,6 +2475,10 @@ impl EventStore for InMemoryStorage {
             .get(&event_id)
             .filter(|event| event.tenant_id == tenant_id)
             .cloned())
+    }
+
+    fn get_event_any_tenant(&self, event_id: Uuid) -> StorageResult<Option<Event>> {
+        Ok(self.read_state()?.events.get(&event_id).cloned())
     }
 
     fn query_events(&self, tenant_id: Uuid, filter: EventFilter) -> StorageResult<Vec<Event>> {
@@ -2322,6 +2538,23 @@ impl EventStore for InMemoryStorage {
         events.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
         Ok(events)
     }
+
+    fn list_all_events(&self) -> StorageResult<Vec<Event>> {
+        let mut events = self
+            .read_state()?
+            .events
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        events.sort_by(|left, right| {
+            right
+                .occurred_at
+                .cmp(&left.occurred_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(events)
+    }
 }
 
 impl RuleStore for InMemoryStorage {
@@ -2356,6 +2589,10 @@ impl RuleStore for InMemoryStorage {
             .cloned())
     }
 
+    fn get_rule_any_tenant(&self, rule_id: Uuid) -> StorageResult<Option<Rule>> {
+        Ok(self.read_state()?.rules.get(&rule_id).cloned())
+    }
+
     fn list_rules(&self, tenant_id: Uuid) -> StorageResult<Vec<Rule>> {
         let mut rules = self
             .read_state()?
@@ -2366,6 +2603,22 @@ impl RuleStore for InMemoryStorage {
             .collect::<Vec<_>>();
 
         rules.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        Ok(rules)
+    }
+
+    fn list_all_rules(&self) -> StorageResult<Vec<Rule>> {
+        let mut rules = self
+            .read_state()?
+            .rules
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        rules.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Ok(rules)
     }
 }

@@ -75,7 +75,7 @@ The PostgreSQL and TimescaleDB migration foundation now covers the current in-me
 
 AionCore still defaults to unauthenticated local development with `AIONCORE_AUTH_MODE=dev`. This is acceptable for local development and tests only, not for public or production exposure.
 
-Milestone 56 broadens token-mode coverage across selected entity, observation, command, action, rule, policy, capability, and executor-inspection reads on top of the earlier MCP, provenance, event, and raw-message protections. It still does not broadly protect the entire API or enforce tenant/resource ownership yet.
+Milestone 57 adds the first tenant/resource ownership skeleton for selected token-mode protected read surfaces on top of the earlier scope protections. It still does not broadly protect the entire API, enforce tenant-aware writes, or implement a full authorization engine.
 
 Local development warning:
 
@@ -83,7 +83,7 @@ Local development warning:
 - do not expose `/mcp`, `/mcp/tools`, `/ai/context/*`, or `/provenance/search` publicly
 - do not treat current connector-secret redaction as a complete production security model
 
-The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md), [ADR 0047](docs/ADR/0047-selected-machine-endpoint-auth-enforcement.md), [ADR 0048](docs/ADR/0048-connector-and-ingestion-auth-enforcement.md), [ADR 0049](docs/ADR/0049-remaining-ingestion-connector-auth-enforcement.md), [ADR 0050](docs/ADR/0050-auth-readiness-and-bootstrap-hardening.md), [ADR 0051](docs/ADR/0051-mcp-ai-provenance-auth-hardening.md), and [ADR 0052](docs/ADR/0052-events-raw-messages-auth-hardening.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, selective machine-principal protection, connector and ingestion enforcement, connector-secret protection, remaining ingestion and connector gap closure, MCP/AI/provenance hardening, and event/raw-message read-surface hardening.
+The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md), [ADR 0047](docs/ADR/0047-selected-machine-endpoint-auth-enforcement.md), [ADR 0048](docs/ADR/0048-connector-and-ingestion-auth-enforcement.md), [ADR 0049](docs/ADR/0049-remaining-ingestion-connector-auth-enforcement.md), [ADR 0050](docs/ADR/0050-auth-readiness-and-bootstrap-hardening.md), [ADR 0051](docs/ADR/0051-mcp-ai-provenance-auth-hardening.md), [ADR 0052](docs/ADR/0052-events-raw-messages-auth-hardening.md), [ADR 0053](docs/ADR/0053-broader-read-surface-auth-coverage.md), and [ADR 0054](docs/ADR/0054-tenant-resource-ownership-skeleton.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, selective machine-principal protection, connector and ingestion enforcement, connector-secret protection, remaining ingestion and connector gap closure, MCP/AI/provenance hardening, event/raw-message read-surface hardening, broader generic read-surface protection, and the first tenant/resource ownership skeleton.
 
 The auth-mode environment variable is:
 
@@ -182,7 +182,6 @@ Selected protected endpoints in `token` mode:
   - all require `auth:tokens:admin`
 - remaining intentionally open surfaces in this milestone:
   - broad write surfaces for entities, observations, commands, actions, rules, policies, and capabilities
-  - tenant/resource ownership enforcement across the protected read routes above
   - standalone relationship read routes and observation detail routes, which do not currently exist
 
 Scope behavior in `token` mode:
@@ -190,8 +189,12 @@ Scope behavior in `token` mode:
 - missing or invalid bearer token returns structured `401`
 - valid token without the required scope returns structured `403`
 - `admin:all` satisfies any required scope
+- on the selected protected read surfaces in this milestone, `admin:all` also bypasses tenant/resource ownership checks
+- in `token` mode, non-admin principals can read only resources whose `tenant_id` matches the principal tenant on the selected protected read routes above
+- selected list/query endpoints return only same-tenant resources in `token` mode unless `admin:all` is present
+- selected detail endpoints return structured `403` for known cross-tenant access in `token` mode
 - broader endpoint coverage remains intentionally partial in this milestone
-- tenant/resource ownership checks remain future work
+- tenant/resource ownership for writes and remaining unprotected routes remains future work
 - `GET /events` and `GET /events/{event_id}` use `events:read`
 - `GET /raw-messages` and `GET /raw-messages/{raw_message_id}` use `raw-messages:read`
 - `GET /entities`, `GET /entities/{entity_id}`, and `GET /entities/{entity_id}/context` use `entities:read`
@@ -250,7 +253,7 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/auth/whoami"
 ```
 
-`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` checks storage and MQTT readiness. In memory mode storage returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable. When MQTT is disabled, `/ready` still succeeds and reports `mqtt.enabled = false`. Connector workers are also disabled by default and reported under `connector_workers.enabled = false`. The readiness response also reports `auth.mode`, `auth.dev_bypass`, `auth.enforcement_level`, `auth.protected_endpoint_groups`, and `auth.bootstrap_admin_configured`. `enforcement_level = partial` means only the documented machine-facing and selected read-oriented endpoint groups are protected in `token` mode; it does not imply broad full-API enforcement or ownership checks.
+`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` checks storage and MQTT readiness. In memory mode storage returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable. When MQTT is disabled, `/ready` still succeeds and reports `mqtt.enabled = false`. Connector workers are also disabled by default and reported under `connector_workers.enabled = false`. The readiness response also reports `auth.mode`, `auth.dev_bypass`, `auth.enforcement_level`, `auth.protected_endpoint_groups`, and `auth.bootstrap_admin_configured`. `enforcement_level = partial` means only the documented machine-facing and selected read-oriented endpoint groups are protected in `token` mode; it does not imply broad full-API enforcement, and the new ownership checks apply only to the selected protected read surfaces documented above.
 
 API token examples:
 
@@ -461,6 +464,10 @@ Token-mode behavior for these scoped surfaces:
 - no bearer token or an invalid bearer token returns `401`
 - a valid bearer token without the required scope returns `403`
 - `admin:all` satisfies all route scope checks, including `entities:read`, `observations:read`, `commands:read`, `actions:read`, `rules:read`, `policies:read`, `capabilities:read`, and `executors:read`
+- on the selected protected read routes added in Milestone 57, `admin:all` also bypasses tenant/resource ownership checks
+- on those selected protected read routes, non-admin tokens can read only resources whose `tenant_id` matches the principal tenant
+- selected list/query endpoints return only same-tenant resources
+- selected detail endpoints return `403` for known cross-tenant access
 
 ```powershell
 $eventsHeaders = @{ Authorization = "Bearer $($eventsReadToken.raw_token)" }
@@ -494,6 +501,25 @@ Invoke-RestMethod `
   -Method Get `
   -Uri "http://localhost:8080/rules" `
   -Headers $rulesHeaders
+```
+
+PowerShell examples for local tenant-ownership validation against a seeded multi-tenant test setup:
+
+```powershell
+$tenantAHeaders = @{ Authorization = "Bearer $($tenantAReadToken.raw_token)" }
+$tenantBHeaders = @{ Authorization = "Bearer $($tenantBReadToken.raw_token)" }
+$adminHeaders = @{ Authorization = "Bearer $($adminAllToken.raw_token)" }
+
+# tenant A token reads tenant A resources
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities/$tenantAEntityId" -Headers $tenantAHeaders
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities" -Headers $tenantAHeaders
+
+# tenant B token is denied on tenant A detail reads
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities/$tenantAEntityId" -Headers $tenantBHeaders
+
+# admin:all can read across tenants
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities/$tenantAEntityId" -Headers $adminHeaders
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities" -Headers $adminHeaders
 ```
 
 ```powershell
