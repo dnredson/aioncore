@@ -73,9 +73,9 @@ The PostgreSQL and TimescaleDB migration foundation now covers the current in-me
 
 ## Authentication Status
 
-Most current AionCore APIs are unauthenticated. This is acceptable for local development and tests only, not for public or production exposure.
+AionCore still defaults to unauthenticated local development with `AIONCORE_AUTH_MODE=dev`. This is acceptable for local development and tests only, not for public or production exposure.
 
-Milestone 49 adds API token issuance, hashing, storage, bearer-token principal resolution, and `/auth/whoami`, but it still does not broadly enforce authentication on existing endpoints.
+Milestone 50 starts selective token enforcement for sensitive machine-facing endpoints in `token` mode. It does not broadly protect the entire API yet.
 
 Local development warning:
 
@@ -83,7 +83,7 @@ Local development warning:
 - do not expose `/mcp`, `/mcp/tools`, or `/ai/context/*` publicly
 - do not treat current connector-secret redaction as a complete production security model
 
-The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), and [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, machine-principal protection for adapters and executors, connector-secret protection, and MCP hardening.
+The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md), and [ADR 0047](docs/ADR/0047-selected-machine-endpoint-auth-enforcement.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, selective machine-principal protection, connector-secret protection, and later MCP hardening.
 
 The auth-mode environment variable is:
 
@@ -93,7 +93,43 @@ Current mode behavior:
 
 - `dev`: default when unset; auth middleware is installed, requests are allowed through, and development bypass is reported in readiness.
 - `disabled`: auth is explicitly disabled; requests are still allowed through.
-- `token`: bearer-token parsing and principal resolution are active, but broad endpoint protection is still not enforced in this milestone.
+- `token`: bearer-token parsing and principal resolution are active, and the selected endpoints below now require valid scoped tokens.
+
+Selected protected endpoints in `token` mode:
+
+- adapter registration and heartbeat:
+  - `POST /adapters` requires `adapters:register`
+  - `PUT /adapters/{adapter_id}/heartbeat` requires `adapters:heartbeat`
+- executor registration and machine command workflow:
+  - `POST /executors` requires `executors:register`
+  - `PUT /executors/{executor_id}/heartbeat` requires `executors:heartbeat`
+  - `GET /executors/{executor_id}/commands/pending` requires `executors:poll`
+  - `POST /executors/{executor_id}/commands/{command_id}/claim` requires `executors:claim`
+  - `POST /executors/{executor_id}/commands/{command_id}/complete` and `/fail` require `executors:report`
+- SmartSentinel executor bridge:
+  - `POST /integrations/smartsentinel/executors/register` requires `smartsentinel:executor_register`
+  - `GET /integrations/smartsentinel/executors/{executor_id}/commands` requires `smartsentinel:executor_poll`
+  - `POST /integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/claim` requires `smartsentinel:executor_claim`
+  - `POST /integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/report` requires `smartsentinel:executor_report`
+- connector secret administration:
+  - `POST /secrets/connectors`
+  - `GET /secrets/connectors`
+  - `GET /secrets/connectors/{secret_id}`
+  - `DELETE /secrets/connectors/{secret_id}`
+  - all require `secrets:admin`
+- API token administration:
+  - `POST /auth/tokens`
+  - `GET /auth/tokens`
+  - `GET /auth/tokens/{token_id}`
+  - `POST /auth/tokens/{token_id}/revoke`
+  - all require `auth:tokens:admin`
+
+Scope behavior in `token` mode:
+
+- missing or invalid bearer token returns structured `401`
+- valid token without the required scope returns structured `403`
+- `admin:all` satisfies any required scope
+- other endpoints remain unchanged in this milestone
 
 Token foundations in this milestone:
 
@@ -102,7 +138,7 @@ Token foundations in this milestone:
 - Stored records keep only a token hash plus a short token prefix for lookup and display.
 - `GET /auth/tokens` and `GET /auth/tokens/{token_id}` never return `raw_token` or `token_hash`.
 - `GET /auth/whoami` reports the current auth mode and resolved principal.
-- Broad endpoint authorization is deferred to Milestone 50.
+- `AIONCORE_BOOTSTRAP_ADMIN_TOKEN` provides a safe local bootstrap path in `token` mode. When the presented bearer token exactly matches this environment variable, AionCore resolves an admin principal with `auth:tokens:admin` and `admin:all` without storing that bootstrap token.
 
 ## Run Locally Without Docker
 
@@ -143,9 +179,20 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/auth/whoami"
 API token examples:
 
 ```powershell
+$env:AIONCORE_AUTH_MODE = "token"
+$env:AIONCORE_BOOTSTRAP_ADMIN_TOKEN = "bootstrap-admin-local"
+cargo run -p aion-api
+```
+
+Bootstrap token management example:
+
+```powershell
+$bootstrapHeaders = @{ Authorization = "Bearer $env:AIONCORE_BOOTSTRAP_ADMIN_TOKEN" }
+
 $tokenResponse = Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
   -ContentType "application/json" `
   -Body (@{
     token_name = "local-service"
@@ -161,7 +208,51 @@ $tokenResponse.raw_token
 The `raw_token` value is shown only once. AionCore stores only its hash and token prefix.
 
 ```powershell
-$headers = @{ Authorization = "Bearer $($tokenResponse.raw_token)" }
+$adapterToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "edge-adapter-01"
+    principal_type = "adapter"
+    principal_id = "fog-01-mqtt"
+    scopes = @("adapters:register", "adapters:heartbeat")
+    metadata = @{ purpose = "adapter runtime" }
+  } | ConvertTo-Json -Depth 8)
+```
+
+```powershell
+$headers = @{ Authorization = "Bearer $($adapterToken.raw_token)" }
+
+$adapterRegistration = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/adapters" `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body (@{
+    adapter_key = "fog-01-mqtt"
+    display_name = "Fog 01 MQTT Adapter"
+    adapter_type = "edge"
+    status = "online"
+  } | ConvertTo-Json -Depth 8)
+```
+
+```powershell
+$adapterId = $adapterRegistration.adapter.id
+
+Invoke-RestMethod `
+  -Method Put `
+  -Uri "http://localhost:8080/adapters/$adapterId/heartbeat" `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body (@{
+    status = "online"
+    metadata = @{ source = "heartbeat-demo" }
+  } | ConvertTo-Json -Depth 8)
+```
+
+```powershell
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/auth/whoami" -Headers $headers
 ```
 
@@ -169,12 +260,58 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/auth/whoami" -Headers 
 Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8080/auth/tokens/$($tokenResponse.token.id)/revoke" `
-  -Headers $headers `
+  -Headers $bootstrapHeaders `
   -ContentType "application/json" `
   -Body "{}"
 ```
 
-In this milestone, token issuance and revocation exist as foundation work, but scope enforcement on the rest of the API comes later.
+Expected token-mode failures on protected routes:
+
+```powershell
+try {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/adapters" `
+    -ContentType "application/json" `
+    -Body (@{
+      adapter_key = "missing-token"
+      display_name = "Missing Token"
+      adapter_type = "edge"
+      status = "online"
+    } | ConvertTo-Json -Depth 8)
+} catch {
+  ($_.ErrorDetails.Message | ConvertFrom-Json).error
+}
+```
+
+```powershell
+$wrongScopeToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "wrong-scope"
+    principal_type = "service"
+    scopes = @("entities:read")
+  } | ConvertTo-Json -Depth 8)
+
+try {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/adapters" `
+    -Headers @{ Authorization = "Bearer $($wrongScopeToken.raw_token)" } `
+    -ContentType "application/json" `
+    -Body (@{
+      adapter_key = "wrong-scope-adapter"
+      display_name = "Wrong Scope"
+      adapter_type = "edge"
+      status = "online"
+    } | ConvertTo-Json -Depth 8)
+} catch {
+  ($_.ErrorDetails.Message | ConvertFrom-Json).error
+}
+```
 
 MQTT ingestion is optional and remains disabled unless you enable it explicitly:
 

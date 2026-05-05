@@ -2,14 +2,20 @@
 
 This document defines the authentication and authorization architecture for AionCore APIs while runtime enforcement is being introduced incrementally.
 
-Milestone 49 adds API token issuance, hashing, storage, principal resolution, `/auth/tokens`, and `/auth/whoami`. It still does not broadly enforce authentication or scopes on existing endpoints, add login, or validate JWTs.
+Milestone 50 adds selected endpoint enforcement for machine-facing routes, connector secret administration, and token administration. It still does not broadly enforce authentication across the full API, add login, or validate JWTs.
 
 ## Status
 
-- Current local runtime behavior: most APIs are still effectively unauthenticated unless a route opts into token-management checks.
+- Current local runtime behavior: `dev` remains the default and still bypasses auth; `token` mode now enforces selected machine-facing and secret-management routes only.
 - Current production suitability: not suitable for exposed production deployment without additional protection in front of the API.
 - Current runtime auth foundation: middleware installed with development-mode bypass, explicit disabled mode, or token principal resolution.
-- Intended next step: introduce endpoint protection incrementally behind the existing development-mode bypass and token model.
+- Current selected enforcement in `token` mode:
+  - `/auth/tokens*` requires `auth:tokens:admin`
+  - `/adapters` registration and heartbeat require adapter scopes
+  - `/executors` registration, heartbeat, polling, claim, complete, and fail require executor scopes
+  - `/integrations/smartsentinel/executors/*` register, poll, claim, and report require SmartSentinel executor scopes
+  - `/secrets/connectors*` requires `secrets:admin`
+- Unprotected in this milestone: the rest of the API surface, including entities, observations, generic commands, rules, connectors, MCP, and SmartSentinel snapshot ingestion.
 
 ## Security Goals
 
@@ -24,13 +30,13 @@ Milestone 49 adds API token issuance, hashing, storage, principal resolution, `/
 
 ## Non-Goals For This Milestone
 
-- No broad authentication enforcement.
+- No broad authentication enforcement across the full API.
 - No login UI, browser session flow, or password-based user auth.
 - No JWT minting.
 - No secret manager, KMS, or Vault integration.
 - No mTLS implementation.
 - No OAuth/OIDC provider integration.
-- No broad scope enforcement.
+- No broad scope enforcement outside the selected endpoint groups listed below.
 
 ## Threat Model
 
@@ -193,8 +199,8 @@ Implemented handling in Milestone 49:
 Current limitations:
 
 - token issuance is foundational and not yet a full operator-hardening story
-- scope enforcement on business endpoints is deferred to Milestone 50
-- local bootstrap flows may still rely on `dev` mode or other trusted local administration paths
+- endpoint enforcement is still intentionally partial in Milestone 50
+- local bootstrap for token administration uses `AIONCORE_BOOTSTRAP_ADMIN_TOKEN`
 
 ### JWT Access Token
 
@@ -282,9 +288,18 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `rules:admin`
 - `mcp:tools`
 - `smartsentinel:ingest`
+- `adapters:register`
 - `adapters:heartbeat`
+- `executors:register`
+- `executors:heartbeat`
 - `executors:poll`
+- `executors:claim`
 - `executors:report`
+- `smartsentinel:executor_register`
+- `smartsentinel:executor_poll`
+- `smartsentinel:executor_claim`
+- `smartsentinel:executor_report`
+- `auth:tokens:admin`
 - `admin:all`
 
 ### Scope Notes
@@ -294,8 +309,12 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `commands:read` covers command visibility through generic, executor, and AI-context read paths.
 - `commands:create` covers command creation and approval-oriented write flows may later split into narrower scopes such as `commands:approve`.
 - `commands:claim` and `executors:poll` separate execution workflow from broad command administration.
+- `adapters:register` and `adapters:heartbeat` keep adapter self-registration separate from broader operator APIs.
+- `executors:register`, `executors:heartbeat`, `executors:poll`, `executors:claim`, and `executors:report` separate executor lifecycle operations.
+- SmartSentinel executor bridge scopes are intentionally separate from generic executor scopes so bridge tokens can stay narrow.
 - `mcp:tools` should authorize local or production MCP tool invocation, not generic write access.
-- `admin:all` is a reserved break-glass scope and should bypass normal scope checks only for `AdminPrincipal`.
+- `auth:tokens:admin` covers token issuance, listing, inspection, and revocation.
+- `admin:all` is a reserved break-glass scope and satisfies any route scope check.
 
 ## API Authentication Model
 
@@ -425,12 +444,21 @@ The table below describes the intended future protection model. It does not chan
 | `/raw-messages` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` | Sensitive because raw payloads and headers may include operational metadata. |
 | `/ingest/http` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Primary generic ingestion write surface. |
 | `/ingestion/connectors/*` | `UserPrincipal`, `AdminPrincipal`, selected `ConnectorPrincipal` or `ServicePrincipal` for narrow validation flows | `connectors:admin` | Includes connector CRUD, enable/disable, status, validate, TTN mappings, worker plan, and connector-aware ingest unless separated later. |
-| `/secrets/connectors/*` | `UserPrincipal`, `AdminPrincipal` | `secrets:admin` | Highest sensitivity operator surface. |
+| `/secrets/connectors/*` | `UserPrincipal`, `AdminPrincipal` | `secrets:admin` | Implemented in Milestone 50. Highest sensitivity operator surface. |
 | `/commands/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:create` for creation and approval-like writes, `commands:claim` for claim/release flows, `commands:report` for execution result writes where applicable | Approval may later split into its own scope. |
 | `/actions/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:report` for POST | Action reporting is part of execution audit. |
-| `/executors/*` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:poll` for list pending and claim-oriented reads, `executors:report` for complete/fail/heartbeat, `connectors:admin` or future executor-admin scope for registration metadata management | Existing executor capability/scope matching still applies. |
-| `/integrations/smartsentinel/*` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:ingest` for snapshots, `executors:poll` for command polling, `executors:report` for claim/report | Split by route in implementation even though grouped here. |
-| `/adapters/*` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:heartbeat` for adapter self-registration and heartbeat, `entities:read` for operator reads, future adapter-admin scope if the surface grows | Adapter registration and heartbeat should not need broad admin rights for the adapter itself. |
+| `/executors` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:register` for POST | Implemented in Milestone 50 for `POST /executors` only. |
+| `/executors/{executor_id}/heartbeat` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:heartbeat` | Implemented in Milestone 50. |
+| `/executors/{executor_id}/commands/pending` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:poll` | Implemented in Milestone 50. Existing executor capability and target-scope matching still applies. |
+| `/executors/{executor_id}/commands/{command_id}/claim` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:claim` | Implemented in Milestone 50. Existing executor capability and target-scope matching still applies. |
+| `/executors/{executor_id}/commands/{command_id}/complete` and `/fail` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:report` | Implemented in Milestone 50. Existing executor capability and target-scope matching still applies. |
+| `/integrations/smartsentinel/snapshots` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:ingest` | Still unprotected in Milestone 50. |
+| `/integrations/smartsentinel/executors/register` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:executor_register` | Implemented in Milestone 50. |
+| `/integrations/smartsentinel/executors/{executor_id}/commands` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:executor_poll` | Implemented in Milestone 50. |
+| `/integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/claim` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:executor_claim` | Implemented in Milestone 50. |
+| `/integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/report` | `ExecutorPrincipal`, `ServicePrincipal`, `UserPrincipal`, `AdminPrincipal` depending on subpath | `smartsentinel:executor_report` | Implemented in Milestone 50. |
+| `/adapters` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:register` for POST | Implemented in Milestone 50 for `POST /adapters` only. |
+| `/adapters/{adapter_id}/heartbeat` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:heartbeat` | Implemented in Milestone 50. |
 | `/mcp` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Production requires auth and Origin validation. |
 | `/mcp/tools` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Includes tool listing and invocation. |
 | `/ai/context/*` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `entities:read`, `observations:read`, and `commands:read` when command context is included | AI context is read-only but aggregates sensitive data. |
@@ -462,10 +490,18 @@ The table below describes the intended future protection model. It does not chan
 
 - `AIONCORE_AUTH_MODE=token` now starts successfully.
 - Middleware attempts to resolve `Authorization: Bearer <token>` against stored API tokens.
-- Valid tokens attach tenant, principal type, principal ID, scopes, and token ID into the internal `AuthContext`.
+- Valid stored tokens attach tenant, principal type, principal ID, scopes, and token ID into the internal `AuthContext`.
+- If `AIONCORE_BOOTSTRAP_ADMIN_TOKEN` is set and the presented bearer token matches it exactly, AionCore resolves an in-memory admin principal with `auth:tokens:admin` and `admin:all`.
 - Successful validation updates `last_used_at` and emits `aion:ApiTokenUsed`.
 - Invalid, expired, revoked, or malformed presented tokens resolve to an anonymous context and emit `aion:ApiTokenRejected`.
-- This milestone does not broadly protect business endpoints yet. Existing development behavior remains intentionally unchanged outside the new token-management surface.
+- Selected protected routes in this milestone return:
+  - `401` for missing or invalid bearer tokens
+  - `403` for valid authenticated principals missing the required scope
+- Selected protected routes also emit:
+  - `aion:AuthTokenAccepted`
+  - `aion:AuthAccessDenied`
+  - `aion:AuthScopeDenied`
+- Existing development behavior remains intentionally unchanged in `dev` and `disabled` modes.
 
 ### Production Mode
 
@@ -498,7 +534,7 @@ Add API token principal model, token hashing, storage model, operator-managed to
 
 ### Milestone 50
 
-Protect adapter and executor endpoints first because they are machine-facing and already represent clear principal boundaries. This milestone should start real endpoint authentication and scope checks using the token model introduced in Milestone 49.
+Protect selected machine-facing routes first because they already represent clear principal boundaries and higher-risk operational actions. This milestone starts real endpoint authentication and scope checks using the token model introduced in Milestone 49.
 
 ### Milestone 51
 

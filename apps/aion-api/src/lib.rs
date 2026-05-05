@@ -81,39 +81,52 @@ impl AuthMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthConfig {
     pub mode: AuthMode,
+    pub bootstrap_admin_token_hash: Option<String>,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             mode: AuthMode::Dev,
+            bootstrap_admin_token_hash: None,
         }
     }
 }
 
 impl AuthConfig {
     pub fn from_env() -> Result<Self, StartupError> {
-        Self::from_env_vars(env::var("AIONCORE_AUTH_MODE").ok())
+        Self::from_env_vars(
+            env::var("AIONCORE_AUTH_MODE").ok(),
+            env::var("AIONCORE_BOOTSTRAP_ADMIN_TOKEN").ok(),
+        )
     }
 
-    pub fn from_env_vars(mode: Option<String>) -> Result<Self, StartupError> {
-        match mode
+    pub fn from_env_vars(
+        mode: Option<String>,
+        bootstrap_admin_token: Option<String>,
+    ) -> Result<Self, StartupError> {
+        let mode = match mode
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            None => Ok(Self::default()),
-            Some("dev") => Ok(Self {
-                mode: AuthMode::Dev,
-            }),
-            Some("disabled") => Ok(Self {
-                mode: AuthMode::Disabled,
-            }),
-            Some("token") => Ok(Self {
-                mode: AuthMode::Token,
-            }),
-            Some(other) => Err(StartupError::unknown_auth_mode(other.to_string())),
-        }
+            None => AuthMode::Dev,
+            Some("dev") => AuthMode::Dev,
+            Some("disabled") => AuthMode::Disabled,
+            Some("token") => AuthMode::Token,
+            Some(other) => return Err(StartupError::unknown_auth_mode(other.to_string())),
+        };
+
+        let bootstrap_admin_token_hash = bootstrap_admin_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(hash_token_value);
+
+        Ok(Self {
+            mode,
+            bootstrap_admin_token_hash,
+        })
     }
 
     pub fn enforced(&self) -> bool {
@@ -193,13 +206,31 @@ impl AuthContext {
         tenant_id: Uuid,
         scopes: Vec<String>,
     ) -> Self {
+        Self::authenticated_principal(
+            config,
+            Some(token_id),
+            principal_type,
+            principal_id,
+            tenant_id,
+            scopes,
+        )
+    }
+
+    fn authenticated_principal(
+        config: &AuthConfig,
+        token_id: Option<Uuid>,
+        principal_type: PrincipalType,
+        principal_id: Option<String>,
+        tenant_id: Uuid,
+        scopes: Vec<String>,
+    ) -> Self {
         Self {
             mode: config.mode,
             enforced: config.enforced(),
             dev_bypass: config.dev_bypass(),
             authenticated: true,
             auth_valid: true,
-            token_id: Some(token_id),
+            token_id,
             principal: Principal {
                 principal_type,
                 principal_id,
@@ -601,6 +632,19 @@ fn resolve_token_auth_context(state: &AppState, request: &Request) -> AuthContex
     let Some(raw_token) = parse_bearer_token(request) else {
         return state.auth_context();
     };
+
+    if auth_configured_bootstrap_token_matches(&state.auth, &raw_token) {
+        record_auth_token_accepted_event(state, None, PrincipalType::Admin, Some("bootstrap_env"));
+        return AuthContext::authenticated_principal(
+            &state.auth,
+            None,
+            PrincipalType::Admin,
+            Some("bootstrap-admin".to_string()),
+            state.tenant_id,
+            vec!["auth:tokens:admin".to_string(), "admin:all".to_string()],
+        );
+    }
+
     let Some(prefix) = parse_token_prefix(&raw_token) else {
         record_token_rejected_event(state, None, TokenRejectionReason::Malformed);
         return state.auth_context();
@@ -653,6 +697,12 @@ fn resolve_token_auth_context(state: &AppState, request: &Request) -> AuthContex
     let _ = state
         .storage
         .update_api_token_last_used_at(state.tenant_id, token.id, now);
+    record_auth_token_accepted_event(
+        state,
+        Some(token.id),
+        map_principal_type_from_storage(token.principal_type),
+        Some("stored_api_token"),
+    );
     record_token_used_event(state, &token);
     AuthContext::authenticated_token(
         &state.auth,
@@ -664,14 +714,83 @@ fn resolve_token_auth_context(state: &AppState, request: &Request) -> AuthContex
     )
 }
 
-fn require_token_management_access(auth: &AuthContext) -> Result<(), ApiError> {
+fn auth_configured_bootstrap_token_matches(config: &AuthConfig, candidate_raw_token: &str) -> bool {
+    config
+        .bootstrap_admin_token_hash
+        .as_deref()
+        .map(|stored_hash| {
+            let candidate_hash = hash_token_value(candidate_raw_token);
+            stored_hash
+                .as_bytes()
+                .ct_eq(candidate_hash.as_bytes())
+                .into()
+        })
+        .unwrap_or(false)
+}
+
+fn auth_has_scope(auth: &AuthContext, scope: &str) -> bool {
+    auth.principal
+        .scopes
+        .iter()
+        .any(|value| value == "admin:all" || value == scope)
+}
+
+fn require_authenticated(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+) -> Result<(), ApiError> {
     match auth.mode {
         AuthMode::Dev | AuthMode::Disabled => Ok(()),
         AuthMode::Token if auth.authenticated && auth.auth_valid => Ok(()),
-        AuthMode::Token => Err(ApiError::unauthorized(
-            "valid bearer token is required for token management in token mode",
-        )),
+        AuthMode::Token => {
+            record_auth_access_denied_event(state, endpoint, None, auth);
+            Err(ApiError::unauthorized(format!(
+                "bearer token is required for {endpoint}"
+            )))
+        }
     }
+}
+
+fn require_scope(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    scope: &'static str,
+) -> Result<(), ApiError> {
+    require_authenticated(state, auth, endpoint)?;
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return Ok(());
+    }
+    if auth_has_scope(auth, scope) {
+        return Ok(());
+    }
+
+    record_auth_scope_denied_event(state, endpoint, &[scope], auth);
+    Err(ApiError::forbidden(format!(
+        "scope '{scope}' is required for {endpoint}"
+    )))
+}
+
+#[allow(dead_code)]
+fn require_any_scope(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    scopes: &[&'static str],
+) -> Result<(), ApiError> {
+    require_authenticated(state, auth, endpoint)?;
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return Ok(());
+    }
+    if scopes.iter().any(|scope| auth_has_scope(auth, scope)) {
+        return Ok(());
+    }
+
+    record_auth_scope_denied_event(state, endpoint, scopes, auth);
+    Err(ApiError::forbidden(format!(
+        "one of the required scopes is missing for {endpoint}"
+    )))
 }
 
 #[derive(Debug, Serialize)]
@@ -2180,7 +2299,7 @@ async fn create_api_token(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateApiTokenRequest>,
 ) -> Result<(StatusCode, Json<CreateApiTokenResponse>), ApiError> {
-    require_token_management_access(&auth)?;
+    require_scope(&state, &auth, "/auth/tokens", "auth:tokens:admin")?;
 
     let principal_type = map_principal_type_to_storage(request.principal_type)
         .ok_or_else(|| ApiError::bad_request("principal_type must not be anonymous"))?;
@@ -2214,7 +2333,7 @@ async fn list_api_tokens(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<ApiTokenRecordResponse>>, ApiError> {
-    require_token_management_access(&auth)?;
+    require_scope(&state, &auth, "/auth/tokens", "auth:tokens:admin")?;
     Ok(Json(
         state
             .storage
@@ -2230,7 +2349,7 @@ async fn get_api_token(
     Extension(auth): Extension<AuthContext>,
     Path(token_id): Path<Uuid>,
 ) -> Result<Json<ApiTokenRecordResponse>, ApiError> {
-    require_token_management_access(&auth)?;
+    require_scope(&state, &auth, "/auth/tokens/:token_id", "auth:tokens:admin")?;
     let token = state
         .storage
         .get_api_token(state.tenant_id, token_id)?
@@ -2243,7 +2362,12 @@ async fn revoke_api_token(
     Extension(auth): Extension<AuthContext>,
     Path(token_id): Path<Uuid>,
 ) -> Result<Json<ApiTokenRecordResponse>, ApiError> {
-    require_token_management_access(&auth)?;
+    require_scope(
+        &state,
+        &auth,
+        "/auth/tokens/:token_id/revoke",
+        "auth:tokens:admin",
+    )?;
     let token = state
         .storage
         .revoke_api_token(state.tenant_id, token_id, Utc::now())?;
@@ -3419,8 +3543,10 @@ async fn evaluate_rules_manually(
 
 async fn create_executor(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateExecutorRequest>,
 ) -> Result<(StatusCode, Json<ExecutorAgent>), ApiError> {
+    require_scope(&state, &auth, "/executors", "executors:register")?;
     let now = Utc::now();
     let executor = ExecutorAgent::new(
         state.tenant_id,
@@ -3459,9 +3585,16 @@ async fn get_executor(
 
 async fn heartbeat_executor(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(executor_id): Path<Uuid>,
     Json(request): Json<ExecutorHeartbeatRequest>,
 ) -> Result<Json<ExecutorAgent>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/executors/:executor_id/heartbeat",
+        "executors:heartbeat",
+    )?;
     let mut executor = get_executor_agent(&state, executor_id)?;
     executor.heartbeat(request.status, Utc::now());
     if request.metadata.is_some() {
@@ -3563,8 +3696,15 @@ async fn get_executor_scopes(
 
 async fn poll_executor_pending_commands(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(executor_id): Path<Uuid>,
 ) -> Result<Json<Vec<Command>>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/executors/:executor_id/commands/pending",
+        "executors:poll",
+    )?;
     ensure_executor_exists(&state, executor_id)?;
     let commands = state
         .storage
@@ -3578,9 +3718,16 @@ async fn poll_executor_pending_commands(
 
 async fn claim_executor_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
     request: Option<Json<ExecutorClaimCommandRequest>>,
 ) -> Result<Json<Command>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/executors/:executor_id/commands/:command_id/claim",
+        "executors:claim",
+    )?;
     let executor = get_executor_agent(&state, executor_id)?;
     ensure_executor_can_run_command(&state, executor_id, command_id)?;
     let request = request.map(|Json(request)| request);
@@ -3607,9 +3754,16 @@ async fn claim_executor_command(
 
 async fn complete_executor_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<ExecutorCompleteCommandRequest>,
 ) -> Result<Json<ExecutorCommandCompletionResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/executors/:executor_id/commands/:command_id/complete",
+        "executors:report",
+    )?;
     let executor = get_executor_agent(&state, executor_id)?;
     let command = get_command_for_executor_mutation(&state, command_id, &executor.agent_key)?;
     let now = Utc::now();
@@ -3669,9 +3823,16 @@ async fn complete_executor_command(
 
 async fn fail_executor_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<ExecutorFailCommandRequest>,
 ) -> Result<Json<ExecutorCommandCompletionResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/executors/:executor_id/commands/:command_id/fail",
+        "executors:report",
+    )?;
     let executor = get_executor_agent(&state, executor_id)?;
     let command = get_command_for_executor_mutation(&state, command_id, &executor.agent_key)?;
     let now = Utc::now();
@@ -3733,8 +3894,10 @@ async fn fail_executor_command(
 
 async fn register_edge_adapter(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<RegisterEdgeAdapterRequest>,
 ) -> Result<(StatusCode, Json<EdgeAdapterRegistrationResponse>), ApiError> {
+    require_scope(&state, &auth, "/adapters", "adapters:register")?;
     let now = Utc::now();
     let existing = state
         .storage
@@ -3829,9 +3992,16 @@ async fn get_edge_adapter(
 
 async fn heartbeat_edge_adapter(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(adapter_id): Path<Uuid>,
     Json(request): Json<EdgeAdapterHeartbeatRequest>,
 ) -> Result<Json<EdgeAdapterStatusResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/adapters/:adapter_id/heartbeat",
+        "adapters:heartbeat",
+    )?;
     let mut adapter = get_edge_adapter_record(&state, adapter_id)?;
     let previous_status = adapter.status.clone();
     let observed_at = request.observed_at.unwrap_or_else(Utc::now);
@@ -3915,8 +4085,15 @@ async fn get_edge_adapter_status(
 
 async fn register_smartsentinel_executor(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<RegisterSmartSentinelExecutorRequest>,
 ) -> Result<(StatusCode, Json<RegisterSmartSentinelExecutorResponse>), ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/integrations/smartsentinel/executors/register",
+        "smartsentinel:executor_register",
+    )?;
     let now = Utc::now();
     let existing = state
         .storage
@@ -3991,8 +4168,15 @@ async fn register_smartsentinel_executor(
 
 async fn poll_smartsentinel_executor_commands(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(executor_id): Path<Uuid>,
 ) -> Result<Json<Vec<SmartSentinelCommandEnvelope>>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/integrations/smartsentinel/executors/:executor_id/commands",
+        "smartsentinel:executor_poll",
+    )?;
     let executor = get_executor_agent(&state, executor_id)?;
     ensure_smartsentinel_executor(&executor)?;
     let commands = state
@@ -4008,9 +4192,16 @@ async fn poll_smartsentinel_executor_commands(
 
 async fn claim_smartsentinel_executor_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
     request: Option<Json<ExecutorClaimCommandRequest>>,
 ) -> Result<Json<SmartSentinelCommandEnvelope>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/integrations/smartsentinel/executors/:executor_id/commands/:command_id/claim",
+        "smartsentinel:executor_claim",
+    )?;
     let executor = get_executor_agent(&state, executor_id)?;
     ensure_smartsentinel_executor(&executor)?;
     ensure_executor_can_run_command(&state, executor_id, command_id)?;
@@ -4040,9 +4231,16 @@ async fn claim_smartsentinel_executor_command(
 
 async fn report_smartsentinel_executor_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<SmartSentinelCommandReportRequest>,
 ) -> Result<Json<SmartSentinelCommandReportResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/integrations/smartsentinel/executors/:executor_id/commands/:command_id/report",
+        "smartsentinel:executor_report",
+    )?;
     let executor = get_executor_agent(&state, executor_id)?;
     ensure_smartsentinel_executor(&executor)?;
     let command = get_command_for_executor_mutation(&state, command_id, &executor.agent_key)?;
@@ -5073,8 +5271,10 @@ fn provenance_search_query_metadata(query: &ProvenanceSearchQuery, limit: u32) -
 
 async fn create_connector_secret(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateConnectorSecretRequest>,
 ) -> Result<(StatusCode, Json<ConnectorSecretResponse>), ApiError> {
+    require_scope(&state, &auth, "/secrets/connectors", "secrets:admin")?;
     let secret = ConnectorSecret::new(
         state.tenant_id,
         request.secret_key,
@@ -5096,7 +5296,9 @@ async fn create_connector_secret(
 
 async fn list_connector_secrets(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<ConnectorSecretResponse>>, ApiError> {
+    require_scope(&state, &auth, "/secrets/connectors", "secrets:admin")?;
     let secrets = state
         .storage
         .list_connector_secrets(state.tenant_id)?
@@ -5108,8 +5310,15 @@ async fn list_connector_secrets(
 
 async fn get_connector_secret(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(secret_id): Path<Uuid>,
 ) -> Result<Json<ConnectorSecretResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/secrets/connectors/:secret_id",
+        "secrets:admin",
+    )?;
     let secret = state
         .storage
         .get_connector_secret(state.tenant_id, secret_id)?
@@ -5119,8 +5328,15 @@ async fn get_connector_secret(
 
 async fn delete_connector_secret(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(secret_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/secrets/connectors/:secret_id",
+        "secrets:admin",
+    )?;
     let secret = state
         .storage
         .get_connector_secret(state.tenant_id, secret_id)?
@@ -10775,6 +10991,25 @@ fn record_api_token_revoked_event(state: &AppState, token: &ApiToken) {
     );
 }
 
+fn record_auth_token_accepted_event(
+    state: &AppState,
+    token_id: Option<Uuid>,
+    principal_type: PrincipalType,
+    source: Option<&str>,
+) {
+    record_auth_event(
+        state,
+        "aion:AuthTokenAccepted",
+        EventSeverity::Info,
+        Some("authenticated token accepted".to_string()),
+        Some(json!({
+            "token_id": token_id,
+            "principal_type": principal_type,
+            "source": source,
+        })),
+    );
+}
+
 fn record_token_used_event(state: &AppState, token: &ApiToken) {
     record_auth_event(
         state,
@@ -10786,6 +11021,48 @@ fn record_token_used_event(state: &AppState, token: &ApiToken) {
             "token_prefix": token.token_prefix,
             "principal_type": map_principal_type_from_storage(token.principal_type),
             "principal_id": token.principal_id,
+        })),
+    );
+}
+
+fn record_auth_access_denied_event(
+    state: &AppState,
+    endpoint: &str,
+    required_scope: Option<&str>,
+    auth: &AuthContext,
+) {
+    record_auth_event(
+        state,
+        "aion:AuthAccessDenied",
+        EventSeverity::Warning,
+        Some(format!("authentication required for {endpoint}")),
+        Some(json!({
+            "endpoint": endpoint,
+            "required_scope": required_scope,
+            "principal_type": auth.principal.principal_type,
+            "principal_id": auth.principal.principal_id,
+            "auth_mode": auth.mode.as_str(),
+        })),
+    );
+}
+
+fn record_auth_scope_denied_event(
+    state: &AppState,
+    endpoint: &str,
+    required_scopes: &[&str],
+    auth: &AuthContext,
+) {
+    record_auth_event(
+        state,
+        "aion:AuthScopeDenied",
+        EventSeverity::Warning,
+        Some(format!("scope denied for {endpoint}")),
+        Some(json!({
+            "endpoint": endpoint,
+            "required_scopes": required_scopes,
+            "principal_type": auth.principal.principal_type,
+            "principal_id": auth.principal.principal_id,
+            "granted_scopes": auth.principal.scopes,
         })),
     );
 }
@@ -11338,6 +11615,16 @@ impl ApiError {
         }
     }
 
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+            validation_errors: Vec::new(),
+            validation_warnings: Vec::new(),
+            skipped_items: Vec::new(),
+        }
+    }
+
     fn smartsentinel_validation(
         message: impl Into<String>,
         report: SmartSentinelValidationReport,
@@ -11468,6 +11755,7 @@ mod tests {
             StorageBackendName::Memory,
             AuthConfig {
                 mode: AuthMode::Disabled,
+                bootstrap_admin_token_hash: None,
             },
             Uuid::nil(),
         );
@@ -11581,7 +11869,7 @@ mod tests {
                     "token_name": "bootstrap",
                     "principal_type": "service",
                     "principal_id": "bootstrap-service",
-                    "scopes": ["entities:read", "observations:read"]
+                    "scopes": ["entities:read", "observations:read", "auth:tokens:admin"]
                 }),
             ))
             .await
@@ -11633,6 +11921,7 @@ mod tests {
             StorageBackendName::Memory,
             AuthConfig {
                 mode: AuthMode::Token,
+                bootstrap_admin_token_hash: None,
             },
             Uuid::nil(),
         ));
@@ -11696,6 +11985,7 @@ mod tests {
             StorageBackendName::Memory,
             AuthConfig {
                 mode: AuthMode::Token,
+                bootstrap_admin_token_hash: None,
             },
             Uuid::nil(),
         ));
@@ -11726,6 +12016,7 @@ mod tests {
             StorageBackendName::Memory,
             AuthConfig {
                 mode: AuthMode::Token,
+                bootstrap_admin_token_hash: None,
             },
             Uuid::nil(),
         );
@@ -11772,6 +12063,435 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dev_mode_allows_protected_adapter_registration_without_token() {
+        let response = app()
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": "dev-adapter-01",
+                    "display_name": "Dev Adapter 01",
+                    "adapter_type": "edge",
+                    "status": "online"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn disabled_mode_allows_protected_adapter_registration_without_token() {
+        let app = disabled_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": "disabled-adapter-01",
+                    "display_name": "Disabled Adapter 01",
+                    "adapter_type": "edge",
+                    "status": "online"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_protected_adapter_registration_without_token() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": "token-adapter-01",
+                    "display_name": "Token Adapter 01",
+                    "adapter_type": "edge",
+                    "status": "online"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_json(response).await;
+        assert!(body["error"].as_str().unwrap().contains("bearer token"));
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_invalid_token_for_protected_adapter_registration() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(auth_json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": "token-adapter-02",
+                    "display_name": "Token Adapter 02",
+                    "adapter_type": "edge",
+                    "status": "online"
+                }),
+                "aion_invalid01_secret",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_json(response).await;
+        assert!(!body.to_string().contains("aion_invalid01_secret"));
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_valid_token_without_required_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("service-no-adapter-scope"),
+            &["entities:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+        let response = app
+            .oneshot(auth_json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": "token-adapter-03",
+                    "display_name": "Token Adapter 03",
+                    "adapter_type": "edge",
+                    "status": "online"
+                }),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_json(response).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("adapters:register"));
+    }
+
+    #[tokio::test]
+    async fn token_mode_allows_adapter_heartbeat_with_required_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let adapter = dev_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": "heartbeat-adapter-01",
+                    "display_name": "Heartbeat Adapter 01",
+                    "adapter_type": "edge",
+                    "status": "online"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(adapter.status(), StatusCode::CREATED);
+        let adapter = to_json(adapter).await;
+        let adapter_id = adapter["adapter"]["id"].as_str().unwrap();
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Adapter,
+            Some("heartbeat-adapter-01"),
+            &["adapters:heartbeat"],
+        );
+
+        let response = token_app
+            .oneshot(auth_json_request(
+                "PUT",
+                &format!("/adapters/{adapter_id}/heartbeat"),
+                json!({
+                    "status": "online",
+                    "metadata": {"source": "test"}
+                }),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_all_satisfies_protected_adapter_registration() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Admin,
+            Some("platform-admin"),
+            &["admin:all"],
+        );
+        let app = token_mode_app_with_storage(storage);
+        let response = app
+            .oneshot(auth_json_request(
+                "POST",
+                "/adapters",
+                json!({
+                    "adapter_key": "admin-adapter-01",
+                    "display_name": "Admin Adapter 01",
+                    "adapter_type": "edge",
+                    "status": "online"
+                }),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn secrets_endpoints_require_secrets_admin_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = token_mode_app_with_storage(storage.clone());
+        let read_only_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("reader"),
+            &["entities:read"],
+        );
+        let admin_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Admin,
+            Some("secret-admin"),
+            &["secrets:admin"],
+        );
+
+        let denied = app
+            .clone()
+            .oneshot(auth_request("GET", "/secrets/connectors", &read_only_token))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let created = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/secrets/connectors",
+                json!({
+                    "secret_key": "protected-secret",
+                    "secret_type": "mqtt_basic_auth",
+                    "username": "mqtt-user",
+                    "secret_value": "secret-pass"
+                }),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = to_json(created).await;
+        let secret_id = created["id"].as_str().unwrap();
+
+        let listed = app
+            .clone()
+            .oneshot(auth_request("GET", "/secrets/connectors", &admin_token))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+
+        let fetched = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/secrets/connectors/{secret_id}"),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+
+        let deleted = app
+            .oneshot(auth_request(
+                "DELETE",
+                &format!("/secrets/connectors/{secret_id}"),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn executor_polling_requires_executors_poll_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&dev_app, "token-executor-pump-01", "aion:Pump").await;
+        let command = create_test_command(&dev_app, &pump_id, "StartPump").await;
+        let executor = create_test_executor(&dev_app, "token-executor-01").await;
+        let executor_id = executor["id"].as_str().unwrap();
+        put_executor_capabilities(&dev_app, executor_id, &["StartPump"]).await;
+        put_executor_scope_for_target(&dev_app, executor_id, &pump_id).await;
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Executor,
+            Some("token-executor-01"),
+            &["executors:heartbeat"],
+        );
+
+        let denied = token_app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/executors/{executor_id}/commands/pending"),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let body = to_json(denied).await;
+        assert!(body["error"].as_str().unwrap().contains("executors:poll"));
+        assert_eq!(command["command_type"], "StartPump");
+    }
+
+    #[tokio::test]
+    async fn smartsentinel_report_requires_executor_report_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let service_id = smartsentinel_service_entity(&dev_app).await;
+        let executor = register_smartsentinel_executor(
+            &dev_app,
+            "smartsentinel-token-executor-01",
+            &service_id,
+            &["sentinel:RunDiagnostic"],
+        )
+        .await;
+        let executor_id = executor["executor"]["id"].as_str().unwrap();
+        let command = create_test_command(&dev_app, &service_id, "sentinel:RunDiagnostic").await;
+        let command_id = command["id"].as_str().unwrap();
+        let _ = claim_smartsentinel_command(&dev_app, executor_id, command_id).await;
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Executor,
+            Some("smartsentinel-token-executor-01"),
+            &["smartsentinel:executor_poll"],
+        );
+
+        let denied = token_app
+            .oneshot(auth_json_request(
+                "POST",
+                &format!(
+                    "/integrations/smartsentinel/executors/{executor_id}/commands/{command_id}/report"
+                ),
+                json!({
+                    "action_type": "sentinel:RunDiagnostic",
+                    "status": "executed",
+                    "verified": true,
+                    "result_payload": {"dry_run": true}
+                }),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let body = to_json(denied).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("smartsentinel:executor_report"));
+    }
+
+    #[tokio::test]
+    async fn token_management_requires_scope_or_bootstrap_admin_token() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let scoped_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("token-admin"),
+            &["auth:tokens:admin"],
+        );
+        let non_admin_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("token-user"),
+            &["entities:read"],
+        );
+        let app = token_mode_app_with_storage(storage.clone());
+
+        let forbidden = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/auth/tokens",
+                json!({
+                    "token_name": "forbidden",
+                    "principal_type": "service",
+                    "scopes": []
+                }),
+                &non_admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let allowed = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/auth/tokens",
+                json!({
+                    "token_name": "allowed",
+                    "principal_type": "service",
+                    "scopes": ["adapters:register"]
+                }),
+                &scoped_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::CREATED);
+
+        let bootstrap_token = "bootstrap-admin-secret";
+        let bootstrap_app = token_mode_app_with_bootstrap(storage, bootstrap_token);
+        let bootstrap_allowed = bootstrap_app
+            .oneshot(auth_json_request(
+                "POST",
+                "/auth/tokens",
+                json!({
+                    "token_name": "bootstrap-created",
+                    "principal_type": "service",
+                    "scopes": ["adapters:heartbeat"]
+                }),
+                bootstrap_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bootstrap_allowed.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn unprotected_endpoints_still_work_in_token_mode_without_token() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/entities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body, json!([]));
+    }
+
+    #[tokio::test]
     async fn existing_endpoints_still_work_without_credentials_in_dev_mode() {
         let app = app();
         let response = app
@@ -11805,6 +12525,7 @@ mod tests {
             StorageBackendName::Memory,
             AuthConfig {
                 mode: AuthMode::Disabled,
+                bootstrap_admin_token_hash: None,
             },
             Uuid::nil(),
         );
@@ -12714,13 +13435,16 @@ mod tests {
 
     #[test]
     fn auth_config_defaults_to_dev() {
-        assert_eq!(AuthConfig::from_env_vars(None).unwrap().mode, AuthMode::Dev);
+        assert_eq!(
+            AuthConfig::from_env_vars(None, None).unwrap().mode,
+            AuthMode::Dev
+        );
     }
 
     #[test]
     fn auth_config_accepts_explicit_dev() {
         assert_eq!(
-            AuthConfig::from_env_vars(Some("dev".to_string()))
+            AuthConfig::from_env_vars(Some("dev".to_string()), None)
                 .unwrap()
                 .mode,
             AuthMode::Dev
@@ -12730,7 +13454,7 @@ mod tests {
     #[test]
     fn auth_config_accepts_explicit_disabled() {
         assert_eq!(
-            AuthConfig::from_env_vars(Some("disabled".to_string()))
+            AuthConfig::from_env_vars(Some("disabled".to_string()), None)
                 .unwrap()
                 .mode,
             AuthMode::Disabled
@@ -12740,7 +13464,7 @@ mod tests {
     #[test]
     fn auth_config_recognizes_token_mode() {
         assert_eq!(
-            AuthConfig::from_env_vars(Some("token".to_string()))
+            AuthConfig::from_env_vars(Some("token".to_string()), None)
                 .unwrap()
                 .mode,
             AuthMode::Token
@@ -12749,7 +13473,7 @@ mod tests {
 
     #[test]
     fn auth_config_rejects_unknown_mode() {
-        let error = AuthConfig::from_env_vars(Some("jwt".to_string()))
+        let error = AuthConfig::from_env_vars(Some("jwt".to_string()), None)
             .expect_err("unknown auth mode should fail");
         assert!(error.to_string().contains("unknown AIONCORE_AUTH_MODE"));
     }
@@ -12760,6 +13484,7 @@ mod tests {
             StorageBackendConfig::Memory,
             AuthConfig {
                 mode: AuthMode::Token,
+                bootstrap_admin_token_hash: None,
             },
         )
         .expect("token auth mode should initialize");
@@ -19514,6 +20239,78 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CREATED);
         to_json(response).await
+    }
+
+    fn token_mode_app_with_storage(storage: Arc<InMemoryStorage>) -> Router {
+        app_with_state(AppState::with_backend_storage_and_auth(
+            storage,
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Token,
+                bootstrap_admin_token_hash: None,
+            },
+            Uuid::nil(),
+        ))
+    }
+
+    fn dev_mode_app_with_storage(storage: Arc<InMemoryStorage>) -> Router {
+        app_with_state(AppState::with_backend_storage_and_auth(
+            storage,
+            StorageBackendName::Memory,
+            AuthConfig::default(),
+            Uuid::nil(),
+        ))
+    }
+
+    fn token_mode_app_with_bootstrap(
+        storage: Arc<InMemoryStorage>,
+        bootstrap_token: &str,
+    ) -> Router {
+        app_with_state(AppState::with_backend_storage_and_auth(
+            storage,
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Token,
+                bootstrap_admin_token_hash: Some(hash_token_value(bootstrap_token)),
+            },
+            Uuid::nil(),
+        ))
+    }
+
+    fn disabled_mode_app_with_storage(storage: Arc<InMemoryStorage>) -> Router {
+        app_with_state(AppState::with_backend_storage_and_auth(
+            storage,
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Disabled,
+                bootstrap_admin_token_hash: None,
+            },
+            Uuid::nil(),
+        ))
+    }
+
+    fn store_api_token(
+        storage: &Arc<InMemoryStorage>,
+        principal_type: ApiTokenPrincipalType,
+        principal_id: Option<&str>,
+        scopes: &[&str],
+    ) -> String {
+        let issued = issue_api_token();
+        let token = ApiToken::new(
+            Uuid::nil(),
+            "test-token",
+            issued.token_prefix.clone(),
+            issued.token_hash,
+            principal_type,
+            principal_id.map(ToOwned::to_owned),
+            scopes.iter().map(|scope| (*scope).to_string()).collect(),
+            None,
+            Some(json!({"suite": "auth"})),
+            Utc::now(),
+        )
+        .unwrap();
+        storage.create_api_token(token).unwrap();
+        issued.raw_token
     }
 
     async fn get_worker_plan(app: &Router) -> Value {
