@@ -24,12 +24,14 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 60 auth hardening: selected token mode write paths now enforce explicit write scopes plus first-pass tenant-aware create/update checks without cross-tenant sharing.
 - Milestone 61 modularization foundation: `apps/aion-api/src/lib.rs` now begins a staged split by extracting cohesive auth code into `src/auth.rs` while preserving runtime behavior and deferring route-level refactors.
 - Milestone 62 modularization foundation: `apps/aion-api/src/lib.rs` now extracts shared API error and response primitives into `src/error.rs` so later route modules can reuse stable HTTP failure behavior without changing endpoint semantics.
+- Milestone 63 route modularization foundation: `apps/aion-api/src/lib.rs` now extracts the Edge Adapter route group into `src/routes/adapters.rs`, preserving endpoint paths, auth semantics, entity projection, and event behavior while establishing the first dedicated route module.
+- Milestone 64 route modularization: `apps/aion-api/src/lib.rs` now extracts the auth/token HTTP surface into `src/routes/auth.rs`, preserving auth mode behavior, token issuance/validation semantics, audit events, endpoint paths, and JSON response shapes while continuing the staged route split.
 
 ## Next
 
-1. Milestone 63: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
-2. Milestone 64: review whether remaining open write surfaces should split into narrower operator and machine scopes.
-3. Milestone 65: continue `aion-api` route-level modularization by splitting handlers and DTOs into cohesive domain modules without changing endpoint behavior.
+1. Milestone 65: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+2. Milestone 66: review whether remaining open write surfaces should split into narrower operator and machine scopes.
+3. Milestone 67: continue `aion-api` route-level modularization by splitting additional cohesive handler groups and DTOs into domain route modules without changing endpoint behavior.
 
 ## Future
 
@@ -43,4 +45,4 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 
 - The roadmap is intentionally concise. Canonical details live in the individual model docs and ADRs.
 - Security hardening remains staged after the current selected write-surface rollout to avoid overreaching beyond verified behavior in one milestone.
-- `aion-api` modularization is intentionally incremental; Milestones 61 and 62 establish safe extraction patterns for later route-level splits.
+- `aion-api` modularization is intentionally incremental; Milestones 61 through 64 establish safe extraction patterns for later route-level splits.

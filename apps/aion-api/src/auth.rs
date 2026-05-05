@@ -1,9 +1,9 @@
 use crate::{
     error::ApiError, record_auth_access_denied_event, record_auth_scope_denied_event,
     record_auth_token_accepted_event, record_token_rejected_event, record_token_used_event,
-    ApiTokenRecordResponse, AppState, StartupError,
+    AppState, StartupError,
 };
-use aion_storage::{ApiToken, ApiTokenPrincipalType};
+use aion_storage::ApiTokenPrincipalType;
 use axum::{extract::Request, http::header};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -366,24 +366,6 @@ pub(crate) fn map_principal_type_from_storage(value: ApiTokenPrincipalType) -> P
         ApiTokenPrincipalType::Connector => PrincipalType::Connector,
         ApiTokenPrincipalType::Service => PrincipalType::Service,
         ApiTokenPrincipalType::Admin => PrincipalType::Admin,
-    }
-}
-
-pub(crate) fn api_token_record_response(token: ApiToken) -> ApiTokenRecordResponse {
-    ApiTokenRecordResponse {
-        id: token.id,
-        tenant_id: token.tenant_id,
-        token_name: token.token_name,
-        token_prefix: token.token_prefix,
-        principal_type: map_principal_type_from_storage(token.principal_type),
-        principal_id: token.principal_id,
-        scopes: token.scopes,
-        expires_at: token.expires_at,
-        revoked_at: token.revoked_at,
-        last_used_at: token.last_used_at,
-        metadata: token.metadata,
-        created_at: token.created_at,
-        updated_at: token.updated_at,
     }
 }
 

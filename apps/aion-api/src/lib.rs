@@ -1,7 +1,6 @@
 use aion_action::{
     Action, ActionResult, ApprovalStatus, Capability, Command, CommandLease, CommandStatus,
-    EdgeAdapter, EdgeAdapterStatus, EdgeAdapterStatusReport, EdgeAdapterType, ExecutorAgent,
-    ExecutorAgentStatus, ExecutorCapability, ExecutorScope, Policy,
+    ExecutorAgent, ExecutorAgentStatus, ExecutorCapability, ExecutorScope, Policy,
 };
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
@@ -46,12 +45,14 @@ use uuid::Uuid;
 mod auth;
 mod error;
 mod mqtt_ingest;
+mod routes;
 
 #[cfg(test)]
 use auth::hash_token_value;
+#[cfg(test)]
+use auth::issue_api_token;
 use auth::{
-    api_token_record_response, deny_cross_tenant_write, is_admin_all, issue_api_token,
-    map_principal_type_from_storage, map_principal_type_to_storage, principal_tenant_id,
+    deny_cross_tenant_write, is_admin_all, map_principal_type_from_storage, principal_tenant_id,
     principal_tenant_or_default, require_any_scope, require_scope, require_scope_for_write,
     resolve_auth_context, tenant_for_created_resource, AuthContext, TokenRejectionReason,
 };
@@ -376,53 +377,6 @@ struct ReadyAuthResponse {
     enforcement_level: AuthEnforcementLevel,
     protected_endpoint_groups: Vec<&'static str>,
     bootstrap_admin_configured: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateApiTokenRequest {
-    pub token_name: String,
-    pub principal_type: PrincipalType,
-    pub principal_id: Option<String>,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ApiTokenRecordResponse {
-    pub id: Uuid,
-    pub tenant_id: Uuid,
-    pub token_name: String,
-    pub token_prefix: String,
-    pub principal_type: PrincipalType,
-    pub principal_id: Option<String>,
-    pub scopes: Vec<String>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub metadata: Option<Value>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CreateApiTokenResponse {
-    pub token: ApiTokenRecordResponse,
-    pub raw_token: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct WhoAmIResponse {
-    pub auth_mode: &'static str,
-    pub authenticated: bool,
-    pub auth_valid: bool,
-    pub dev_bypass: bool,
-    pub principal_type: PrincipalType,
-    pub principal_id: Option<String>,
-    pub tenant_id: Option<Uuid>,
-    pub scopes: Vec<String>,
-    pub token_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1114,53 +1068,6 @@ pub struct ExecutorCommandCompletionResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RegisterEdgeAdapterRequest {
-    pub adapter_key: String,
-    pub display_name: Option<String>,
-    pub adapter_type: EdgeAdapterType,
-    pub status: Option<EdgeAdapterStatus>,
-    pub version: Option<String>,
-    pub host_id: Option<String>,
-    pub site_id: Option<String>,
-    pub environment: Option<String>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct EdgeAdapterHeartbeatRequest {
-    pub status: EdgeAdapterStatus,
-    pub version: Option<String>,
-    pub host_id: Option<String>,
-    pub site_id: Option<String>,
-    pub environment: Option<String>,
-    pub observed_at: Option<DateTime<Utc>>,
-    pub uptime_seconds: Option<u64>,
-    pub active_connectors: Option<u32>,
-    pub active_plugins: Option<u32>,
-    pub dlq_depth: Option<u64>,
-    pub dlq_oldest_record_at: Option<DateTime<Utc>>,
-    pub last_publish_success_at: Option<DateTime<Utc>>,
-    pub last_publish_failure_at: Option<DateTime<Utc>>,
-    pub last_error: Option<String>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EdgeAdapterRegistrationResponse {
-    pub adapter: EdgeAdapter,
-    pub entity: Option<Entity>,
-    pub status: EdgeAdapterStatusReport,
-    pub reused: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EdgeAdapterStatusResponse {
-    pub adapter: EdgeAdapter,
-    pub entity: Option<Entity>,
-    pub status: EdgeAdapterStatusReport,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct RegisterSmartSentinelExecutorRequest {
     pub agent_key: String,
     pub display_name: Option<String>,
@@ -1552,10 +1459,7 @@ pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/auth/whoami", get(whoami))
-        .route("/auth/tokens", post(create_api_token).get(list_api_tokens))
-        .route("/auth/tokens/:token_id", get(get_api_token))
-        .route("/auth/tokens/:token_id/revoke", post(revoke_api_token))
+        .merge(routes::auth::router())
         .route("/entities", post(create_entity).get(list_entities))
         .route("/entities/:entity_id", get(get_entity))
         .route("/entities/:entity_id/context", get(get_entity_context))
@@ -1601,16 +1505,7 @@ pub fn app_with_state(state: AppState) -> Router {
             "/executors/:executor_id/commands/:command_id/fail",
             post(fail_executor_command),
         )
-        .route(
-            "/adapters",
-            post(register_edge_adapter).get(list_edge_adapters),
-        )
-        .route("/adapters/:adapter_id", get(get_edge_adapter))
-        .route(
-            "/adapters/:adapter_id/heartbeat",
-            put(heartbeat_edge_adapter),
-        )
-        .route("/adapters/:adapter_id/status", get(get_edge_adapter_status))
+        .merge(routes::adapters::router())
         .route("/commands", post(create_command).get(query_commands))
         .route(
             "/commands/recover-expired-leases",
@@ -1826,101 +1721,6 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse
             details,
         }),
     )
-}
-
-async fn whoami(Extension(auth): Extension<AuthContext>) -> Json<WhoAmIResponse> {
-    Json(WhoAmIResponse {
-        auth_mode: auth.mode.as_str(),
-        authenticated: auth.authenticated,
-        auth_valid: auth.auth_valid,
-        dev_bypass: auth.dev_bypass,
-        principal_type: auth.principal.principal_type,
-        principal_id: auth.principal.principal_id,
-        tenant_id: auth.principal.tenant_id,
-        scopes: auth.principal.scopes,
-        token_id: auth.token_id,
-    })
-}
-
-async fn create_api_token(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Json(request): Json<CreateApiTokenRequest>,
-) -> Result<(StatusCode, Json<CreateApiTokenResponse>), ApiError> {
-    require_scope(&state, &auth, "/auth/tokens", "auth:tokens:admin")?;
-
-    let principal_type = map_principal_type_to_storage(request.principal_type)
-        .ok_or_else(|| ApiError::bad_request("principal_type must not be anonymous"))?;
-    let issued = issue_api_token();
-    let now = Utc::now();
-    let token = ApiToken::new(
-        state.tenant_id,
-        request.token_name,
-        issued.token_prefix.clone(),
-        issued.token_hash,
-        principal_type,
-        request.principal_id,
-        request.scopes,
-        request.expires_at,
-        request.metadata,
-        now,
-    )?;
-    let token = state.storage.create_api_token(token)?;
-    record_api_token_created_event(&state, &token);
-
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateApiTokenResponse {
-            token: api_token_record_response(token),
-            raw_token: issued.raw_token,
-        }),
-    ))
-}
-
-async fn list_api_tokens(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-) -> Result<Json<Vec<ApiTokenRecordResponse>>, ApiError> {
-    require_scope(&state, &auth, "/auth/tokens", "auth:tokens:admin")?;
-    Ok(Json(
-        state
-            .storage
-            .list_api_tokens(state.tenant_id)?
-            .into_iter()
-            .map(api_token_record_response)
-            .collect(),
-    ))
-}
-
-async fn get_api_token(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(token_id): Path<Uuid>,
-) -> Result<Json<ApiTokenRecordResponse>, ApiError> {
-    require_scope(&state, &auth, "/auth/tokens/:token_id", "auth:tokens:admin")?;
-    let token = state
-        .storage
-        .get_api_token(state.tenant_id, token_id)?
-        .ok_or_else(ApiError::not_found)?;
-    Ok(Json(api_token_record_response(token)))
-}
-
-async fn revoke_api_token(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(token_id): Path<Uuid>,
-) -> Result<Json<ApiTokenRecordResponse>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/auth/tokens/:token_id/revoke",
-        "auth:tokens:admin",
-    )?;
-    let token = state
-        .storage
-        .revoke_api_token(state.tenant_id, token_id, Utc::now())?;
-    record_api_token_revoked_event(&state, &token);
-    Ok(Json(api_token_record_response(token)))
 }
 
 async fn create_entity(
@@ -3826,208 +3626,6 @@ async fn fail_executor_command(
         command,
         action,
         action_result,
-    }))
-}
-
-async fn register_edge_adapter(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Json(request): Json<RegisterEdgeAdapterRequest>,
-) -> Result<(StatusCode, Json<EdgeAdapterRegistrationResponse>), ApiError> {
-    require_scope(&state, &auth, "/adapters", "adapters:register")?;
-    let now = Utc::now();
-    let existing = state
-        .storage
-        .get_edge_adapter_by_key(state.tenant_id, &request.adapter_key)?;
-    let previous_status = existing.as_ref().map(|adapter| adapter.status.clone());
-    let reused = previous_status.is_some();
-
-    let adapter = if let Some(mut adapter) = existing {
-        adapter.display_name = request.display_name;
-        adapter.adapter_type = request.adapter_type;
-        adapter.status = request
-            .status
-            .clone()
-            .unwrap_or_else(|| adapter.status.clone());
-        adapter.version = request.version;
-        adapter.host_id = request.host_id;
-        adapter.site_id = request.site_id;
-        adapter.environment = request.environment;
-        adapter.metadata = request.metadata;
-        adapter.updated_at = now;
-        state.storage.update_edge_adapter(adapter)?
-    } else {
-        let adapter = EdgeAdapter::new(
-            state.tenant_id,
-            request.adapter_key,
-            request.adapter_type,
-            request.display_name,
-            request.status.unwrap_or(EdgeAdapterStatus::Unknown),
-            request.version,
-            request.host_id,
-            request.site_id,
-            request.environment,
-            request.metadata,
-            now,
-        )
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        state.storage.create_edge_adapter(adapter)?
-    };
-
-    let entity = upsert_edge_adapter_entity(&state, &adapter)?;
-    let status = edge_adapter_status_from_registration(&adapter, now);
-    let status = state
-        .storage
-        .put_edge_adapter_status(state.tenant_id, status)?;
-    record_edge_adapter_event(
-        &state,
-        "aion:EdgeAdapterRegistered",
-        &adapter,
-        Some(&entity),
-        Some(&status),
-        Some(json!({
-            "reused": previous_status.is_some(),
-            "source": "edge_adapter_api"
-        })),
-    )?;
-    if previous_status.as_ref() != Some(&adapter.status) {
-        record_edge_adapter_status_changed_event(
-            &state,
-            &adapter,
-            Some(&entity),
-            previous_status.clone(),
-        )?;
-    }
-
-    Ok((
-        if reused {
-            StatusCode::OK
-        } else {
-            StatusCode::CREATED
-        },
-        Json(EdgeAdapterRegistrationResponse {
-            adapter,
-            entity: Some(entity),
-            status,
-            reused,
-        }),
-    ))
-}
-
-async fn list_edge_adapters(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-) -> Result<Json<Vec<EdgeAdapter>>, ApiError> {
-    require_scope(&state, &auth, "/adapters", "adapters:read")?;
-    Ok(Json(state.storage.list_edge_adapters(state.tenant_id)?))
-}
-
-async fn get_edge_adapter(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(adapter_id): Path<Uuid>,
-) -> Result<Json<EdgeAdapter>, ApiError> {
-    require_scope(&state, &auth, "/adapters/:adapter_id", "adapters:read")?;
-    Ok(Json(get_edge_adapter_record(&state, adapter_id)?))
-}
-
-async fn heartbeat_edge_adapter(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(adapter_id): Path<Uuid>,
-    Json(request): Json<EdgeAdapterHeartbeatRequest>,
-) -> Result<Json<EdgeAdapterStatusResponse>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/adapters/:adapter_id/heartbeat",
-        "adapters:heartbeat",
-    )?;
-    let mut adapter = get_edge_adapter_record(&state, adapter_id)?;
-    let previous_status = adapter.status.clone();
-    let observed_at = request.observed_at.unwrap_or_else(Utc::now);
-    let request_metadata = request.metadata.clone();
-    adapter.heartbeat(request.status.clone(), observed_at);
-    if request.version.is_some() {
-        adapter.version = request.version;
-    }
-    if request.host_id.is_some() {
-        adapter.host_id = request.host_id;
-    }
-    if request.site_id.is_some() {
-        adapter.site_id = request.site_id;
-    }
-    if request.environment.is_some() {
-        adapter.environment = request.environment;
-    }
-    if request_metadata.is_some() {
-        adapter.metadata = request_metadata.clone();
-    }
-    let adapter = state.storage.update_edge_adapter(adapter)?;
-    let entity = upsert_edge_adapter_entity(&state, &adapter)?;
-    let status = EdgeAdapterStatusReport {
-        adapter_id: adapter.id,
-        status: request.status,
-        observed_at,
-        uptime_seconds: request.uptime_seconds,
-        active_connectors: request.active_connectors,
-        active_plugins: request.active_plugins,
-        dlq_depth: request.dlq_depth,
-        dlq_oldest_record_at: request.dlq_oldest_record_at,
-        last_publish_success_at: request.last_publish_success_at,
-        last_publish_failure_at: request.last_publish_failure_at,
-        last_error: request.last_error,
-        metadata: request_metadata,
-    };
-    let status = state
-        .storage
-        .put_edge_adapter_status(state.tenant_id, status)?;
-    record_edge_adapter_event(
-        &state,
-        "aion:EdgeAdapterHeartbeat",
-        &adapter,
-        Some(&entity),
-        Some(&status),
-        Some(json!({"source": "edge_adapter_api"})),
-    )?;
-    if previous_status != adapter.status {
-        record_edge_adapter_status_changed_event(
-            &state,
-            &adapter,
-            Some(&entity),
-            Some(previous_status),
-        )?;
-    }
-
-    Ok(Json(EdgeAdapterStatusResponse {
-        adapter,
-        entity: Some(entity),
-        status,
-    }))
-}
-
-async fn get_edge_adapter_status(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(adapter_id): Path<Uuid>,
-) -> Result<Json<EdgeAdapterStatusResponse>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/adapters/:adapter_id/status",
-        "adapters:read",
-    )?;
-    let adapter = get_edge_adapter_record(&state, adapter_id)?;
-    let entity = get_edge_adapter_entity(&state, &adapter)?;
-    let status = state
-        .storage
-        .get_edge_adapter_status(state.tenant_id, adapter_id)?
-        .unwrap_or_else(|| edge_adapter_status_from_adapter(&adapter, adapter.last_seen_at));
-
-    Ok(Json(EdgeAdapterStatusResponse {
-        adapter,
-        entity,
-        status,
     }))
 }
 
@@ -10790,199 +10388,6 @@ fn get_executor_agent(state: &AppState, executor_id: Uuid) -> Result<ExecutorAge
         .ok_or_else(ApiError::not_found)
 }
 
-fn get_edge_adapter_record(state: &AppState, adapter_id: Uuid) -> Result<EdgeAdapter, ApiError> {
-    state
-        .storage
-        .get_edge_adapter(state.tenant_id, adapter_id)?
-        .ok_or_else(ApiError::not_found)
-}
-
-fn get_edge_adapter_entity(
-    state: &AppState,
-    adapter: &EdgeAdapter,
-) -> Result<Option<Entity>, ApiError> {
-    state
-        .storage
-        .get_entity_by_key(
-            state.tenant_id,
-            &edge_adapter_entity_key(&adapter.adapter_key),
-        )
-        .map_err(ApiError::from)
-}
-
-fn upsert_edge_adapter_entity(state: &AppState, adapter: &EdgeAdapter) -> Result<Entity, ApiError> {
-    let entity_key = edge_adapter_entity_key(&adapter.adapter_key);
-    let now = Utc::now();
-    let jsonld = edge_adapter_jsonld(adapter);
-    if let Some(mut entity) = state
-        .storage
-        .get_entity_by_key(state.tenant_id, &entity_key)?
-    {
-        let unchanged = entity.entity_type == "aion:EdgeAdapter" && entity.jsonld == jsonld;
-        if unchanged {
-            return Ok(entity);
-        }
-        entity.entity_type = "aion:EdgeAdapter".to_string();
-        entity.jsonld = jsonld;
-        entity.updated_at = now;
-        return Ok(state.storage.update_entity(entity)?);
-    }
-
-    let entity = Entity::new(state.tenant_id, entity_key, "aion:EdgeAdapter", jsonld, now)
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    Ok(state.storage.create_entity(entity)?)
-}
-
-fn edge_adapter_entity_key(adapter_key: &str) -> String {
-    format!("edge-adapter:{adapter_key}")
-}
-
-fn edge_adapter_jsonld(adapter: &EdgeAdapter) -> Value {
-    json!({
-        "@context": {"aion": "https://aioncore.org/ns#"},
-        "@id": format!("urn:aion:edge-adapter:{}", adapter.adapter_key),
-        "@type": "aion:EdgeAdapter",
-        "entity_key": edge_adapter_entity_key(&adapter.adapter_key),
-        "adapter_key": adapter.adapter_key,
-        "adapter_type": adapter.adapter_type,
-        "status": adapter.status,
-        "display_name": adapter.display_name,
-        "version": adapter.version,
-        "host_id": adapter.host_id,
-        "site_id": adapter.site_id,
-        "environment": adapter.environment,
-        "last_seen_at": adapter.last_seen_at,
-        "metadata": adapter.metadata
-    })
-}
-
-fn edge_adapter_status_from_registration(
-    adapter: &EdgeAdapter,
-    observed_at: DateTime<Utc>,
-) -> EdgeAdapterStatusReport {
-    EdgeAdapterStatusReport {
-        adapter_id: adapter.id,
-        status: adapter.status.clone(),
-        observed_at,
-        uptime_seconds: None,
-        active_connectors: None,
-        active_plugins: None,
-        dlq_depth: None,
-        dlq_oldest_record_at: None,
-        last_publish_success_at: None,
-        last_publish_failure_at: None,
-        last_error: None,
-        metadata: adapter.metadata.clone(),
-    }
-}
-
-fn edge_adapter_status_from_adapter(
-    adapter: &EdgeAdapter,
-    observed_at: Option<DateTime<Utc>>,
-) -> EdgeAdapterStatusReport {
-    EdgeAdapterStatusReport {
-        adapter_id: adapter.id,
-        status: adapter.status.clone(),
-        observed_at: observed_at.unwrap_or(adapter.created_at),
-        uptime_seconds: None,
-        active_connectors: None,
-        active_plugins: None,
-        dlq_depth: None,
-        dlq_oldest_record_at: None,
-        last_publish_success_at: None,
-        last_publish_failure_at: None,
-        last_error: None,
-        metadata: adapter.metadata.clone(),
-    }
-}
-
-fn record_edge_adapter_event(
-    state: &AppState,
-    event_type: impl Into<String>,
-    adapter: &EdgeAdapter,
-    entity: Option<&Entity>,
-    status: Option<&EdgeAdapterStatusReport>,
-    metadata: Option<Value>,
-) -> Result<Event, ApiError> {
-    let mut event_metadata = json!({
-        "adapter_id": adapter.id,
-        "adapter_key": adapter.adapter_key,
-        "adapter_type": adapter.adapter_type,
-        "status": adapter.status,
-        "version": adapter.version,
-        "host_id": adapter.host_id,
-        "site_id": adapter.site_id,
-        "environment": adapter.environment,
-        "last_seen_at": adapter.last_seen_at
-    });
-    if let Some(object) = event_metadata.as_object_mut() {
-        if let Some(status) = status {
-            object.insert(
-                "status_report".to_string(),
-                json!({
-                    "status": status.status,
-                    "observed_at": status.observed_at,
-                    "uptime_seconds": status.uptime_seconds,
-                    "active_connectors": status.active_connectors,
-                    "active_plugins": status.active_plugins,
-                    "dlq_depth": status.dlq_depth,
-                    "dlq_oldest_record_at": status.dlq_oldest_record_at,
-                    "last_publish_success_at": status.last_publish_success_at,
-                    "last_publish_failure_at": status.last_publish_failure_at,
-                    "last_error": status.last_error,
-                    "metadata": status.metadata
-                }),
-            );
-        }
-        if let Some(entity) = entity {
-            object.insert("entity_id".to_string(), json!(entity.id));
-            object.insert("entity_key".to_string(), json!(entity.entity_key));
-        }
-        if let Some(metadata) = metadata {
-            object.insert("metadata".to_string(), metadata);
-        }
-    }
-
-    record_event(
-        state,
-        EventDraft {
-            event_type: event_type.into(),
-            severity: EventSeverity::Info,
-            source_entity_id: None,
-            target_entity_id: entity.map(|entity| entity.id),
-            message: Some(format!("Edge adapter {} event", adapter.adapter_key)),
-            occurred_at: Utc::now(),
-            observed_at: None,
-            correlation_id: None,
-            raw_message_id: None,
-            observation_id: None,
-            command_id: None,
-            action_id: None,
-            action_result_id: None,
-            metadata: Some(event_metadata),
-        },
-    )
-}
-
-fn record_edge_adapter_status_changed_event(
-    state: &AppState,
-    adapter: &EdgeAdapter,
-    entity: Option<&Entity>,
-    previous_status: Option<EdgeAdapterStatus>,
-) -> Result<Event, ApiError> {
-    record_edge_adapter_event(
-        state,
-        "aion:EdgeAdapterStatusChanged",
-        adapter,
-        entity,
-        None,
-        Some(json!({
-            "previous_status": previous_status,
-            "current_status": adapter.status
-        })),
-    )
-}
-
 fn ensure_smartsentinel_executor(executor: &ExecutorAgent) -> Result<(), ApiError> {
     if executor.agent_type != "smartsentinel" {
         return Err(ApiError::bad_request(
@@ -11679,7 +11084,7 @@ fn record_ingest_event_optional(
     )
 }
 
-fn record_event(state: &AppState, draft: EventDraft) -> Result<Event, ApiError> {
+pub(crate) fn record_event(state: &AppState, draft: EventDraft) -> Result<Event, ApiError> {
     let now = Utc::now();
     let event = Event::new(
         state.tenant_id,
@@ -11733,37 +11138,6 @@ fn record_auth_event(
     if let Ok(event) = event {
         let _ = state.storage.store_event(event);
     }
-}
-
-fn record_api_token_created_event(state: &AppState, token: &ApiToken) {
-    record_auth_event(
-        state,
-        "aion:ApiTokenCreated",
-        EventSeverity::Info,
-        Some(format!("api token '{}' created", token.token_name)),
-        Some(json!({
-            "token_id": token.id,
-            "token_prefix": token.token_prefix,
-            "principal_type": map_principal_type_from_storage(token.principal_type),
-            "principal_id": token.principal_id,
-            "scopes": token.scopes,
-        })),
-    );
-}
-
-fn record_api_token_revoked_event(state: &AppState, token: &ApiToken) {
-    record_auth_event(
-        state,
-        "aion:ApiTokenRevoked",
-        EventSeverity::Info,
-        Some(format!("api token '{}' revoked", token.token_name)),
-        Some(json!({
-            "token_id": token.id,
-            "token_prefix": token.token_prefix,
-            "principal_type": map_principal_type_from_storage(token.principal_type),
-            "principal_id": token.principal_id,
-        })),
-    );
 }
 
 fn record_auth_token_accepted_event(
@@ -11859,21 +11233,21 @@ fn record_token_rejected_event(
     );
 }
 
-struct EventDraft {
-    event_type: String,
-    severity: EventSeverity,
-    source_entity_id: Option<Uuid>,
-    target_entity_id: Option<Uuid>,
-    message: Option<String>,
-    occurred_at: DateTime<Utc>,
-    observed_at: Option<DateTime<Utc>>,
-    correlation_id: Option<String>,
-    raw_message_id: Option<Uuid>,
-    observation_id: Option<Uuid>,
-    command_id: Option<Uuid>,
-    action_id: Option<Uuid>,
-    action_result_id: Option<Uuid>,
-    metadata: Option<Value>,
+pub(crate) struct EventDraft {
+    pub(crate) event_type: String,
+    pub(crate) severity: EventSeverity,
+    pub(crate) source_entity_id: Option<Uuid>,
+    pub(crate) target_entity_id: Option<Uuid>,
+    pub(crate) message: Option<String>,
+    pub(crate) occurred_at: DateTime<Utc>,
+    pub(crate) observed_at: Option<DateTime<Utc>>,
+    pub(crate) correlation_id: Option<String>,
+    pub(crate) raw_message_id: Option<Uuid>,
+    pub(crate) observation_id: Option<Uuid>,
+    pub(crate) command_id: Option<Uuid>,
+    pub(crate) action_id: Option<Uuid>,
+    pub(crate) action_result_id: Option<Uuid>,
+    pub(crate) metadata: Option<Value>,
 }
 
 fn mutate_command(

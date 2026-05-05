@@ -1,0 +1,14 @@
+C:\Users\dnred\OneDrive\projetos\AionCore\target_m64_api_test\debug\deps\serde-5a6ecf99d2e76406.d: C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\dnred\OneDrive\projetos\AionCore\target_m64_api_test\debug\build\serde-9b76ea22f6fba3a5\out/private.rs
+
+C:\Users\dnred\OneDrive\projetos\AionCore\target_m64_api_test\debug\deps\libserde-5a6ecf99d2e76406.rlib: C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\dnred\OneDrive\projetos\AionCore\target_m64_api_test\debug\build\serde-9b76ea22f6fba3a5\out/private.rs
+
+C:\Users\dnred\OneDrive\projetos\AionCore\target_m64_api_test\debug\deps\libserde-5a6ecf99d2e76406.rmeta: C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\dnred\OneDrive\projetos\AionCore\target_m64_api_test\debug\build\serde-9b76ea22f6fba3a5\out/private.rs
+
+C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+C:\Users\dnred\OneDrive\projetos\AionCore\target_m64_api_test\debug\build\serde-9b76ea22f6fba3a5\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Users\\dnred\\OneDrive\\projetos\\AionCore\\target_m64_api_test\\debug\\build\\serde-9b76ea22f6fba3a5\\out
