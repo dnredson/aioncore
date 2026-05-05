@@ -2,11 +2,11 @@
 
 This document defines the authentication and authorization architecture for AionCore APIs while runtime enforcement is being introduced incrementally.
 
-Milestone 57 adds the first tenant/resource ownership skeleton for selected token-mode protected read surfaces on top of the Milestone 50 through 56 foundation. It still does not broadly enforce authentication across the full API, add login, validate JWTs, or implement full authorization.
+Milestone 60 adds selected tenant-aware write authorization on top of the Milestone 50 through 57 foundation. It still does not broadly enforce authentication across the full API, add login, validate JWTs, or implement full authorization.
 
 ## Status
 
-- Current local runtime behavior: `dev` remains the default and still bypasses auth; `token` mode now enforces selected machine-facing, broader read, MCP/AI, and secret-management routes, with first-pass tenant/resource ownership checks on selected protected reads only.
+- Current local runtime behavior: `dev` remains the default and still bypasses auth; `token` mode now enforces selected machine-facing, broader read, selected write, MCP/AI, and secret-management routes, with first-pass tenant/resource ownership checks on selected protected reads and writes.
 - Current production suitability: not suitable for exposed production deployment without additional protection in front of the API.
 - Current runtime auth foundation: middleware installed with development-mode bypass, explicit disabled mode, or token principal resolution.
 - Current selected enforcement in `token` mode:
@@ -26,15 +26,22 @@ Milestone 57 adds the first tenant/resource ownership skeleton for selected toke
   - `/events` and `/events/{event_id}` require `events:read`
   - `/raw-messages` and `/raw-messages/{raw_message_id}` require `raw-messages:read`
   - `/entities`, `/entities/{entity_id}`, and `/entities/{entity_id}/context` require `entities:read`
+  - `POST /entities` requires `entities:write`
+  - `POST /relationships` requires `relationships:write`
   - `/observations` requires `observations:read`
+  - `POST /observations` requires `observations:write`
   - `/commands` and `/commands/{command_id}` require `commands:read`
+  - selected generic command writes require `commands:create`, `commands:approve`, `commands:write`, `commands:claim`, or `commands:lease`
   - `/actions`, `/actions/{action_id}`, and `/action-results` require `actions:read`
+  - `POST /actions` and `POST /action-results` require `actions:write`
   - `/rules` and `/rules/{rule_id}` require `rules:read`
-  - `/policies` requires `policies:read`
-  - `/entities/{entity_id}/capabilities` requires `capabilities:read`
+  - selected generic rule writes require `rules:write`
+  - `/policies` requires `policies:read`; `PUT /policies` requires `policies:write`
+  - `/entities/{entity_id}/capabilities` requires `capabilities:read`; `PUT` requires `capabilities:write`
   - `/executors`, `/executors/{executor_id}`, `/executors/{executor_id}/capabilities`, and `/executors/{executor_id}/scopes` require `executors:read`
+  - `/executors/{executor_id}/capabilities` and `/executors/{executor_id}/scopes` also require `executors:admin` or `executors:write` for mutation
   - `/secrets/connectors*` requires `secrets:admin`
-- Unprotected in this milestone: the rest of the API surface, including broad write paths for entities, observations, commands, actions, rules, policies, and capabilities, plus tenant-aware writes and ownership enforcement for remaining routes outside the selected protected reads.
+- Unprotected in this milestone: the rest of the API surface, plus remaining tenant-aware writes and ownership enforcement outside the selected protected read/write surfaces.
 
 ## Security Goals
 
@@ -311,6 +318,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 
 - `entities:read`
 - `entities:write`
+- `relationships:write`
 - `observations:write`
 - `observations:read`
 - `ingestion:write`
@@ -322,18 +330,24 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `commands:read`
 - `actions:read`
 - `commands:create`
+- `commands:approve`
+- `commands:write`
 - `commands:claim`
-- `commands:report`
+- `commands:lease`
 - `rules:read`
-- `rules:admin`
+- `rules:write`
 - `policies:read`
+- `policies:write`
 - `capabilities:read`
+- `capabilities:write`
 - `mcp:tools`
 - `smartsentinel:ingest`
 - `adapters:register`
 - `adapters:heartbeat`
 - `executors:register`
 - `executors:read`
+- `executors:write`
+- `executors:admin`
 - `executors:heartbeat`
 - `executors:poll`
 - `executors:claim`
@@ -347,7 +361,8 @@ Scopes are additive. Principals should receive the minimum set required for thei
 
 ### Scope Notes
 
-- `entities:write` covers entity, relationship, capability, and payload-profile mutation unless a later split is needed.
+- `entities:write` covers selected generic entity creation.
+- `relationships:write` covers selected generic relationship creation.
 - `ingestion:write` protects both generic `/ingest/http` and connector-aware machine writes at `/ingestion/connectors/{connector_id}/ingest`.
 - `connectors:read` covers selected connector and worker operational reads without granting mutation.
 - `connectors:admin` covers connector lifecycle mutation, TTN device-mapping administration, worker reconciliation, TTN live validation preflight, validation-related operator actions, enable/disable, and configuration updates.
@@ -355,13 +370,19 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `raw-messages:read` covers `/raw-messages` list and detail reads, which can expose raw payloads, ingestion headers, connector metadata, and provenance-linked evidence references.
 - `commands:read` covers command visibility through generic, executor, and AI-context read paths.
 - `actions:read` covers action and action-result inspection without granting command mutation or execution reporting rights.
-- `commands:create` covers command creation and approval-oriented write flows may later split into narrower scopes such as `commands:approve`.
-- `rules:read` covers generic rule inspection while `rules:admin` remains the future mutation scope.
+- `commands:create` covers command creation.
+- `commands:approve` covers generic approve and reject flows.
+- `commands:write` covers selected generic command lifecycle writes such as cancel, release, mark-executed, and mark-failed.
+- `commands:lease` covers selected generic lease refresh, release, and recovery flows.
+- `rules:read` covers generic rule inspection while `rules:write` covers selected generic rule mutation and evaluation flows.
 - `policies:read` covers policy inspection without granting policy mutation.
+- `policies:write` covers selected policy replacement writes.
 - `capabilities:read` covers capability inspection without granting semantic graph mutation.
+- `capabilities:write` covers selected capability replacement writes.
 - `commands:claim` and `executors:poll` separate execution workflow from broad command administration.
 - `adapters:register` and `adapters:heartbeat` keep adapter self-registration separate from broader operator APIs.
 - `executors:read`, `executors:register`, `executors:heartbeat`, `executors:poll`, `executors:claim`, and `executors:report` separate executor catalog inspection from executor lifecycle operations.
+- `executors:write` and `executors:admin` cover selected executor capability and scope configuration writes.
 - SmartSentinel executor bridge scopes are intentionally separate from generic executor scopes so bridge tokens can stay narrow.
 - `mcp:tools` should authorize local or production MCP tool invocation, not generic write access.
 - `auth:tokens:admin` covers token issuance, listing, inspection, and revocation.
@@ -490,7 +511,7 @@ The table below describes the intended future protection model. It does not chan
 | Endpoint group | Future principal types | Required scope(s) | Notes |
 | --- | --- | --- | --- |
 | `/entities` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `entities:read` for GET, `entities:write` for POST | Includes standard entity CRUD-style growth over time. |
-| `/relationships` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `entities:write`; future `relationships:read` if standalone read routes are added | The current API exposes relationship mutation only; standalone relationship read routes do not exist yet. |
+| `/relationships` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `relationships:write`; future `relationships:read` if standalone read routes are added | Selected write authorization now applies in Milestone 60. |
 | `/observations` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` for GET, `observations:write` for POST | Direct write path should remain limited; most machine writers should prefer ingestion endpoints. |
 | `/raw-messages` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `raw-messages:read` | Implemented in Milestone 55 for list and detail reads. Sensitive because raw payloads and headers may include operational metadata. |
 | `/ingest/http` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Primary generic ingestion write surface. |
@@ -499,8 +520,8 @@ The table below describes the intended future protection model. It does not chan
 | `/ingestion/connectors/{connector_id}/ttn-device-mappings` POST, PATCH, enable, disable, and DELETE | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 52 for TTN device-mapping administration. |
 | `/ingestion/connectors/{connector_id}/ingest` and `/ingest/http` | `ConnectorPrincipal`, `DevicePrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `ingestion:write` | Implemented across Milestones 51 and 52. |
 | `/secrets/connectors/*` | `UserPrincipal`, `AdminPrincipal` | `secrets:admin` | Implemented in Milestone 50. Highest sensitivity operator surface. |
-| `/commands/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:create` for creation and approval-like writes, `commands:claim` for claim/release flows, `commands:report` for execution result writes where applicable | Implemented in Milestone 56 for generic list/detail GET routes only. Approval may later split into its own scope. |
-| `/actions/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `actions:read` for GET, `commands:report` for POST | Implemented in Milestone 56 for `/actions` list/detail and `/action-results` reads. Action reporting remains part of execution audit. |
+| `/commands/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:create` for creation, `commands:approve` for approve/reject, `commands:write` for selected lifecycle writes, `commands:claim` for generic claim, `commands:lease` for selected lease writes | Selected generic write authorization now applies in Milestone 60. Executor-specific flows still use executor scopes. |
+| `/actions/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `actions:read` for GET, `actions:write` for selected POST routes | Selected generic write authorization now applies in Milestone 60. |
 | `/executors` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:read` for GET, `executors:register` for POST | Implemented in Milestones 50 and 56 for registration plus selected inspection reads. |
 | `/executors/{executor_id}/heartbeat` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:heartbeat` | Implemented in Milestone 50. |
 | `/executors/{executor_id}/commands/pending` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:poll` | Implemented in Milestone 50. Existing executor capability and target-scope matching still applies. |
@@ -517,7 +538,7 @@ The table below describes the intended future protection model. It does not chan
 | `/mcp` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Implemented in Milestone 54 for the current minimal JSON-RPC compatibility endpoint. Production still requires Origin validation and stronger transport hardening. |
 | `/mcp/tools` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Implemented in Milestone 54 for both listing and invocation. |
 | `/ai/context/*` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `ai:context:read` | Implemented in Milestone 54 for entity AI context reads. AI context is read-only but aggregates sensitive topology and operational data. |
-| `/rules/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `rules:read` for GET, `rules:admin` for mutation and evaluation-style administration | Implemented in Milestone 56 for list/detail GET routes only. |
+| `/rules/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `rules:read` for GET, `rules:write` for selected mutation and evaluation-style administration | Selected generic write authorization now applies in Milestone 60. |
 | `/events/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `events:read` | Implemented in Milestone 55 for list and detail reads. Event data spans telemetry, control audit, and provenance-linked operational history. |
 | `/provenance/search` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `provenance:read` | Implemented in Milestone 54. Aggregates events, raw messages, observations, and evidence-oriented metadata. |
 | `/health` | public or any principal | none in first auth implementation | Intended for liveness probes. Must not expose secrets. |
@@ -578,6 +599,15 @@ The table below describes the intended future protection model. It does not chan
   - `policies`
   - `capabilities`
   - `executors_read`
+  - `entity_writes`
+  - `relationship_writes`
+  - `observation_writes`
+  - `command_writes`
+  - `action_writes`
+  - `rule_writes`
+  - `policy_writes`
+  - `capability_writes`
+  - `executor_config_writes`
 - `GET /ready` reports only `bootstrap_admin_configured = true|false`; it never returns bootstrap token material.
 - Selected protected routes in this milestone return:
   - `401` for missing or invalid bearer tokens
@@ -708,6 +738,29 @@ Implemented shape:
 - filter entity-context relationships so inconsistent cross-tenant references do not leak through context reads
 - explicitly leave tenant-aware writes, cross-tenant sharing, relationship-based authorization, and remaining route coverage for later milestones
 
+### Milestone 60
+
+Add selected tenant-aware write authorization in `token` mode without changing `dev`/`disabled` behavior and without introducing cross-tenant sharing or a full policy engine.
+
+Implemented shape:
+
+- require explicit write scopes on selected generic write routes for entities, relationships, observations, commands, actions, rules, policies, capabilities, and executor configuration
+- keep `admin:all` as the break-glass bypass for scope and tenant checks
+- for non-admin token principals, require same-tenant target entities and same-tenant target resources on the selected write surfaces
+- create selected generic resources under the authenticated tenant context instead of trusting caller-supplied tenant information
+- return `403` for known cross-tenant writes on the selected protected write surfaces
+- extend `GET /ready` `protected_endpoint_groups` with:
+  - `entity_writes`
+  - `relationship_writes`
+  - `observation_writes`
+  - `command_writes`
+  - `action_writes`
+  - `rule_writes`
+  - `policy_writes`
+  - `capability_writes`
+  - `executor_config_writes`
+- explicitly leave cross-tenant sharing, remaining write coverage, JWT/OIDC/OAuth, and a full authorization engine for later milestones
+
 ## Open Questions For Later Milestones
 
 - Whether command approval should get its own dedicated scope.
@@ -716,4 +769,4 @@ Implemented shape:
 - How the future write-authorization model should compose tenant ownership, role scopes, and policy decisions without overfitting the current modular-monolith deployment.
 - Whether device credentials should bind directly to entity IDs, connector IDs, or both.
 - Whether service-to-service auth should start with API tokens or skip directly to mTLS in distributed mode.
-- How and when tenant/resource ownership checks should be layered onto the newly protected read surfaces.
+- How and when tenant/resource ownership checks should be layered onto the remaining unprotected write and read surfaces.

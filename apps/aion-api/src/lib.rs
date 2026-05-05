@@ -79,7 +79,7 @@ impl AuthMode {
 }
 
 const BOOTSTRAP_ADMIN_TOKEN_MIN_LENGTH: usize = 24;
-const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 25] = [
+const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 34] = [
     "auth_tokens",
     "connector_secrets",
     "adapters",
@@ -105,6 +105,15 @@ const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 25] = [
     "policies",
     "capabilities",
     "executors_read",
+    "entity_writes",
+    "relationship_writes",
+    "observation_writes",
+    "command_writes",
+    "action_writes",
+    "rule_writes",
+    "policy_writes",
+    "capability_writes",
+    "executor_config_writes",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -810,10 +819,43 @@ fn is_admin_all(auth: &AuthContext) -> bool {
     matches!(auth.mode, AuthMode::Token) && auth_has_scope(auth, "admin:all")
 }
 
+fn state_for_tenant(state: &AppState, tenant_id: Uuid) -> AppState {
+    let mut scoped = state.clone();
+    scoped.tenant_id = tenant_id;
+    scoped
+}
+
 fn principal_tenant_id(auth: &AuthContext) -> Result<Uuid, ApiError> {
     auth.principal
         .tenant_id
         .ok_or_else(|| ApiError::forbidden("authenticated token is missing tenant context"))
+}
+
+fn principal_tenant_or_default(state: &AppState, auth: &AuthContext) -> Result<Uuid, ApiError> {
+    match auth.mode {
+        AuthMode::Dev | AuthMode::Disabled => Ok(state.tenant_id),
+        AuthMode::Token => auth
+            .principal
+            .tenant_id
+            .or_else(|| is_admin_all(auth).then_some(state.tenant_id))
+            .ok_or_else(|| ApiError::forbidden("authenticated token is missing tenant context")),
+    }
+}
+
+fn tenant_for_created_resource(state: &AppState, auth: &AuthContext) -> Result<Uuid, ApiError> {
+    principal_tenant_or_default(state, auth)
+}
+
+fn deny_cross_tenant_write(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    resource_name: &'static str,
+) -> ApiError {
+    record_auth_access_denied_event(state, endpoint, Some("tenant_mismatch"), auth);
+    ApiError::forbidden(format!(
+        "principal tenant does not own the target {resource_name} for {endpoint}"
+    ))
 }
 
 #[allow(dead_code)]
@@ -881,6 +923,15 @@ fn require_scope(
     Err(ApiError::forbidden(format!(
         "scope '{scope}' is required for {endpoint}"
     )))
+}
+
+fn require_scope_for_write(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    scope: &'static str,
+) -> Result<(), ApiError> {
+    require_scope(state, auth, endpoint, scope)
 }
 
 #[allow(dead_code)]
@@ -2492,11 +2543,14 @@ async fn revoke_api_token(
 
 async fn create_entity(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<Value>,
 ) -> Result<(StatusCode, Json<Entity>), ApiError> {
+    require_scope_for_write(&state, &auth, "/entities", "entities:write")?;
     let request = parse_entity_input(request)?;
+    let tenant_id = tenant_for_created_resource(&state, &auth)?;
     let entity = Entity::new(
-        state.tenant_id,
+        tenant_id,
         request.entity_key,
         request.entity_type,
         request.jsonld,
@@ -2651,13 +2705,26 @@ async fn list_entities(
 
 async fn create_relationship(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateRelationshipRequest>,
 ) -> Result<(StatusCode, Json<Relationship>), ApiError> {
-    ensure_entity_exists(&state, request.source_entity_id)?;
-    ensure_entity_exists(&state, request.target_entity_id)?;
+    require_scope_for_write(&state, &auth, "/relationships", "relationships:write")?;
+    require_same_tenant_for_target_entity(
+        &state,
+        &auth,
+        "/relationships",
+        request.source_entity_id,
+    )?;
+    require_same_tenant_for_target_entity(
+        &state,
+        &auth,
+        "/relationships",
+        request.target_entity_id,
+    )?;
+    let tenant_id = tenant_for_created_resource(&state, &auth)?;
 
     let relationship = Relationship::new(
-        state.tenant_id,
+        tenant_id,
         request.source_entity_id,
         request.relationship_type,
         request.target_entity_id,
@@ -3590,10 +3657,23 @@ impl McpToolFailure {
 
 async fn put_capabilities(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(entity_id): Path<Uuid>,
     Json(requests): Json<Vec<PutCapabilityRequest>>,
 ) -> Result<(StatusCode, Json<Vec<Capability>>), ApiError> {
-    ensure_entity_exists(&state, entity_id)?;
+    require_scope_for_write(
+        &state,
+        &auth,
+        "/entities/:entity_id/capabilities",
+        "capabilities:write",
+    )?;
+    let entity = require_same_tenant_for_target_entity(
+        &state,
+        &auth,
+        "/entities/:entity_id/capabilities",
+        entity_id,
+    )?;
+    let scoped_state = state_for_tenant(&state, entity.tenant_id);
     let capabilities = requests
         .into_iter()
         .map(|request| {
@@ -3608,9 +3688,10 @@ async fn put_capabilities(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let capabilities = state
-        .storage
-        .put_capabilities(state.tenant_id, entity_id, capabilities)?;
+    let capabilities =
+        scoped_state
+            .storage
+            .put_capabilities(scoped_state.tenant_id, entity_id, capabilities)?;
     Ok((StatusCode::OK, Json(capabilities)))
 }
 
@@ -3658,19 +3739,23 @@ async fn get_capabilities(
 
 async fn put_policies(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(requests): Json<Vec<PutPolicyRequest>>,
 ) -> Result<(StatusCode, Json<Vec<Policy>>), ApiError> {
+    require_scope_for_write(&state, &auth, "/policies", "policies:write")?;
     for request in &requests {
         if let Some(target_entity_id) = request.target_entity_id {
-            ensure_entity_exists(&state, target_entity_id)?;
+            require_same_tenant_for_target_entity(&state, &auth, "/policies", target_entity_id)?;
         }
     }
+    let tenant_id = tenant_for_created_resource(&state, &auth)?;
+    let scoped_state = state_for_tenant(&state, tenant_id);
 
     let policies = requests
         .into_iter()
         .map(|request| {
             Policy::new(
-                state.tenant_id,
+                scoped_state.tenant_id,
                 request.target_entity_id,
                 request.command_type,
                 request.requires_approval,
@@ -3681,7 +3766,9 @@ async fn put_policies(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let policies = state.storage.put_policies(state.tenant_id, policies)?;
+    let policies = scoped_state
+        .storage
+        .put_policies(scoped_state.tenant_id, policies)?;
     Ok((StatusCode::OK, Json(policies)))
 }
 
@@ -3728,15 +3815,19 @@ async fn query_policies(
 
 async fn create_rule(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateRuleRequest>,
 ) -> Result<(StatusCode, Json<Rule>), ApiError> {
+    require_scope_for_write(&state, &auth, "/rules", "rules:write")?;
     if let Some(target_entity_id) = request.target_entity_id {
-        ensure_entity_exists(&state, target_entity_id)?;
+        require_same_tenant_for_target_entity(&state, &auth, "/rules", target_entity_id)?;
     }
-    ensure_rule_action_targets_exist(&state, &request.action)?;
+    ensure_rule_action_targets_exist_with_auth(&state, &auth, "/rules", &request.action)?;
+    let tenant_id = tenant_for_created_resource(&state, &auth)?;
+    let scoped_state = state_for_tenant(&state, tenant_id);
 
     let rule = Rule::new(
-        state.tenant_id,
+        scoped_state.tenant_id,
         request.name,
         request.description,
         request.enabled,
@@ -3751,7 +3842,10 @@ async fn create_rule(
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    Ok((StatusCode::CREATED, Json(state.storage.store_rule(rule)?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(scoped_state.storage.store_rule(rule)?),
+    ))
 }
 
 async fn list_rules(
@@ -3804,16 +3898,24 @@ async fn get_rule(
 
 async fn enable_rule(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(rule_id): Path<Uuid>,
 ) -> Result<Json<Rule>, ApiError> {
-    set_rule_enabled(state, rule_id, true)
+    require_scope_for_write(&state, &auth, "/rules/:rule_id/enable", "rules:write")?;
+    let rule =
+        require_same_tenant_for_target_rule(&state, &auth, "/rules/:rule_id/enable", rule_id)?;
+    set_rule_enabled(state_for_tenant(&state, rule.tenant_id), rule_id, true)
 }
 
 async fn disable_rule(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(rule_id): Path<Uuid>,
 ) -> Result<Json<Rule>, ApiError> {
-    set_rule_enabled(state, rule_id, false)
+    require_scope_for_write(&state, &auth, "/rules/:rule_id/disable", "rules:write")?;
+    let rule =
+        require_same_tenant_for_target_rule(&state, &auth, "/rules/:rule_id/disable", rule_id)?;
+    set_rule_enabled(state_for_tenant(&state, rule.tenant_id), rule_id, false)
 }
 
 fn set_rule_enabled(state: AppState, rule_id: Uuid, enabled: bool) -> Result<Json<Rule>, ApiError> {
@@ -3827,8 +3929,10 @@ fn set_rule_enabled(state: AppState, rule_id: Uuid, enabled: bool) -> Result<Jso
 
 async fn evaluate_rules_manually(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<ManualRuleEvaluationRequest>,
 ) -> Result<Json<RuleEvaluationResponse>, ApiError> {
+    require_scope_for_write(&state, &auth, "/rules/evaluate", "rules:write")?;
     let has_observation = request.observation_id.is_some();
     let has_event = request.event_id.is_some();
     if has_observation == has_event {
@@ -3838,19 +3942,20 @@ async fn evaluate_rules_manually(
     }
 
     if let Some(observation_id) = request.observation_id {
-        let observation = state
-            .storage
-            .get_observation(state.tenant_id, observation_id)?
-            .ok_or_else(ApiError::not_found)?;
-        return evaluate_rules_for_observation(&state, &observation, false).map(Json);
+        let observation = require_same_tenant_for_target_observation(
+            &state,
+            &auth,
+            "/rules/evaluate",
+            observation_id,
+        )?;
+        let scoped_state = state_for_tenant(&state, observation.tenant_id);
+        return evaluate_rules_for_observation(&scoped_state, &observation, false).map(Json);
     }
 
     let event_id = request.event_id.expect("event_id presence checked above");
-    let event = state
-        .storage
-        .get_event(state.tenant_id, event_id)?
-        .ok_or_else(ApiError::not_found)?;
-    evaluate_rules_for_event(&state, &event, false).map(Json)
+    let event = require_same_tenant_for_target_event(&state, &auth, "/rules/evaluate", event_id)?;
+    let scoped_state = state_for_tenant(&state, event.tenant_id);
+    evaluate_rules_for_event(&scoped_state, &event, false).map(Json)
 }
 
 async fn create_executor(
@@ -3965,10 +4070,23 @@ async fn heartbeat_executor(
 
 async fn put_executor_capabilities(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(executor_id): Path<Uuid>,
     Json(requests): Json<Vec<PutExecutorCapabilityRequest>>,
 ) -> Result<(StatusCode, Json<Vec<ExecutorCapability>>), ApiError> {
-    ensure_executor_exists(&state, executor_id)?;
+    require_any_scope(
+        &state,
+        &auth,
+        "/executors/:executor_id/capabilities",
+        &["executors:admin", "executors:write"],
+    )?;
+    let executor = require_same_tenant_for_target_executor(
+        &state,
+        &auth,
+        "/executors/:executor_id/capabilities",
+        executor_id,
+    )?;
+    let scoped_state = state_for_tenant(&state, executor.tenant_id);
     let capabilities = requests
         .into_iter()
         .map(|request| {
@@ -3984,8 +4102,8 @@ async fn put_executor_capabilities(
 
     Ok((
         StatusCode::OK,
-        Json(state.storage.put_executor_capabilities(
-            state.tenant_id,
+        Json(scoped_state.storage.put_executor_capabilities(
+            scoped_state.tenant_id,
             executor_id,
             capabilities,
         )?),
@@ -4039,14 +4157,32 @@ async fn get_executor_capabilities(
 
 async fn put_executor_scopes(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(executor_id): Path<Uuid>,
     Json(requests): Json<Vec<PutExecutorScopeRequest>>,
 ) -> Result<(StatusCode, Json<Vec<ExecutorScope>>), ApiError> {
-    ensure_executor_exists(&state, executor_id)?;
+    require_any_scope(
+        &state,
+        &auth,
+        "/executors/:executor_id/scopes",
+        &["executors:admin", "executors:write"],
+    )?;
+    let executor = require_same_tenant_for_target_executor(
+        &state,
+        &auth,
+        "/executors/:executor_id/scopes",
+        executor_id,
+    )?;
+    let scoped_state = state_for_tenant(&state, executor.tenant_id);
     let mut scopes = Vec::with_capacity(requests.len());
     for request in requests {
         if let Some(target_entity_id) = request.target_entity_id {
-            ensure_entity_exists(&state, target_entity_id)?;
+            require_same_tenant_for_target_entity(
+                &state,
+                &auth,
+                "/executors/:executor_id/scopes",
+                target_entity_id,
+            )?;
         }
         scopes.push(ExecutorScope::new(
             executor_id,
@@ -4059,11 +4195,11 @@ async fn put_executor_scopes(
 
     Ok((
         StatusCode::OK,
-        Json(
-            state
-                .storage
-                .put_executor_scopes(state.tenant_id, executor_id, scopes)?,
-        ),
+        Json(scoped_state.storage.put_executor_scopes(
+            scoped_state.tenant_id,
+            executor_id,
+            scopes,
+        )?),
     ))
 }
 
@@ -4777,37 +4913,64 @@ async fn report_smartsentinel_executor_command(
 
 async fn get_command_lease(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<CommandLease>, ApiError> {
-    ensure_command_exists(&state, command_id)?;
+    require_scope(
+        &state,
+        &auth,
+        "/commands/:command_id/lease",
+        "commands:read",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/lease",
+        command_id,
+    )?;
+    let scoped_state = state_for_tenant(&state, command.tenant_id);
     Ok(Json(
-        state
+        scoped_state
             .storage
-            .get_latest_command_lease(state.tenant_id, command_id)?
+            .get_latest_command_lease(scoped_state.tenant_id, command_id)?
             .ok_or_else(ApiError::not_found)?,
     ))
 }
 
 async fn refresh_command_lease(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
     Json(request): Json<RefreshCommandLeaseRequest>,
 ) -> Result<Json<CommandLease>, ApiError> {
-    let mut lease = active_lease_for_executor(&state, command_id, request.executor_id)?;
+    require_scope_for_write(
+        &state,
+        &auth,
+        "/commands/:command_id/lease/refresh",
+        "commands:lease",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/lease/refresh",
+        command_id,
+    )?;
+    let scoped_state = state_for_tenant(&state, command.tenant_id);
+    let mut lease = active_lease_for_executor(&scoped_state, command_id, request.executor_id)?;
     let now = Utc::now();
     let expires_at = lease_expiry(now, request.lease_duration_seconds)?;
     lease
         .refresh(expires_at, now)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let lease = state.storage.update_command_lease(lease)?;
-    let mut command = state
+    let lease = scoped_state.storage.update_command_lease(lease)?;
+    let mut command = scoped_state
         .storage
-        .get_command(state.tenant_id, command_id)?
+        .get_command(scoped_state.tenant_id, command_id)?
         .ok_or_else(ApiError::not_found)?;
     command.set_lease_expires_at(Some(expires_at), now);
-    let command = state.storage.update_command(command)?;
+    let command = scoped_state.storage.update_command(command)?;
     record_lease_event(
-        &state,
+        &scoped_state,
         "aion:CommandLeaseRefreshed",
         &lease,
         Some(&command),
@@ -4818,15 +4981,41 @@ async fn refresh_command_lease(
 
 async fn release_command_lease(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
     Json(request): Json<ReleaseCommandLeaseRequest>,
 ) -> Result<Json<CommandLease>, ApiError> {
-    release_active_lease(&state, command_id, request.executor_id).map(Json)
+    require_scope_for_write(
+        &state,
+        &auth,
+        "/commands/:command_id/lease/release",
+        "commands:lease",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/lease/release",
+        command_id,
+    )?;
+    release_active_lease(
+        &state_for_tenant(&state, command.tenant_id),
+        command_id,
+        request.executor_id,
+    )
+    .map(Json)
 }
 
 async fn recover_expired_leases(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<RecoverExpiredLeasesResponse>, ApiError> {
+    require_scope_for_write(
+        &state,
+        &auth,
+        "/commands/recover-expired-leases",
+        "commands:lease",
+    )?;
+    let scoped_state = state_for_tenant(&state, principal_tenant_or_default(&state, &auth)?);
     let now = Utc::now();
     let mut response = RecoverExpiredLeasesResponse {
         expired_lease_ids: Vec::new(),
@@ -4834,20 +5023,23 @@ async fn recover_expired_leases(
         failed_command_ids: Vec::new(),
     };
 
-    for mut lease in state.storage.list_active_command_leases(state.tenant_id)? {
+    for mut lease in scoped_state
+        .storage
+        .list_active_command_leases(scoped_state.tenant_id)?
+    {
         if lease.expires_at > now {
             continue;
         }
         lease.mark_expired(now);
-        let lease = state.storage.update_command_lease(lease)?;
+        let lease = scoped_state.storage.update_command_lease(lease)?;
         response.expired_lease_ids.push(lease.id);
 
-        let mut command = state
+        let mut command = scoped_state
             .storage
-            .get_command(state.tenant_id, lease.command_id)?
+            .get_command(scoped_state.tenant_id, lease.command_id)?
             .ok_or_else(ApiError::not_found)?;
         record_lease_event(
-            &state,
+            &scoped_state,
             "aion:CommandLeaseExpired",
             &lease,
             Some(&command),
@@ -4856,10 +5048,10 @@ async fn recover_expired_leases(
 
         if command.retry_limit_exceeded() {
             command.mark_failed_due_to_retry_limit("command retry limit exceeded", now);
-            let command = state.storage.update_command(command)?;
+            let command = scoped_state.storage.update_command(command)?;
             response.failed_command_ids.push(command.id);
             record_lease_event(
-                &state,
+                &scoped_state,
                 "aion:CommandRetryLimitExceeded",
                 &lease,
                 Some(&command),
@@ -4868,7 +5060,7 @@ async fn recover_expired_leases(
                 ),
             )?;
             record_command_event(
-                &state,
+                &scoped_state,
                 "aion:CommandFailed",
                 EventSeverity::Error,
                 &command,
@@ -4876,10 +5068,10 @@ async fn recover_expired_leases(
             )?;
         } else {
             command.schedule_retry(now);
-            let command = state.storage.update_command(command)?;
+            let command = scoped_state.storage.update_command(command)?;
             response.retried_command_ids.push(command.id);
             record_lease_event(
-                &state,
+                &scoped_state,
                 "aion:CommandRetryScheduled",
                 &lease,
                 Some(&command),
@@ -4895,13 +5087,19 @@ async fn recover_expired_leases(
 
 async fn create_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateCommandRequest>,
 ) -> Result<(StatusCode, Json<Command>), ApiError> {
-    ensure_entity_exists(&state, request.target_entity_id)?;
-    let (approval_status, policy_decision) =
-        command_policy_decision(&state, request.target_entity_id, &request.command_type)?;
+    require_scope_for_write(&state, &auth, "/commands", "commands:create")?;
+    require_same_tenant_for_target_entity(&state, &auth, "/commands", request.target_entity_id)?;
+    let scoped_state = state_for_tenant(&state, tenant_for_created_resource(&state, &auth)?);
+    let (approval_status, policy_decision) = command_policy_decision(
+        &scoped_state,
+        request.target_entity_id,
+        &request.command_type,
+    )?;
     let command = Command::new(
-        state.tenant_id,
+        scoped_state.tenant_id,
         request.target_entity_id,
         request.command_type,
         request.payload,
@@ -4913,9 +5111,9 @@ async fn create_command(
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let command = state.storage.store_command(command)?;
+    let command = scoped_state.storage.store_command(command)?;
     record_command_event(
-        &state,
+        &scoped_state,
         "aion:CommandCreated",
         EventSeverity::Info,
         &command,
@@ -4926,11 +5124,24 @@ async fn create_command(
 
 async fn claim_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
     Json(request): Json<ClaimCommandRequest>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(
+    require_scope_for_write(
         &state,
+        &auth,
+        "/commands/:command_id/claim",
+        "commands:claim",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/claim",
+        command_id,
+    )?;
+    mutate_command(
+        &state_for_tenant(&state, command.tenant_id),
         command_id,
         "aion:CommandClaimed",
         EventSeverity::Info,
@@ -4940,10 +5151,23 @@ async fn claim_command(
 
 async fn release_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(
+    require_scope_for_write(
         &state,
+        &auth,
+        "/commands/:command_id/release",
+        "commands:write",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/release",
+        command_id,
+    )?;
+    mutate_command(
+        &state_for_tenant(&state, command.tenant_id),
         command_id,
         "aion:CommandReleased",
         EventSeverity::Info,
@@ -4953,10 +5177,23 @@ async fn release_command(
 
 async fn mark_command_executed(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(
+    require_scope_for_write(
         &state,
+        &auth,
+        "/commands/:command_id/mark-executed",
+        "commands:write",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/mark-executed",
+        command_id,
+    )?;
+    mutate_command(
+        &state_for_tenant(&state, command.tenant_id),
         command_id,
         "aion:CommandExecuted",
         EventSeverity::Info,
@@ -4966,11 +5203,24 @@ async fn mark_command_executed(
 
 async fn mark_command_failed(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
     Json(request): Json<MarkFailedCommandRequest>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(
+    require_scope_for_write(
         &state,
+        &auth,
+        "/commands/:command_id/mark-failed",
+        "commands:write",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/mark-failed",
+        command_id,
+    )?;
+    mutate_command(
+        &state_for_tenant(&state, command.tenant_id),
         command_id,
         "aion:CommandFailed",
         EventSeverity::Error,
@@ -4980,10 +5230,23 @@ async fn mark_command_failed(
 
 async fn cancel_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(
+    require_scope_for_write(
         &state,
+        &auth,
+        "/commands/:command_id/cancel",
+        "commands:write",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/cancel",
+        command_id,
+    )?;
+    mutate_command(
+        &state_for_tenant(&state, command.tenant_id),
         command_id,
         "aion:CommandCancelled",
         EventSeverity::Warning,
@@ -4993,10 +5256,23 @@ async fn cancel_command(
 
 async fn approve_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(
+    require_scope_for_write(
         &state,
+        &auth,
+        "/commands/:command_id/approve",
+        "commands:approve",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/approve",
+        command_id,
+    )?;
+    mutate_command(
+        &state_for_tenant(&state, command.tenant_id),
         command_id,
         "aion:CommandApproved",
         EventSeverity::Info,
@@ -5006,10 +5282,23 @@ async fn approve_command(
 
 async fn reject_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
-    mutate_command(
+    require_scope_for_write(
         &state,
+        &auth,
+        "/commands/:command_id/reject",
+        "commands:approve",
+    )?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/commands/:command_id/reject",
+        command_id,
+    )?;
+    mutate_command(
+        &state_for_tenant(&state, command.tenant_id),
         command_id,
         "aion:CommandRejected",
         EventSeverity::Warning,
@@ -5092,15 +5381,19 @@ async fn query_commands(
 
 async fn create_action(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateActionRequest>,
 ) -> Result<(StatusCode, Json<Action>), ApiError> {
-    ensure_command_exists(&state, request.command_id)?;
+    require_scope_for_write(&state, &auth, "/actions", "actions:write")?;
+    let command =
+        require_same_tenant_for_target_command(&state, &auth, "/actions", request.command_id)?;
     if let Some(executor_entity_id) = request.executor_entity_id {
-        ensure_entity_exists(&state, executor_entity_id)?;
+        require_same_tenant_for_target_entity(&state, &auth, "/actions", executor_entity_id)?;
     }
+    let scoped_state = state_for_tenant(&state, command.tenant_id);
 
     let action = Action::new(
-        state.tenant_id,
+        scoped_state.tenant_id,
         request.command_id,
         request.executor_entity_id,
         request.action_type,
@@ -5111,7 +5404,7 @@ async fn create_action(
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let action = state.storage.store_action(action)?;
+    let action = scoped_state.storage.store_action(action)?;
     Ok((StatusCode::CREATED, Json(action)))
 }
 
@@ -5181,13 +5474,23 @@ async fn query_actions(
 
 async fn create_action_result(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateActionResultRequest>,
 ) -> Result<(StatusCode, Json<ActionResult>), ApiError> {
-    ensure_command_exists(&state, request.command_id)?;
-    let action = state
-        .storage
-        .get_action(state.tenant_id, request.action_id)?
-        .ok_or_else(ApiError::not_found)?;
+    require_scope_for_write(&state, &auth, "/action-results", "actions:write")?;
+    let command = require_same_tenant_for_target_command(
+        &state,
+        &auth,
+        "/action-results",
+        request.command_id,
+    )?;
+    let scoped_state = state_for_tenant(&state, command.tenant_id);
+    let action = require_same_tenant_for_target_action(
+        &scoped_state,
+        &auth,
+        "/action-results",
+        request.action_id,
+    )?;
     if action.command_id != request.command_id {
         return Err(ApiError::bad_request(
             "action_id does not belong to command_id",
@@ -5195,7 +5498,7 @@ async fn create_action_result(
     }
 
     let result = ActionResult::new(
-        state.tenant_id,
+        scoped_state.tenant_id,
         request.command_id,
         request.action_id,
         request.status,
@@ -5206,7 +5509,7 @@ async fn create_action_result(
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let result = state.storage.store_action_result(result)?;
+    let result = scoped_state.storage.store_action_result(result)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -5415,13 +5718,26 @@ async fn query_events(
 
 async fn create_observation(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateObservationRequest>,
 ) -> Result<(StatusCode, Json<Observation>), ApiError> {
-    ensure_entity_exists(&state, request.producer_entity_id)?;
-    ensure_entity_exists(&state, request.feature_of_interest_id)?;
+    require_scope_for_write(&state, &auth, "/observations", "observations:write")?;
+    require_same_tenant_for_target_entity(
+        &state,
+        &auth,
+        "/observations",
+        request.producer_entity_id,
+    )?;
+    require_same_tenant_for_target_entity(
+        &state,
+        &auth,
+        "/observations",
+        request.feature_of_interest_id,
+    )?;
+    let scoped_state = state_for_tenant(&state, tenant_for_created_resource(&state, &auth)?);
 
     let observation = Observation::new(
-        state.tenant_id,
+        scoped_state.tenant_id,
         request.producer_entity_id,
         request.feature_of_interest_id,
         request.observed_property,
@@ -5437,8 +5753,8 @@ async fn create_observation(
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-    let observation = state.storage.store_observation(observation)?;
-    evaluate_rules_for_observation(&state, &observation, true)?;
+    let observation = scoped_state.storage.store_observation(observation)?;
+    evaluate_rules_for_observation(&scoped_state, &observation, true)?;
     Ok((StatusCode::CREATED, Json(observation)))
 }
 
@@ -7527,6 +7843,250 @@ fn validate_smartsentinel_observation_items(
         }
     }
     Ok(())
+}
+
+fn require_same_tenant_for_target_entity(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    entity_id: Uuid,
+) -> Result<Entity, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return state
+            .storage
+            .get_entity(state.tenant_id, entity_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    if is_admin_all(auth) {
+        return state
+            .storage
+            .get_entity_any_tenant(entity_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    let tenant_id = principal_tenant_or_default(state, auth)?;
+    match state.storage.get_entity(tenant_id, entity_id)? {
+        Some(entity) => Ok(entity),
+        None => {
+            if state.storage.get_entity_any_tenant(entity_id)?.is_some() {
+                Err(deny_cross_tenant_write(state, auth, endpoint, "entity"))
+            } else {
+                Err(ApiError::not_found())
+            }
+        }
+    }
+}
+
+fn require_same_tenant_for_target_command(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    command_id: Uuid,
+) -> Result<Command, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return state
+            .storage
+            .get_command(state.tenant_id, command_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    if is_admin_all(auth) {
+        return state
+            .storage
+            .get_command_any_tenant(command_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    let tenant_id = principal_tenant_or_default(state, auth)?;
+    match state.storage.get_command(tenant_id, command_id)? {
+        Some(command) => Ok(command),
+        None => {
+            if state.storage.get_command_any_tenant(command_id)?.is_some() {
+                Err(deny_cross_tenant_write(state, auth, endpoint, "command"))
+            } else {
+                Err(ApiError::not_found())
+            }
+        }
+    }
+}
+
+fn require_same_tenant_for_target_rule(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    rule_id: Uuid,
+) -> Result<Rule, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return state
+            .storage
+            .get_rule(state.tenant_id, rule_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    if is_admin_all(auth) {
+        return state
+            .storage
+            .get_rule_any_tenant(rule_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    let tenant_id = principal_tenant_or_default(state, auth)?;
+    match state.storage.get_rule(tenant_id, rule_id)? {
+        Some(rule) => Ok(rule),
+        None => {
+            if state.storage.get_rule_any_tenant(rule_id)?.is_some() {
+                Err(deny_cross_tenant_write(state, auth, endpoint, "rule"))
+            } else {
+                Err(ApiError::not_found())
+            }
+        }
+    }
+}
+
+fn require_same_tenant_for_target_executor(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    executor_id: Uuid,
+) -> Result<ExecutorAgent, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return state
+            .storage
+            .get_executor(state.tenant_id, executor_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    if is_admin_all(auth) {
+        return state
+            .storage
+            .get_executor_any_tenant(executor_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    let tenant_id = principal_tenant_or_default(state, auth)?;
+    match state.storage.get_executor(tenant_id, executor_id)? {
+        Some(executor) => Ok(executor),
+        None => {
+            if state
+                .storage
+                .get_executor_any_tenant(executor_id)?
+                .is_some()
+            {
+                Err(deny_cross_tenant_write(state, auth, endpoint, "executor"))
+            } else {
+                Err(ApiError::not_found())
+            }
+        }
+    }
+}
+
+fn require_same_tenant_for_target_action(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    action_id: Uuid,
+) -> Result<Action, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return state
+            .storage
+            .get_action(state.tenant_id, action_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    if is_admin_all(auth) {
+        return state
+            .storage
+            .get_action_any_tenant(action_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    let tenant_id = principal_tenant_or_default(state, auth)?;
+    match state.storage.get_action(tenant_id, action_id)? {
+        Some(action) => Ok(action),
+        None => {
+            if state.storage.get_action_any_tenant(action_id)?.is_some() {
+                Err(deny_cross_tenant_write(state, auth, endpoint, "action"))
+            } else {
+                Err(ApiError::not_found())
+            }
+        }
+    }
+}
+
+fn require_same_tenant_for_target_observation(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    observation_id: Uuid,
+) -> Result<Observation, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return state
+            .storage
+            .get_observation(state.tenant_id, observation_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    if is_admin_all(auth) {
+        return state
+            .storage
+            .get_observation_any_tenant(observation_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    let tenant_id = principal_tenant_or_default(state, auth)?;
+    match state.storage.get_observation(tenant_id, observation_id)? {
+        Some(observation) => Ok(observation),
+        None => {
+            if state
+                .storage
+                .get_observation_any_tenant(observation_id)?
+                .is_some()
+            {
+                Err(deny_cross_tenant_write(
+                    state,
+                    auth,
+                    endpoint,
+                    "observation",
+                ))
+            } else {
+                Err(ApiError::not_found())
+            }
+        }
+    }
+}
+
+fn require_same_tenant_for_target_event(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    event_id: Uuid,
+) -> Result<Event, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return state
+            .storage
+            .get_event(state.tenant_id, event_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    if is_admin_all(auth) {
+        return state
+            .storage
+            .get_event_any_tenant(event_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    let tenant_id = principal_tenant_or_default(state, auth)?;
+    match state.storage.get_event(tenant_id, event_id)? {
+        Some(event) => Ok(event),
+        None => {
+            if state.storage.get_event_any_tenant(event_id)?.is_some() {
+                Err(deny_cross_tenant_write(state, auth, endpoint, "event"))
+            } else {
+                Err(ApiError::not_found())
+            }
+        }
+    }
 }
 
 fn validate_smartsentinel_event_items(
@@ -11960,6 +12520,7 @@ fn mutate_command_raw(
     Ok(command)
 }
 
+#[allow(dead_code)]
 fn ensure_rule_action_targets_exist(state: &AppState, action: &RuleAction) -> Result<(), ApiError> {
     match action {
         RuleAction::CreateEvent {
@@ -11977,6 +12538,35 @@ fn ensure_rule_action_targets_exist(state: &AppState, action: &RuleAction) -> Re
         RuleAction::CreateCommand {
             target_entity_id, ..
         } => ensure_entity_exists(state, *target_entity_id)?,
+    }
+
+    Ok(())
+}
+
+fn ensure_rule_action_targets_exist_with_auth(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    action: &RuleAction,
+) -> Result<(), ApiError> {
+    match action {
+        RuleAction::CreateEvent {
+            source_entity_id,
+            target_entity_id,
+            ..
+        } => {
+            if let Some(source_entity_id) = source_entity_id {
+                require_same_tenant_for_target_entity(state, auth, endpoint, *source_entity_id)?;
+            }
+            if let Some(target_entity_id) = target_entity_id {
+                require_same_tenant_for_target_entity(state, auth, endpoint, *target_entity_id)?;
+            }
+        }
+        RuleAction::CreateCommand {
+            target_entity_id, ..
+        } => {
+            require_same_tenant_for_target_entity(state, auth, endpoint, *target_entity_id)?;
+        }
     }
 
     Ok(())
@@ -12668,7 +13258,16 @@ mod tests {
                 "rules",
                 "policies",
                 "capabilities",
-                "executors_read"
+                "executors_read",
+                "entity_writes",
+                "relationship_writes",
+                "observation_writes",
+                "command_writes",
+                "action_writes",
+                "rule_writes",
+                "policy_writes",
+                "capability_writes",
+                "executor_config_writes"
             ])
         );
         assert_eq!(body["auth"]["bootstrap_admin_configured"], false);
@@ -12937,7 +13536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_mode_requires_bearer_for_token_management_and_keeps_open_writes_unchanged() {
+    async fn token_mode_requires_bearer_for_token_management_and_selected_writes() {
         let state = AppState::with_backend_storage_and_auth(
             Arc::new(InMemoryStorage::new()),
             StorageBackendName::Memory,
@@ -12993,7 +13592,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(create_entity.status(), StatusCode::CREATED);
+        assert_eq!(create_entity.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -14562,26 +15161,7 @@ mod tests {
     #[tokio::test]
     async fn selected_unprotected_endpoints_still_work_in_token_mode_without_token() {
         let storage = Arc::new(InMemoryStorage::new());
-        let dev_app = dev_mode_app_with_storage(storage.clone());
         let app = token_mode_app_with_storage(storage);
-        let create_entity = app
-            .clone()
-            .oneshot(json_request(
-                "POST",
-                "/entities",
-                json!({
-                    "entity_key": "token-still-open-write-01",
-                    "entity_type": "aion:Sensor",
-                    "jsonld": {
-                        "@context": {"aion": "https://aioncore.org/ns#"},
-                        "@id": "urn:aion:test:token-still-open-write-01",
-                        "@type": "aion:Sensor"
-                    }
-                }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(create_entity.status(), StatusCode::CREATED);
 
         let whoami = app
             .oneshot(
@@ -14593,9 +15173,507 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(whoami.status(), StatusCode::OK);
+    }
 
-        let created = get_json(&dev_app, "/entities").await;
-        assert_eq!(created.as_array().unwrap().len(), 1);
+    #[tokio::test]
+    async fn token_mode_protects_entity_writes_and_assigns_principal_tenant() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = token_mode_app_with_storage(storage.clone());
+        let missing_scope_token = store_api_token_for_tenant(
+            &storage,
+            Uuid::new_v4(),
+            ApiTokenPrincipalType::Service,
+            Some("entity-write-missing"),
+            &["entities:read"],
+        );
+        let tenant_id = Uuid::new_v4();
+        let write_token = store_api_token_for_tenant(
+            &storage,
+            tenant_id,
+            ApiTokenPrincipalType::Service,
+            Some("entity-writer"),
+            &["entities:write"],
+        );
+        let body = json!({
+            "entity_key": "tenant-write-entity-01",
+            "entity_type": "aion:Sensor",
+            "jsonld": {
+                "@context": {"aion": "https://aioncore.org/ns#"},
+                "@id": "urn:aion:test:tenant-write-entity-01",
+                "@type": "aion:Sensor"
+            }
+        });
+
+        let forbidden = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/entities",
+                body.clone(),
+                &missing_scope_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let created = to_json(
+            app.clone()
+                .oneshot(auth_json_request("POST", "/entities", body, &write_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created["tenant_id"], tenant_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn token_mode_enforces_relationship_and_observation_write_tenants() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let entity_a =
+            create_test_entity(&tenant_a_app, "tenant-a-rel-source", "aion:Sensor").await;
+        let entity_a_target =
+            create_test_entity(&tenant_a_app, "tenant-a-rel-target", "aion:Plot").await;
+        let entity_b = create_test_entity(&tenant_b_app, "tenant-b-rel-target", "aion:Plot").await;
+        let tenant_a_relationship_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-relationship-writer"),
+            &["relationships:write", "observations:write"],
+        );
+        let admin_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Admin,
+            Some("write-admin"),
+            &["admin:all"],
+        );
+
+        let denied_relationship = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/relationships",
+                json!({
+                    "source_entity_id": entity_a,
+                    "relationship_type": "aion:connectedTo",
+                    "target_entity_id": entity_b,
+                    "jsonld": {"@type": "aion:Relationship"}
+                }),
+                &tenant_a_relationship_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_relationship.status(), StatusCode::FORBIDDEN);
+
+        let admin_relationship = to_json(
+            app.clone()
+                .oneshot(auth_json_request(
+                    "POST",
+                    "/relationships",
+                    json!({
+                        "source_entity_id": entity_a,
+                        "relationship_type": "aion:connectedTo",
+                        "target_entity_id": entity_b,
+                        "jsonld": {"@type": "aion:Relationship"}
+                    }),
+                    &admin_token,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(admin_relationship["tenant_id"], tenant_a.to_string());
+
+        let denied_observation = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/observations",
+                json!({
+                    "producer_entity_id": entity_a,
+                    "feature_of_interest_id": entity_b,
+                    "observed_property": "temperature",
+                    "value": {"type": "number", "value": 21.5},
+                    "unit": "Cel",
+                    "observed_at": "2026-05-05T12:00:00Z",
+                    "received_at": "2026-05-05T12:00:05Z",
+                    "protocol": "http",
+                    "payload_format": "json_mapping",
+                    "quality": {},
+                    "metadata": {}
+                }),
+                &tenant_a_relationship_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_observation.status(), StatusCode::FORBIDDEN);
+
+        let same_tenant_observation = app
+            .oneshot(auth_json_request(
+                "POST",
+                "/observations",
+                json!({
+                    "producer_entity_id": entity_a,
+                    "feature_of_interest_id": entity_a_target,
+                    "observed_property": "temperature",
+                    "value": {"type": "number", "value": 21.5},
+                    "unit": "Cel",
+                    "observed_at": "2026-05-05T12:00:00Z",
+                    "received_at": "2026-05-05T12:00:05Z",
+                    "protocol": "http",
+                    "payload_format": "json_mapping",
+                    "quality": {},
+                    "metadata": {}
+                }),
+                &tenant_a_relationship_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(same_tenant_observation.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_enforces_command_action_and_lifecycle_write_tenants() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let pump_a = create_test_entity(&tenant_a_app, "tenant-a-command-pump", "aion:Pump").await;
+        let pump_b = create_test_entity(&tenant_b_app, "tenant-b-command-pump", "aion:Pump").await;
+        let tenant_a_command_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-command-writer"),
+            &["commands:create", "commands:write", "actions:write"],
+        );
+        let tenant_b_command_token = store_api_token_for_tenant(
+            &storage,
+            tenant_b,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-b-command-writer"),
+            &["commands:create", "commands:write", "actions:write"],
+        );
+        let missing_create_scope = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-command-missing-create"),
+            &["commands:read"],
+        );
+
+        let missing_scope = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/commands",
+                json!({
+                    "target_entity_id": pump_a,
+                    "command_type": "StartPump",
+                    "payload": {"target_state": "running"}
+                }),
+                &missing_create_scope,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_scope.status(), StatusCode::FORBIDDEN);
+
+        let cross_tenant_create = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/commands",
+                json!({
+                    "target_entity_id": pump_a,
+                    "command_type": "StartPump",
+                    "payload": {"target_state": "running"}
+                }),
+                &tenant_b_command_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_create.status(), StatusCode::FORBIDDEN);
+
+        let command = to_json(
+            app.clone()
+                .oneshot(auth_json_request(
+                    "POST",
+                    "/commands",
+                    json!({
+                        "target_entity_id": pump_a,
+                        "command_type": "StartPump",
+                        "payload": {"target_state": "running"}
+                    }),
+                    &tenant_a_command_token,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let command_id = command["id"].as_str().unwrap();
+
+        let denied_lifecycle = app
+            .clone()
+            .oneshot(auth_request(
+                "POST",
+                &format!("/commands/{command_id}/cancel"),
+                &tenant_b_command_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_lifecycle.status(), StatusCode::FORBIDDEN);
+
+        let action = to_json(
+            app.clone()
+                .oneshot(auth_json_request(
+                    "POST",
+                    "/actions",
+                    json!({
+                        "command_id": command_id,
+                        "action_type": "StartPump",
+                        "status": "completed",
+                        "started_at": "2026-05-05T12:00:00Z",
+                        "finished_at": "2026-05-05T12:01:00Z"
+                    }),
+                    &tenant_a_command_token,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let action_id = action["id"].as_str().unwrap();
+
+        let denied_action = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/actions",
+                json!({
+                    "command_id": command_id,
+                    "action_type": "StartPump",
+                    "status": "completed",
+                    "started_at": "2026-05-05T12:00:00Z",
+                    "finished_at": "2026-05-05T12:01:00Z",
+                    "executor_entity_id": pump_b
+                }),
+                &tenant_b_command_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_action.status(), StatusCode::FORBIDDEN);
+
+        let denied_result = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/action-results",
+                json!({
+                    "command_id": command_id,
+                    "action_id": action_id,
+                    "status": "succeeded",
+                    "verified": true,
+                    "result_payload": {"ok": true},
+                    "observed_at": "2026-05-05T12:01:30Z"
+                }),
+                &tenant_b_command_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_result.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_enforces_rule_policy_capability_and_executor_write_scopes() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let tank_a =
+            create_test_entity(&tenant_a_app, "tenant-a-rule-tank-write", "aion:Tank").await;
+        let pump_a =
+            create_test_entity(&tenant_a_app, "tenant-a-rule-pump-write", "aion:Pump").await;
+        let pump_b =
+            create_test_entity(&tenant_b_app, "tenant-b-rule-pump-write", "aion:Pump").await;
+        let executor_b = create_test_executor(&tenant_b_app, "tenant-b-executor-write").await;
+        let executor_b_id = executor_b["id"].as_str().unwrap();
+
+        let rule_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-rule-writer"),
+            &[
+                "rules:write",
+                "policies:write",
+                "capabilities:write",
+                "executors:write",
+            ],
+        );
+        let missing_scope_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-rule-missing"),
+            &["rules:read"],
+        );
+
+        let missing_rule_scope = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/rules",
+                json!({
+                    "name": "low-water",
+                    "trigger_type": "observation_created",
+                    "target_entity_id": tank_a,
+                    "observed_property": "level_pct",
+                    "condition": {"comparison": "less_than", "value": 20.0},
+                    "action": {
+                        "type": "create_command",
+                        "target_entity_id": pump_a,
+                        "command_type": "StartPump",
+                        "payload": {"target_state": "running"}
+                    }
+                }),
+                &missing_scope_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_rule_scope.status(), StatusCode::FORBIDDEN);
+
+        let cross_tenant_rule = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/rules",
+                json!({
+                    "name": "cross-tenant-low-water",
+                    "trigger_type": "observation_created",
+                    "target_entity_id": tank_a,
+                    "observed_property": "level_pct",
+                    "condition": {"comparison": "less_than", "value": 20.0},
+                    "action": {
+                        "type": "create_command",
+                        "target_entity_id": pump_b,
+                        "command_type": "StartPump",
+                        "payload": {"target_state": "running"}
+                    }
+                }),
+                &rule_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_rule.status(), StatusCode::FORBIDDEN);
+
+        let cross_tenant_policy = app
+            .clone()
+            .oneshot(auth_json_request(
+                "PUT",
+                "/policies",
+                json!([{
+                    "target_entity_id": pump_b,
+                    "command_type": "StartPump",
+                    "requires_approval": true,
+                    "auto_execute_allowed": false
+                }]),
+                &rule_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_policy.status(), StatusCode::FORBIDDEN);
+
+        let cross_tenant_capability = app
+            .clone()
+            .oneshot(auth_json_request(
+                "PUT",
+                &format!("/entities/{pump_b}/capabilities"),
+                json!([{
+                    "capability_name": "pump:start",
+                    "command_type": "StartPump"
+                }]),
+                &rule_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_capability.status(), StatusCode::FORBIDDEN);
+
+        let executor_scope_write = app
+            .clone()
+            .oneshot(auth_json_request(
+                "PUT",
+                &format!("/executors/{executor_b_id}/scopes"),
+                json!([{
+                    "entity_type": "aion:Pump"
+                }]),
+                &rule_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(executor_scope_write.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_all_satisfies_new_write_scopes_and_tenant_checks() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let source_a = create_test_entity(&tenant_a_app, "admin-write-source-a", "aion:Pump").await;
+        let target_b =
+            create_test_entity(&tenant_b_app, "admin-write-target-b", "aion:Valve").await;
+        let executor_b = create_test_executor(&tenant_b_app, "admin-write-executor-b").await;
+        let executor_b_id = executor_b["id"].as_str().unwrap();
+        let admin_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Admin,
+            Some("platform-admin-write"),
+            &["admin:all"],
+        );
+
+        let relationship = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/relationships",
+                json!({
+                    "source_entity_id": source_a,
+                    "relationship_type": "aion:connectedTo",
+                    "target_entity_id": target_b,
+                    "jsonld": {"@type": "aion:Relationship"}
+                }),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(relationship.status(), StatusCode::CREATED);
+
+        let executor_caps = app
+            .clone()
+            .oneshot(auth_json_request(
+                "PUT",
+                &format!("/executors/{executor_b_id}/capabilities"),
+                json!([{
+                    "command_type": "StartPump",
+                    "protocol": "http"
+                }]),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(executor_caps.status(), StatusCode::OK);
     }
 
     #[tokio::test]

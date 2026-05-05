@@ -21,12 +21,13 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 57 auth hardening: selected token mode protected read surfaces now enforce the first tenant/resource ownership skeleton, including tenant-filtered lists and `403` on known cross-tenant detail reads.
 - Milestone 58 documentation simplification: the root `README.md` now stays concise and operational examples live in focused usage guides under `docs/`.
 - Milestone 59 documentation consistency pass: usage guides, model docs, roadmap references, and documentation navigation now use normalized cross-links and terminology.
+- Milestone 60 auth hardening: selected token mode write paths now enforce explicit write scopes plus first-pass tenant-aware create/update checks without cross-tenant sharing.
 
 ## Next
 
-1. Milestone 60: extend tenant-aware authorization to write paths and remaining protected surfaces without introducing cross-tenant sharing yet.
-2. Milestone 61: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
-3. Milestone 62: review whether remaining open write surfaces should split into narrower operator and machine scopes.
+1. Milestone 61: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+2. Milestone 62: review whether remaining open write surfaces should split into narrower operator and machine scopes.
+3. Milestone 63: expand tenant-aware authorization beyond the current selected read/write surfaces without introducing cross-tenant sharing by default.
 
 ## Future
 
@@ -39,4 +40,4 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 ## Notes
 
 - The roadmap is intentionally concise. Canonical details live in the individual model docs and ADRs.
-- Security hardening remains staged after the current documentation pass to avoid changing runtime behavior prematurely.
+- Security hardening remains staged after the current selected write-surface rollout to avoid overreaching beyond verified behavior in one milestone.

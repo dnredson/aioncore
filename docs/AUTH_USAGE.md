@@ -2,15 +2,15 @@
 
 This guide collects the operational authentication examples that were previously in the root `README.md`.
 
-For the architecture and roadmap context, also see [Security Model](SECURITY_MODEL.md), [ADR 0044: Security Model and Auth Roadmap](ADR/0044-security-model-and-auth-roadmap.md), [ADR 0045: Auth Middleware Skeleton and Dev Bypass](ADR/0045-auth-middleware-skeleton-dev-bypass.md), [ADR 0046: API Token Principal Model and Hashing](ADR/0046-api-token-principal-model-and-hashing.md), and [ADR 0054: Tenant Resource Ownership Skeleton](ADR/0054-tenant-resource-ownership-skeleton.md).
+For the architecture and roadmap context, also see [Security Model](SECURITY_MODEL.md), [ADR 0044: Security Model and Auth Roadmap](ADR/0044-security-model-and-auth-roadmap.md), [ADR 0045: Auth Middleware Skeleton and Dev Bypass](ADR/0045-auth-middleware-skeleton-dev-bypass.md), [ADR 0046: API Token Principal Model and Hashing](ADR/0046-api-token-principal-model-and-hashing.md), [ADR 0054: Tenant Resource Ownership Skeleton](ADR/0054-tenant-resource-ownership-skeleton.md), and [ADR 0055: Tenant-Aware Write Authorization Skeleton](ADR/0055-tenant-aware-write-authorization-skeleton.md).
 
 ## Current Status
 
 - `AIONCORE_AUTH_MODE=dev` is still the default when unset.
 - `token` mode enforces only selected endpoint groups.
 - Enforcement level in `token` mode is still partial.
-- Tenant/resource ownership checks currently apply only to selected protected read surfaces.
-- Writes and full ownership enforcement remain future work.
+- Tenant/resource ownership checks now apply to selected protected read surfaces and selected write paths.
+- Broad write coverage and a full authorization engine remain future work.
 - The current auth model is not production-ready.
 
 ## Auth Modes
@@ -38,6 +38,7 @@ Selected route groups currently protected in `token` mode:
 - selected adapter reads
 - event and raw-message reads
 - selected entity, observation, command, action, rule, policy, capability, and executor reads
+- selected entity, relationship, observation, command, action, rule, policy, capability, and executor-configuration writes
 - MCP and AI/provenance read surfaces
 - API token administration
 
@@ -273,6 +274,58 @@ $rulesReadToken = Invoke-RestMethod `
   } | ConvertTo-Json -Depth 8)
 ```
 
+Selected write-scope examples:
+
+```powershell
+$entitiesWriteToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "entities-write"
+    principal_type = "service"
+    principal_id = "entities-writer"
+    scopes = @("entities:write", "relationships:write")
+  } | ConvertTo-Json -Depth 8)
+
+$observationWriteToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "observations-write"
+    principal_type = "service"
+    principal_id = "observations-writer"
+    scopes = @("observations:write")
+  } | ConvertTo-Json -Depth 8)
+
+$commandWriteToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "commands-write"
+    principal_type = "service"
+    principal_id = "commands-writer"
+    scopes = @("commands:create", "commands:approve", "commands:write", "commands:claim", "commands:lease")
+  } | ConvertTo-Json -Depth 8)
+
+$rulePolicyToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "rule-policy-write"
+    principal_type = "service"
+    principal_id = "rule-policy-writer"
+    scopes = @("actions:write", "rules:write", "policies:write", "capabilities:write", "executors:write")
+  } | ConvertTo-Json -Depth 8)
+```
+
 ## Scope Usage Examples
 
 ```powershell
@@ -315,9 +368,23 @@ Token-mode behavior for these scoped surfaces:
 - a valid bearer token without the required scope returns `403`
 - `admin:all` satisfies all route scope checks
 - on selected protected read routes, `admin:all` also bypasses tenant/resource ownership checks
+- on selected protected write routes, `admin:all` bypasses tenant checks
 - on those selected protected read routes, non-admin tokens can read only resources whose `tenant_id` matches the principal tenant
+- on selected protected write routes, non-admin tokens can create or mutate only same-tenant resources
 - selected list/query endpoints return only same-tenant resources
 - selected detail endpoints return `403` for known cross-tenant access
+
+Selected tenant-aware write behavior in `token` mode:
+
+- `POST /entities` requires `entities:write` and stores the entity under the authenticated tenant
+- `POST /relationships` requires `relationships:write`; non-admin tokens may link only same-tenant entities
+- `POST /observations` requires `observations:write`; non-admin tokens may reference only same-tenant producer and feature entities
+- `POST /commands` requires `commands:create`; generic lifecycle writes use `commands:approve`, `commands:write`, `commands:claim`, or `commands:lease` depending on the endpoint
+- `POST /actions` and `POST /action-results` require `actions:write` and must reference same-tenant commands unless `admin:all`
+- `POST /rules`, `PUT /rules/{rule_id}/enable`, `PUT /rules/{rule_id}/disable`, and `POST /rules/evaluate` require `rules:write`
+- `PUT /policies` requires `policies:write`
+- `PUT /entities/{entity_id}/capabilities` requires `capabilities:write`
+- `PUT /executors/{executor_id}/capabilities` and `PUT /executors/{executor_id}/scopes` require `executors:admin` or `executors:write`
 
 ## 401 And 403 Examples
 
@@ -339,6 +406,49 @@ try {
 ```
 
 The first request returns `401` in `token` mode because no bearer token was provided. The second returns `403` because `events:read` does not satisfy `raw-messages:read`.
+
+Selected write examples:
+
+```powershell
+try {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/entities" `
+    -ContentType "application/json" `
+    -Body (@{
+      entity_key = "missing-token-write"
+      entity_type = "aion:Sensor"
+      jsonld = @{
+        "@context" = @{ aion = "https://aioncore.org/ns#" }
+        "@id" = "urn:aion:test:missing-token-write"
+        "@type" = "aion:Sensor"
+      }
+    } | ConvertTo-Json -Depth 8)
+} catch {
+  ($_.ErrorDetails.Message | ConvertFrom-Json).error
+}
+```
+
+```powershell
+try {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8080/relationships" `
+    -Headers @{ Authorization = "Bearer $($entitiesWriteToken.raw_token)" } `
+    -ContentType "application/json" `
+    -Body (@{
+      source_entity_id = $tenantAEntityId
+      relationship_type = "aion:connectedTo"
+      target_entity_id = $tenantBEntityId
+      jsonld = @{ "@type" = "aion:Relationship" }
+    } | ConvertTo-Json -Depth 8)
+} catch {
+  $_.Exception.Response.StatusCode.value__
+  ($_.ErrorDetails.Message | ConvertFrom-Json).error
+}
+```
+
+The first write returns `401` in `token` mode because no bearer token was provided. The second returns `403` because non-admin tokens cannot create cross-tenant links on the selected tenant-aware write surfaces.
 
 Missing-token and wrong-scope examples:
 
@@ -411,9 +521,9 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/entities" -Headers $ad
 
 Current limitations:
 
-- ownership checks cover selected protected read surfaces only
-- writes are not broadly tenant-authorized yet
-- full cross-route coverage remains future work
+- ownership checks cover selected protected read surfaces and selected write paths only
+- cross-tenant sharing is still not supported
+- full cross-route coverage and a richer authorization engine remain future work
 
 ## Token Revocation Example
 
@@ -437,3 +547,4 @@ Invoke-RestMethod `
 - [Events and Raw Messages Auth Hardening](ADR/0052-events-raw-messages-auth-hardening.md)
 - [Broader Read Surface Auth Coverage](ADR/0053-broader-read-surface-auth-coverage.md)
 - [Tenant Resource Ownership Skeleton](ADR/0054-tenant-resource-ownership-skeleton.md)
+- [Tenant-Aware Write Authorization Skeleton](ADR/0055-tenant-aware-write-authorization-skeleton.md)
