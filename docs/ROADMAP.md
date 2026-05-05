@@ -16,14 +16,14 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - SmartSentinel integration: snapshot ingestion, provenance, evidence, and executor bridge support.
 - Edge Adapter architecture: optional edge/fog model, registration, and status contract.
 - Security model: documented principals, credential types, scopes, trust boundaries, and auth roadmap.
+- Milestone 55 auth hardening: `/events*` and `/raw-messages*` now require dedicated read scopes in `token` mode.
+- Milestone 56 auth hardening: broader read-surface coverage now protects selected entity, observation, command, action, rule, policy, capability, and executor-inspection reads in `token` mode.
 
 ## Next
 
-1. Milestone 48: auth middleware skeleton with dev-mode bypass.
-2. Milestone 49: API token principal model and token hashing.
-3. Milestone 50: protect adapter/executor endpoints.
-4. Milestone 51: protect connector secrets and connector admin APIs.
-5. Milestone 52: protect MCP and production origin validation.
+1. Milestone 57: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+2. Milestone 58: start tenant/resource ownership enforcement for token-authenticated reads and writes.
+3. Milestone 59: review whether remaining open write surfaces should split into narrower operator and machine scopes.
 
 ## Future
 

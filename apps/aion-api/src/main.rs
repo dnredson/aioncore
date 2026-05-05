@@ -13,7 +13,7 @@ async fn main() {
     let app = aion_api::app_with_state(state.clone());
 
     eprintln!(
-        "startup storage backend={}, database_url_provided={}, migrations_applied={}, auth_mode={}, auth_enforced={}, auth_dev_bypass={}",
+        "startup storage backend={}, database_url_provided={}, migrations_applied={}, auth_mode={}, auth_enforcement_level={}, auth_dev_bypass={}, bootstrap_admin_configured={}",
         diagnostics.storage_backend.as_str(),
         diagnostics.database_url_provided,
         diagnostics
@@ -21,8 +21,13 @@ async fn main() {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "n/a".to_string()),
         diagnostics.auth_mode.as_str(),
-        diagnostics.auth_enforced,
-        diagnostics.auth_dev_bypass
+        match diagnostics.auth_enforcement_level {
+            aion_api::AuthEnforcementLevel::None => "none",
+            aion_api::AuthEnforcementLevel::Partial => "partial",
+            aion_api::AuthEnforcementLevel::Full => "full",
+        },
+        diagnostics.auth_dev_bypass,
+        diagnostics.auth_bootstrap_admin_configured
     );
 
     match diagnostics.auth_mode {
@@ -33,6 +38,12 @@ async fn main() {
             eprintln!("warning: authentication is explicitly disabled for this runtime");
         }
         aion_api::AuthMode::Token => {}
+    }
+
+    if diagnostics.auth_bootstrap_admin_configured {
+        eprintln!(
+            "warning: AIONCORE_BOOTSTRAP_ADMIN_TOKEN is intended only for local bootstrap and development; remove it after creating real admin tokens; do not expose it publicly"
+        );
     }
 
     if let Err(error) = aion_api::start_connector_workers_if_enabled(state.clone()).await {

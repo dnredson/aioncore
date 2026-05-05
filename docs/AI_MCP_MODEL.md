@@ -55,7 +55,23 @@ This is not a standalone production MCP server yet. It is an internal MCP-style 
 
 No real LLM is called by either `/mcp/tools` or `/mcp`. The AI context builder only assembles stored AionCore data from the in-memory runtime.
 
-The minimal `/mcp` endpoint is intended for localhost development only. Do not expose it publicly without authentication and Origin validation. Production MCP transport, authentication, Origin validation, and SSE or streaming support are future work.
+Auth behavior for the local MCP-style surfaces:
+
+- `AIONCORE_AUTH_MODE=dev` keeps the local development bypass unchanged
+- `AIONCORE_AUTH_MODE=disabled` keeps auth explicitly off
+- `AIONCORE_AUTH_MODE=token` requires `mcp:tools` for:
+  - `GET /mcp/tools`
+  - `POST /mcp/tools/{tool_name}`
+  - `POST /mcp`
+- `admin:all` also satisfies those checks
+
+The minimal `/mcp` endpoint is intended for localhost development only. Do not expose it publicly without authentication and Origin validation. In `token` mode it now requires `mcp:tools`, but production MCP transport, Origin validation, browser-facing CSRF-style controls, and SSE or streaming support are still future work.
+
+The AI context HTTP surface is separate from the MCP transport but part of the same AI-facing model:
+
+- `GET /ai/context/entity/{entity_id}` requires `ai:context:read` in `token` mode
+- AI context can expose operational topology, relationships, recent observations, events, command context, and raw-message references
+- no external AI call is made by the context builder
 
 ### query_entities
 

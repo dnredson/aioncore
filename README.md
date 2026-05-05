@@ -75,15 +75,15 @@ The PostgreSQL and TimescaleDB migration foundation now covers the current in-me
 
 AionCore still defaults to unauthenticated local development with `AIONCORE_AUTH_MODE=dev`. This is acceptable for local development and tests only, not for public or production exposure.
 
-Milestone 52 closes the remaining known ingestion and connector-related token-mode gaps, including generic HTTP ingestion, TTN device-mapping routes, and adapter detail reads. It does not broadly protect the entire API yet.
+Milestone 56 broadens token-mode coverage across selected entity, observation, command, action, rule, policy, capability, and executor-inspection reads on top of the earlier MCP, provenance, event, and raw-message protections. It still does not broadly protect the entire API or enforce tenant/resource ownership yet.
 
 Local development warning:
 
 - run the API on trusted local networks only
-- do not expose `/mcp`, `/mcp/tools`, or `/ai/context/*` publicly
+- do not expose `/mcp`, `/mcp/tools`, `/ai/context/*`, or `/provenance/search` publicly
 - do not treat current connector-secret redaction as a complete production security model
 
-The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md), [ADR 0047](docs/ADR/0047-selected-machine-endpoint-auth-enforcement.md), [ADR 0048](docs/ADR/0048-connector-and-ingestion-auth-enforcement.md), and [ADR 0049](docs/ADR/0049-remaining-ingestion-connector-auth-enforcement.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, selective machine-principal protection, connector and ingestion enforcement, connector-secret protection, remaining ingestion and connector gap closure, and later MCP hardening.
+The planned production direction is documented in [Security Model](docs/SECURITY_MODEL.md), [ADR 0044](docs/ADR/0044-security-model-and-auth-roadmap.md), [ADR 0046](docs/ADR/0046-api-token-principal-model-and-hashing.md), [ADR 0047](docs/ADR/0047-selected-machine-endpoint-auth-enforcement.md), [ADR 0048](docs/ADR/0048-connector-and-ingestion-auth-enforcement.md), [ADR 0049](docs/ADR/0049-remaining-ingestion-connector-auth-enforcement.md), [ADR 0050](docs/ADR/0050-auth-readiness-and-bootstrap-hardening.md), [ADR 0051](docs/ADR/0051-mcp-ai-provenance-auth-hardening.md), and [ADR 0052](docs/ADR/0052-events-raw-messages-auth-hardening.md). The staged roadmap starts with auth middleware and a development-mode bypass, then adds API tokens, selective machine-principal protection, connector and ingestion enforcement, connector-secret protection, remaining ingestion and connector gap closure, MCP/AI/provenance hardening, and event/raw-message read-surface hardening.
 
 The auth-mode environment variable is:
 
@@ -91,9 +91,9 @@ The auth-mode environment variable is:
 
 Current mode behavior:
 
-- `dev`: default when unset; auth middleware is installed, requests are allowed through, and development bypass is reported in readiness.
-- `disabled`: auth is explicitly disabled; requests are still allowed through.
-- `token`: bearer-token parsing and principal resolution are active, and the selected endpoints below now require valid scoped tokens.
+- `dev`: default when unset; auth middleware is installed, requests are allowed through, readiness reports `enforcement_level = none`, and development bypass is active.
+- `disabled`: auth is explicitly disabled; requests are still allowed through, and readiness reports `enforcement_level = none`.
+- `token`: bearer-token parsing and principal resolution are active, readiness reports `enforcement_level = partial`, and only the selected endpoint groups below currently require valid scoped tokens.
 
 Selected protected endpoints in `token` mode:
 
@@ -147,12 +147,43 @@ Selected protected endpoints in `token` mode:
   - `GET /adapters` requires `adapters:read`
   - `GET /adapters/{adapter_id}` requires `adapters:read`
   - `GET /adapters/{adapter_id}/status` requires `adapters:read`
+- event and raw-message operational reads:
+  - `GET /events` requires `events:read`
+  - `GET /events/{event_id}` requires `events:read`
+  - `GET /raw-messages` requires `raw-messages:read`
+  - `GET /raw-messages/{raw_message_id}` requires `raw-messages:read`
+- broader generic read surfaces:
+  - `GET /entities`
+  - `GET /entities/{entity_id}`
+  - `GET /entities/{entity_id}/context`
+  - all require `entities:read`
+  - `GET /observations` requires `observations:read`
+  - `GET /commands` and `GET /commands/{command_id}` require `commands:read`
+  - `GET /actions`, `GET /actions/{action_id}`, and `GET /action-results` require `actions:read`
+  - `GET /rules` and `GET /rules/{rule_id}` require `rules:read`
+  - `GET /policies` requires `policies:read`
+  - `GET /entities/{entity_id}/capabilities` requires `capabilities:read`
+  - `GET /executors`
+  - `GET /executors/{executor_id}`
+  - `GET /executors/{executor_id}/capabilities`
+  - `GET /executors/{executor_id}/scopes`
+  - all require `executors:read`
+- MCP and AI/provenance surfaces:
+  - `GET /mcp/tools` requires `mcp:tools`
+  - `POST /mcp/tools/{tool_name}` requires `mcp:tools`
+  - `POST /mcp` requires `mcp:tools`
+  - `GET /ai/context/entity/{entity_id}` requires `ai:context:read`
+  - `GET /provenance/search` requires `provenance:read`
 - API token administration:
   - `POST /auth/tokens`
   - `GET /auth/tokens`
   - `GET /auth/tokens/{token_id}`
   - `POST /auth/tokens/{token_id}/revoke`
   - all require `auth:tokens:admin`
+- remaining intentionally open surfaces in this milestone:
+  - broad write surfaces for entities, observations, commands, actions, rules, policies, and capabilities
+  - tenant/resource ownership enforcement across the protected read routes above
+  - standalone relationship read routes and observation detail routes, which do not currently exist
 
 Scope behavior in `token` mode:
 
@@ -160,7 +191,20 @@ Scope behavior in `token` mode:
 - valid token without the required scope returns structured `403`
 - `admin:all` satisfies any required scope
 - broader endpoint coverage remains intentionally partial in this milestone
-- executor catalog/detail/capability/scope reads remain unchanged until a dedicated executor read scope is introduced
+- tenant/resource ownership checks remain future work
+- `GET /events` and `GET /events/{event_id}` use `events:read`
+- `GET /raw-messages` and `GET /raw-messages/{raw_message_id}` use `raw-messages:read`
+- `GET /entities`, `GET /entities/{entity_id}`, and `GET /entities/{entity_id}/context` use `entities:read`
+- `GET /observations` uses `observations:read`
+- `GET /commands` and `GET /commands/{command_id}` use `commands:read`
+- `GET /actions`, `GET /actions/{action_id}`, and `GET /action-results` use `actions:read`
+- `GET /rules` and `GET /rules/{rule_id}` use `rules:read`
+- `GET /policies` uses `policies:read`
+- `GET /entities/{entity_id}/capabilities` uses `capabilities:read`
+- `GET /executors`, `GET /executors/{executor_id}`, `GET /executors/{executor_id}/capabilities`, and `GET /executors/{executor_id}/scopes` use `executors:read`
+- `GET /mcp/tools`, `POST /mcp/tools/{tool_name}`, and `POST /mcp` use `mcp:tools`
+- `GET /ai/context/entity/{entity_id}` uses `ai:context:read`
+- `GET /provenance/search` uses `provenance:read`
 
 Token foundations in this milestone:
 
@@ -169,7 +213,8 @@ Token foundations in this milestone:
 - Stored records keep only a token hash plus a short token prefix for lookup and display.
 - `GET /auth/tokens` and `GET /auth/tokens/{token_id}` never return `raw_token` or `token_hash`.
 - `GET /auth/whoami` reports the current auth mode and resolved principal.
-- `AIONCORE_BOOTSTRAP_ADMIN_TOKEN` provides a safe local bootstrap path in `token` mode. When the presented bearer token exactly matches this environment variable, AionCore resolves an admin principal with `auth:tokens:admin` and `admin:all` without storing that bootstrap token.
+- `AIONCORE_BOOTSTRAP_ADMIN_TOKEN` provides a local bootstrap path in `token` mode. It must be at least 24 characters long. When the presented bearer token exactly matches this environment variable, AionCore resolves an admin principal with `auth:tokens:admin` and `admin:all` without storing that bootstrap token.
+- The bootstrap admin token is intended only for local bootstrap and development. Remove it after creating real admin tokens, and do not expose it publicly.
 
 ## Run Locally Without Docker
 
@@ -205,13 +250,13 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/auth/whoami"
 ```
 
-`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` checks storage and MQTT readiness. In memory mode storage returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable. When MQTT is disabled, `/ready` still succeeds and reports `mqtt.enabled = false`. Connector workers are also disabled by default and reported under `connector_workers.enabled = false`. The readiness response now also reports `auth.mode`, `auth.enforced`, and `auth.dev_bypass`.
+`/health` is a lightweight liveness check. It reports the active storage backend and should not perform a database probe. `/ready` checks storage and MQTT readiness. In memory mode storage returns ready immediately. In postgres mode it verifies database connectivity and does not fall back to memory if the database is unavailable. When MQTT is disabled, `/ready` still succeeds and reports `mqtt.enabled = false`. Connector workers are also disabled by default and reported under `connector_workers.enabled = false`. The readiness response also reports `auth.mode`, `auth.dev_bypass`, `auth.enforcement_level`, `auth.protected_endpoint_groups`, and `auth.bootstrap_admin_configured`. `enforcement_level = partial` means only the documented machine-facing and selected read-oriented endpoint groups are protected in `token` mode; it does not imply broad full-API enforcement or ownership checks.
 
 API token examples:
 
 ```powershell
 $env:AIONCORE_AUTH_MODE = "token"
-$env:AIONCORE_BOOTSTRAP_ADMIN_TOKEN = "bootstrap-admin-local"
+$env:AIONCORE_BOOTSTRAP_ADMIN_TOKEN = "bootstrap-admin-local-token-123456"
 cargo run -p aion-api
 ```
 
@@ -305,7 +350,170 @@ $adapterReadToken = Invoke-RestMethod `
     scopes = @("adapters:read")
     metadata = @{ purpose = "adapter inspection" }
   } | ConvertTo-Json -Depth 8)
+
+$mcpToolsToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "local-mcp-tools"
+    principal_type = "service"
+    principal_id = "local-mcp-client"
+    scopes = @("mcp:tools")
+    metadata = @{ purpose = "local MCP access" }
+  } | ConvertTo-Json -Depth 8)
+
+$aiContextToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "local-ai-context"
+    principal_type = "service"
+    principal_id = "local-ai-client"
+    scopes = @("ai:context:read")
+    metadata = @{ purpose = "AI context reads" }
+  } | ConvertTo-Json -Depth 8)
+
+$provenanceToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "local-provenance"
+    principal_type = "service"
+    principal_id = "local-provenance-client"
+    scopes = @("provenance:read")
+    metadata = @{ purpose = "provenance search" }
+  } | ConvertTo-Json -Depth 8)
+
+$eventsReadToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "events-read"
+    principal_type = "service"
+    principal_id = "events-reader"
+    scopes = @("events:read")
+    metadata = @{ purpose = "event inspection" }
+  } | ConvertTo-Json -Depth 8)
+
+$rawMessagesReadToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "raw-messages-read"
+    principal_type = "service"
+    principal_id = "raw-messages-reader"
+    scopes = @("raw-messages:read")
+    metadata = @{ purpose = "raw payload inspection" }
+  } | ConvertTo-Json -Depth 8)
+
+$entitiesReadToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "entities-read"
+    principal_type = "service"
+    principal_id = "entities-reader"
+    scopes = @("entities:read")
+    metadata = @{ purpose = "entity inspection" }
+  } | ConvertTo-Json -Depth 8)
+
+$commandsReadToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "commands-read"
+    principal_type = "service"
+    principal_id = "commands-reader"
+    scopes = @("commands:read")
+    metadata = @{ purpose = "command inspection" }
+  } | ConvertTo-Json -Depth 8)
+
+$rulesReadToken = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/auth/tokens" `
+  -Headers $bootstrapHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    token_name = "rules-read"
+    principal_type = "service"
+    principal_id = "rules-reader"
+    scopes = @("rules:read")
+    metadata = @{ purpose = "rule inspection" }
+  } | ConvertTo-Json -Depth 8)
 ```
+
+Token-mode behavior for these scoped surfaces:
+
+- no bearer token or an invalid bearer token returns `401`
+- a valid bearer token without the required scope returns `403`
+- `admin:all` satisfies all route scope checks, including `entities:read`, `observations:read`, `commands:read`, `actions:read`, `rules:read`, `policies:read`, `capabilities:read`, and `executors:read`
+
+```powershell
+$eventsHeaders = @{ Authorization = "Bearer $($eventsReadToken.raw_token)" }
+$rawMessagesHeaders = @{ Authorization = "Bearer $($rawMessagesReadToken.raw_token)" }
+$entitiesHeaders = @{ Authorization = "Bearer $($entitiesReadToken.raw_token)" }
+$observationsHeaders = @{ Authorization = "Bearer $($tokenResponse.raw_token)" }
+$commandsHeaders = @{ Authorization = "Bearer $($commandsReadToken.raw_token)" }
+$rulesHeaders = @{ Authorization = "Bearer $($rulesReadToken.raw_token)" }
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/events" `
+  -Headers $eventsHeaders
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/raw-messages" `
+  -Headers $rawMessagesHeaders
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/entities" `
+  -Headers $entitiesHeaders
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/commands" `
+  -Headers $commandsHeaders
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/rules" `
+  -Headers $rulesHeaders
+```
+
+```powershell
+try {
+  Invoke-RestMethod -Method Get -Uri "http://localhost:8080/events"
+} catch {
+  $_.Exception.Response.StatusCode.value__
+}
+
+try {
+  Invoke-RestMethod `
+    -Method Get `
+    -Uri "http://localhost:8080/raw-messages" `
+    -Headers $eventsHeaders
+} catch {
+  $_.Exception.Response.StatusCode.value__
+}
+```
+
+The first request returns `401` in `token` mode because no bearer token was provided. The second returns `403` because `events:read` does not satisfy `raw-messages:read`.
 
 ```powershell
 $headers = @{ Authorization = "Bearer $($adapterToken.raw_token)" }
@@ -2859,5 +3067,62 @@ Invoke-RestMethod `
 ```
 
 The `/mcp` endpoint is a minimal localhost-development compatibility layer for the MCP `tools/list` and `tools/call` JSON-RPC flow. Do not expose it publicly without authentication and Origin validation.
+
+In `token` mode, use `mcp:tools` for `/mcp/tools` and `/mcp`:
+
+```powershell
+$mcpHeaders = @{ Authorization = "Bearer $($mcpToolsToken.raw_token)" }
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/mcp/tools" `
+  -Headers $mcpHeaders
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/mcp/tools/build_ai_context" `
+  -Headers $mcpHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    arguments = @{
+      entity_id = $mcpTank.id
+      include_observations = $true
+      include_events = $true
+      include_commands = $true
+      limit = 10
+    }
+  } | ConvertTo-Json -Depth 10)
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/mcp" `
+  -Headers $mcpHeaders `
+  -ContentType "application/json" `
+  -Body (@{
+    jsonrpc = "2.0"
+    id = 4
+    method = "tools/list"
+    params = @{}
+  } | ConvertTo-Json -Depth 10)
+```
+
+In `token` mode, use dedicated read scopes for AI context and provenance:
+
+```powershell
+$aiHeaders = @{ Authorization = "Bearer $($aiContextToken.raw_token)" }
+$provenanceHeaders = @{ Authorization = "Bearer $($provenanceToken.raw_token)" }
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/ai/context/entity/$($mcpTank.id)" `
+  -Headers $aiHeaders
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8080/provenance/search?trace_id=trace-abc" `
+  -Headers $provenanceHeaders
+```
+
+`/mcp` and `/mcp/tools` remain development/local tool surfaces by default. In production-style token mode they require `mcp:tools`. Browser-like or public exposure still requires future Origin validation and stronger transport hardening, and the current `/mcp` endpoint remains only a minimal MCP JSON-RPC compatibility layer rather than a production MCP transport.
 
 In-memory data is lost when the process exits.

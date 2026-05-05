@@ -2,11 +2,11 @@
 
 This document defines the authentication and authorization architecture for AionCore APIs while runtime enforcement is being introduced incrementally.
 
-Milestone 52 closes the remaining known ingestion and connector-related token-mode gaps by protecting generic HTTP ingestion, TTN device-mapping routes, and adapter detail reads on top of the Milestone 50 and 51 machine-facing foundation. It still does not broadly enforce authentication across the full API, add login, or validate JWTs.
+Milestone 56 broadens token-mode protection across selected read surfaces on top of the Milestone 50 through 55 foundation. It still does not broadly enforce authentication across the full API, add login, validate JWTs, or enforce tenant/resource ownership.
 
 ## Status
 
-- Current local runtime behavior: `dev` remains the default and still bypasses auth; `token` mode now enforces selected machine-facing and secret-management routes only.
+- Current local runtime behavior: `dev` remains the default and still bypasses auth; `token` mode now enforces selected machine-facing, broader read, MCP/AI, and secret-management routes only.
 - Current production suitability: not suitable for exposed production deployment without additional protection in front of the API.
 - Current runtime auth foundation: middleware installed with development-mode bypass, explicit disabled mode, or token principal resolution.
 - Current selected enforcement in `token` mode:
@@ -20,8 +20,21 @@ Milestone 52 closes the remaining known ingestion and connector-related token-mo
   - `/ingestion/connectors/{connector_id}/ingest` and `/ingest/http` require `ingestion:write`
   - `/integrations/smartsentinel/executors/*` register, poll, claim, and report require SmartSentinel executor scopes
   - `/integrations/smartsentinel/snapshots` requires `smartsentinel:ingest`
+  - `/mcp`, `/mcp/tools`, and `/mcp/tools/{tool_name}` require `mcp:tools`
+  - `/ai/context/entity/{entity_id}` requires `ai:context:read`
+  - `/provenance/search` requires `provenance:read`
+  - `/events` and `/events/{event_id}` require `events:read`
+  - `/raw-messages` and `/raw-messages/{raw_message_id}` require `raw-messages:read`
+  - `/entities`, `/entities/{entity_id}`, and `/entities/{entity_id}/context` require `entities:read`
+  - `/observations` requires `observations:read`
+  - `/commands` and `/commands/{command_id}` require `commands:read`
+  - `/actions`, `/actions/{action_id}`, and `/action-results` require `actions:read`
+  - `/rules` and `/rules/{rule_id}` require `rules:read`
+  - `/policies` requires `policies:read`
+  - `/entities/{entity_id}/capabilities` requires `capabilities:read`
+  - `/executors`, `/executors/{executor_id}`, `/executors/{executor_id}/capabilities`, and `/executors/{executor_id}/scopes` require `executors:read`
   - `/secrets/connectors*` requires `secrets:admin`
-- Unprotected in this milestone: the rest of the API surface, including entities, observations, generic commands, rules, MCP, and currently-open executor catalog/detail/capability/scope reads that do not yet have a dedicated read scope in the model.
+- Unprotected in this milestone: the rest of the API surface, including broad write paths for entities, observations, commands, actions, rules, policies, and capabilities, plus tenant/resource ownership enforcement across both read and write routes.
 
 ## Security Goals
 
@@ -205,8 +218,8 @@ Implemented handling in Milestone 49:
 Current limitations:
 
 - token issuance is foundational and not yet a full operator-hardening story
-- endpoint enforcement is still intentionally partial in Milestone 50
-- local bootstrap for token administration uses `AIONCORE_BOOTSTRAP_ADMIN_TOKEN`
+- endpoint enforcement is still intentionally partial
+- local bootstrap for token administration uses `AIONCORE_BOOTSTRAP_ADMIN_TOKEN`, which must be at least 24 characters long
 
 ### JWT Access Token
 
@@ -287,17 +300,24 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `ingestion:write`
 - `connectors:read`
 - `connectors:admin`
+- `events:read`
+- `raw-messages:read`
 - `secrets:admin`
 - `commands:read`
+- `actions:read`
 - `commands:create`
 - `commands:claim`
 - `commands:report`
+- `rules:read`
 - `rules:admin`
+- `policies:read`
+- `capabilities:read`
 - `mcp:tools`
 - `smartsentinel:ingest`
 - `adapters:register`
 - `adapters:heartbeat`
 - `executors:register`
+- `executors:read`
 - `executors:heartbeat`
 - `executors:poll`
 - `executors:claim`
@@ -315,11 +335,17 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `ingestion:write` protects both generic `/ingest/http` and connector-aware machine writes at `/ingestion/connectors/{connector_id}/ingest`.
 - `connectors:read` covers selected connector and worker operational reads without granting mutation.
 - `connectors:admin` covers connector lifecycle mutation, TTN device-mapping administration, worker reconciliation, TTN live validation preflight, validation-related operator actions, enable/disable, and configuration updates.
+- `events:read` covers `/events` list and detail reads without broadening command, observation, or provenance access.
+- `raw-messages:read` covers `/raw-messages` list and detail reads, which can expose raw payloads, ingestion headers, connector metadata, and provenance-linked evidence references.
 - `commands:read` covers command visibility through generic, executor, and AI-context read paths.
+- `actions:read` covers action and action-result inspection without granting command mutation or execution reporting rights.
 - `commands:create` covers command creation and approval-oriented write flows may later split into narrower scopes such as `commands:approve`.
+- `rules:read` covers generic rule inspection while `rules:admin` remains the future mutation scope.
+- `policies:read` covers policy inspection without granting policy mutation.
+- `capabilities:read` covers capability inspection without granting semantic graph mutation.
 - `commands:claim` and `executors:poll` separate execution workflow from broad command administration.
 - `adapters:register` and `adapters:heartbeat` keep adapter self-registration separate from broader operator APIs.
-- `executors:register`, `executors:heartbeat`, `executors:poll`, `executors:claim`, and `executors:report` separate executor lifecycle operations.
+- `executors:read`, `executors:register`, `executors:heartbeat`, `executors:poll`, `executors:claim`, and `executors:report` separate executor catalog inspection from executor lifecycle operations.
 - SmartSentinel executor bridge scopes are intentionally separate from generic executor scopes so bridge tokens can stay narrow.
 - `mcp:tools` should authorize local or production MCP tool invocation, not generic write access.
 - `auth:tokens:admin` covers token issuance, listing, inspection, and revocation.
@@ -448,18 +474,18 @@ The table below describes the intended future protection model. It does not chan
 | Endpoint group | Future principal types | Required scope(s) | Notes |
 | --- | --- | --- | --- |
 | `/entities` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `entities:read` for GET, `entities:write` for POST | Includes standard entity CRUD-style growth over time. |
-| `/relationships` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `entities:write` | Relationship mutation stays under semantic graph administration. |
+| `/relationships` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `entities:write`; future `relationships:read` if standalone read routes are added | The current API exposes relationship mutation only; standalone relationship read routes do not exist yet. |
 | `/observations` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` for GET, `observations:write` for POST | Direct write path should remain limited; most machine writers should prefer ingestion endpoints. |
-| `/raw-messages` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` | Sensitive because raw payloads and headers may include operational metadata. |
+| `/raw-messages` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `raw-messages:read` | Implemented in Milestone 55 for list and detail reads. Sensitive because raw payloads and headers may include operational metadata. |
 | `/ingest/http` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Primary generic ingestion write surface. |
 | `/ingestion/connectors` POST, PATCH, enable, disable, and `/ingestion/workers/reconcile` | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 51 for selected connector administration and worker reconciliation only. |
 | `/ingestion/connectors` selected GET routes, TTN device-mapping GET/list routes, and `/ingestion/workers/plan`, `/ingestion/workers/status` | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:read` | Implemented across Milestones 51 and 52 for selected connector and worker operational reads plus TTN mapping inspection. |
 | `/ingestion/connectors/{connector_id}/ttn-device-mappings` POST, PATCH, enable, disable, and DELETE | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 52 for TTN device-mapping administration. |
 | `/ingestion/connectors/{connector_id}/ingest` and `/ingest/http` | `ConnectorPrincipal`, `DevicePrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `ingestion:write` | Implemented across Milestones 51 and 52. |
 | `/secrets/connectors/*` | `UserPrincipal`, `AdminPrincipal` | `secrets:admin` | Implemented in Milestone 50. Highest sensitivity operator surface. |
-| `/commands/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:create` for creation and approval-like writes, `commands:claim` for claim/release flows, `commands:report` for execution result writes where applicable | Approval may later split into its own scope. |
-| `/actions/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:report` for POST | Action reporting is part of execution audit. |
-| `/executors` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:register` for POST | Implemented in Milestone 50 for `POST /executors` only. |
+| `/commands/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:create` for creation and approval-like writes, `commands:claim` for claim/release flows, `commands:report` for execution result writes where applicable | Implemented in Milestone 56 for generic list/detail GET routes only. Approval may later split into its own scope. |
+| `/actions/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `actions:read` for GET, `commands:report` for POST | Implemented in Milestone 56 for `/actions` list/detail and `/action-results` reads. Action reporting remains part of execution audit. |
+| `/executors` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:read` for GET, `executors:register` for POST | Implemented in Milestones 50 and 56 for registration plus selected inspection reads. |
 | `/executors/{executor_id}/heartbeat` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:heartbeat` | Implemented in Milestone 50. |
 | `/executors/{executor_id}/commands/pending` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:poll` | Implemented in Milestone 50. Existing executor capability and target-scope matching still applies. |
 | `/executors/{executor_id}/commands/{command_id}/claim` | `ExecutorPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `executors:claim` | Implemented in Milestone 50. Existing executor capability and target-scope matching still applies. |
@@ -472,12 +498,12 @@ The table below describes the intended future protection model. It does not chan
 | `/adapters` and `/adapters/{adapter_id}` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:register` for POST, `adapters:read` for GET | Implemented across Milestones 50, 51, and 52 for registration plus selected operational reads. |
 | `/adapters/{adapter_id}/heartbeat` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:heartbeat` | Implemented in Milestone 50. |
 | `/adapters/{adapter_id}/status` | `AdapterPrincipal`, `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `adapters:read` | Implemented in Milestone 51. |
-| `/mcp` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Production requires auth and Origin validation. |
-| `/mcp/tools` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Includes tool listing and invocation. |
-| `/ai/context/*` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `entities:read`, `observations:read`, and `commands:read` when command context is included | AI context is read-only but aggregates sensitive data. |
-| `/rules/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `rules:admin` | Rule evaluation can create commands and should remain restricted. |
-| `/events/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` or `commands:read` depending on event domain; first implementation can require both read families or a broader operator scope | Event data spans telemetry and control audit. |
-| `/provenance/search` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` and `commands:read` | Aggregates events, raw messages, and observations. |
+| `/mcp` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Implemented in Milestone 54 for the current minimal JSON-RPC compatibility endpoint. Production still requires Origin validation and stronger transport hardening. |
+| `/mcp/tools` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `mcp:tools` | Implemented in Milestone 54 for both listing and invocation. |
+| `/ai/context/*` | `UserPrincipal`, `ServicePrincipal`, `AdminPrincipal` | `ai:context:read` | Implemented in Milestone 54 for entity AI context reads. AI context is read-only but aggregates sensitive topology and operational data. |
+| `/rules/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `rules:read` for GET, `rules:admin` for mutation and evaluation-style administration | Implemented in Milestone 56 for list/detail GET routes only. |
+| `/events/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `events:read` | Implemented in Milestone 55 for list and detail reads. Event data spans telemetry, control audit, and provenance-linked operational history. |
+| `/provenance/search` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `provenance:read` | Implemented in Milestone 54. Aggregates events, raw messages, observations, and evidence-oriented metadata. |
 | `/health` | public or any principal | none in first auth implementation | Intended for liveness probes. Must not expose secrets. |
 | `/ready` | environment-dependent: private probe, `ServicePrincipal`, or public in dev | none in dev, authenticated in hardened production deployments when exposure is broader | Readiness reveals operational state and should usually stay private in production. |
 
@@ -491,6 +517,7 @@ The table below describes the intended future protection model. It does not chan
 - Startup logs and README must clearly warn that the API is unauthenticated.
 - Intended for localhost, tests, and integration prototyping.
 - MCP local tool layer may remain available for local development.
+- AI context and provenance search may remain easy to use in local development, but they are sensitive surfaces in production.
 - Secret values still must remain redacted even when auth is disabled.
 
 ### Explicit Disabled Mode
@@ -505,8 +532,37 @@ The table below describes the intended future protection model. It does not chan
 - Middleware attempts to resolve `Authorization: Bearer <token>` against stored API tokens.
 - Valid stored tokens attach tenant, principal type, principal ID, scopes, and token ID into the internal `AuthContext`.
 - If `AIONCORE_BOOTSTRAP_ADMIN_TOKEN` is set and the presented bearer token matches it exactly, AionCore resolves an in-memory admin principal with `auth:tokens:admin` and `admin:all`.
+- `AIONCORE_BOOTSTRAP_ADMIN_TOKEN` is intended only for local bootstrap and development. Remove it after creating real admin tokens, and do not expose it publicly.
 - Successful validation updates `last_used_at` and emits `aion:ApiTokenUsed`.
 - Invalid, expired, revoked, or malformed presented tokens resolve to an anonymous context and emit `aion:ApiTokenRejected`.
+- `GET /ready` reports token-mode diagnostics as `enforcement_level = partial`, not full, because only selected endpoint groups are protected in this milestone.
+- `GET /ready` reports `protected_endpoint_groups` as:
+  - `auth_tokens`
+  - `connector_secrets`
+  - `adapters`
+  - `executors`
+  - `smartsentinel_executor_bridge`
+  - `ingestion_connectors`
+  - `connector_workers`
+  - `connector_aware_ingestion`
+  - `generic_http_ingestion`
+  - `ttn_device_mappings`
+  - `ttn_live_validation`
+  - `smartsentinel_snapshot_ingestion`
+  - `mcp_tools`
+  - `ai_context`
+  - `provenance_search`
+  - `events`
+  - `raw_messages`
+  - `entities`
+  - `observations`
+  - `commands`
+  - `actions`
+  - `rules`
+  - `policies`
+  - `capabilities`
+  - `executors_read`
+- `GET /ready` reports only `bootstrap_admin_configured = true|false`; it never returns bootstrap token material.
 - Selected protected routes in this milestone return:
   - `401` for missing or invalid bearer tokens
   - `403` for valid authenticated principals missing the required scope
@@ -538,7 +594,6 @@ Implemented shape:
 - default to `dev` when unset
 - attach an internal `AuthContext` with `AuthMode`, `Principal`, and `PrincipalType`
 - report auth diagnostics in `/ready`
-- keep `auth.enforced = false` for all current modes
 - keep existing endpoints working in development mode without credentials
 
 ### Milestone 49
@@ -559,7 +614,59 @@ Protect remaining ingestion and connector-related operational gaps: generic `/in
 
 ### Milestone 53
 
-Protect MCP endpoints and add production Origin validation for browser-like clients and local-tool HTTP exposure.
+Harden auth readiness diagnostics and bootstrap-admin handling without broadening route protection.
+
+Implemented shape:
+
+- replace the old boolean readiness enforcement signal with `auth.enforcement_level`
+- report `none` for `dev` and `disabled`, and `partial` for the currently selected `token`-mode protections
+- expose the current protected endpoint groups explicitly through `/ready`
+- report only `bootstrap_admin_configured = true|false` in readiness
+- require `AIONCORE_BOOTSTRAP_ADMIN_TOKEN` to be at least 24 characters long
+- emit startup warnings that the bootstrap admin token is for local bootstrap/development only, should be removed after creating real admin tokens, and must not be exposed publicly
+
+### Milestone 54
+
+Protect MCP-style local tool surfaces, the minimal MCP JSON-RPC compatibility endpoint, AI context, and provenance search in `token` mode without changing dev/disabled behavior.
+
+Implemented shape:
+
+- require `mcp:tools` for `GET /mcp/tools`, `POST /mcp/tools/{tool_name}`, and `POST /mcp`
+- require `ai:context:read` for `GET /ai/context/entity/{entity_id}`
+- require `provenance:read` for `GET /provenance/search`
+- continue to satisfy all three scope checks with `admin:all`
+- extend `GET /ready` `protected_endpoint_groups` with `mcp_tools`, `ai_context`, and `provenance_search`
+- explicitly leave `/events*` and `/raw-messages*` open for a later milestone rather than widening this rollout
+
+### Milestone 55
+
+Protect event and raw-message operational reads in `token` mode without changing dev/disabled behavior or broadening to full API ownership enforcement.
+
+Implemented shape:
+
+- require `events:read` for `GET /events` and `GET /events/{event_id}`
+- require `raw-messages:read` for `GET /raw-messages` and `GET /raw-messages/{raw_message_id}`
+- continue to satisfy both scope checks with `admin:all`
+- keep `/provenance/search` on `provenance:read`
+- extend `GET /ready` `protected_endpoint_groups` with `events` and `raw_messages`
+
+### Milestone 56
+
+Protect broader generic read surfaces in `token` mode without changing dev/disabled behavior or introducing tenant/resource ownership enforcement.
+
+Implemented shape:
+
+- require `entities:read` for entity list, detail, and context reads
+- require `observations:read` for `/observations`
+- require `commands:read` for command list and detail reads
+- require `actions:read` for `/actions`, `/actions/{action_id}`, and `/action-results`
+- require `rules:read` for rule list and detail reads
+- require `policies:read` for `/policies`
+- require `capabilities:read` for `GET /entities/{entity_id}/capabilities`
+- require `executors:read` for executor catalog, detail, capability, and scope reads
+- continue to satisfy these scope checks with `admin:all`
+- extend `GET /ready` `protected_endpoint_groups` with `entities`, `observations`, `commands`, `actions`, `rules`, `policies`, `capabilities`, and `executors_read`
+- explicitly leave tenant/resource ownership enforcement and broad write-surface protection for later milestones
 
 ## Open Questions For Later Milestones
 
@@ -568,3 +675,4 @@ Protect MCP endpoints and add production Origin validation for browser-like clie
 - Whether `ready` should be fully authenticated in all production deployments or only kept network-private.
 - Whether device credentials should bind directly to entity IDs, connector IDs, or both.
 - Whether service-to-service auth should start with API tokens or skip directly to mTLS in distributed mode.
+- How and when tenant/resource ownership checks should be layered onto the newly protected read surfaces.

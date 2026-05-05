@@ -1,3 +1,14 @@
 /target/
 **/*.rs.bk
 .env
+@"
+
+# Rust build artifacts
+/target/
+/target_smoke/
+
+# Windows/debug artifacts
+*.pdb
+*.rlib
+*.exe
+"@ | Add-Content .gitignore

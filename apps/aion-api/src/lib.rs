@@ -78,6 +78,43 @@ impl AuthMode {
     }
 }
 
+const BOOTSTRAP_ADMIN_TOKEN_MIN_LENGTH: usize = 24;
+const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 25] = [
+    "auth_tokens",
+    "connector_secrets",
+    "adapters",
+    "executors",
+    "smartsentinel_executor_bridge",
+    "ingestion_connectors",
+    "connector_workers",
+    "connector_aware_ingestion",
+    "generic_http_ingestion",
+    "ttn_device_mappings",
+    "ttn_live_validation",
+    "smartsentinel_snapshot_ingestion",
+    "mcp_tools",
+    "ai_context",
+    "provenance_search",
+    "events",
+    "raw_messages",
+    "entities",
+    "observations",
+    "commands",
+    "actions",
+    "rules",
+    "policies",
+    "capabilities",
+    "executors_read",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthEnforcementLevel {
+    None,
+    Partial,
+    Full,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthConfig {
     pub mode: AuthMode,
@@ -117,11 +154,21 @@ impl AuthConfig {
             Some(other) => return Err(StartupError::unknown_auth_mode(other.to_string())),
         };
 
-        let bootstrap_admin_token_hash = bootstrap_admin_token
+        let bootstrap_admin_token = bootstrap_admin_token
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(hash_token_value);
+            .map(ToOwned::to_owned);
+
+        if let Some(token) = bootstrap_admin_token.as_deref() {
+            if token.len() < BOOTSTRAP_ADMIN_TOKEN_MIN_LENGTH {
+                return Err(StartupError::bootstrap_admin_token_too_short(
+                    BOOTSTRAP_ADMIN_TOKEN_MIN_LENGTH,
+                ));
+            }
+        }
+
+        let bootstrap_admin_token_hash = bootstrap_admin_token.as_deref().map(hash_token_value);
 
         Ok(Self {
             mode,
@@ -130,11 +177,29 @@ impl AuthConfig {
     }
 
     pub fn enforced(&self) -> bool {
-        false
+        !matches!(self.enforcement_level(), AuthEnforcementLevel::None)
     }
 
     pub fn dev_bypass(&self) -> bool {
         matches!(self.mode, AuthMode::Dev)
+    }
+
+    pub fn enforcement_level(&self) -> AuthEnforcementLevel {
+        match self.mode {
+            AuthMode::Dev | AuthMode::Disabled => AuthEnforcementLevel::None,
+            AuthMode::Token => AuthEnforcementLevel::Partial,
+        }
+    }
+
+    pub fn protected_endpoint_groups(&self) -> &'static [&'static str] {
+        match self.mode {
+            AuthMode::Token => &TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS,
+            AuthMode::Dev | AuthMode::Disabled => &[],
+        }
+    }
+
+    pub fn bootstrap_admin_configured(&self) -> bool {
+        self.bootstrap_admin_token_hash.is_some()
     }
 
     pub fn ensure_supported(&self) -> Result<(), StartupError> {
@@ -315,6 +380,12 @@ impl StartupError {
         ))
     }
 
+    fn bootstrap_admin_token_too_short(minimum_length: usize) -> Self {
+        Self::new(format!(
+            "AIONCORE_BOOTSTRAP_ADMIN_TOKEN must be at least {minimum_length} characters long"
+        ))
+    }
+
     fn backend_initialization(message: impl Into<String>) -> Self {
         Self::new(message)
     }
@@ -363,8 +434,9 @@ pub struct StartupDiagnostics {
     pub database_url_provided: bool,
     pub migrations_applied: Option<bool>,
     pub auth_mode: AuthMode,
-    pub auth_enforced: bool,
+    pub auth_enforcement_level: AuthEnforcementLevel,
     pub auth_dev_bypass: bool,
+    pub auth_bootstrap_admin_configured: bool,
 }
 
 impl AppState {
@@ -452,8 +524,9 @@ impl AppState {
                     database_url_provided: false,
                     migrations_applied: None,
                     auth_mode: auth.mode,
-                    auth_enforced: auth.enforced(),
+                    auth_enforcement_level: auth.enforcement_level(),
                     auth_dev_bypass: auth.dev_bypass(),
+                    auth_bootstrap_admin_configured: auth.bootstrap_admin_configured(),
                 },
             )),
             StorageBackendConfig::Postgres { database_url } => {
@@ -480,8 +553,9 @@ impl AppState {
                         database_url_provided: true,
                         migrations_applied: Some(true),
                         auth_mode: auth.mode,
-                        auth_enforced: auth.enforced(),
+                        auth_enforcement_level: auth.enforcement_level(),
                         auth_dev_bypass: auth.dev_bypass(),
+                        auth_bootstrap_admin_configured: auth.bootstrap_admin_configured(),
                     },
                 ))
             }
@@ -817,8 +891,10 @@ struct ReadyResponse {
 #[derive(Debug, Serialize)]
 struct ReadyAuthResponse {
     mode: &'static str,
-    enforced: bool,
     dev_bypass: bool,
+    enforcement_level: AuthEnforcementLevel,
+    protected_endpoint_groups: Vec<&'static str>,
+    bootstrap_admin_configured: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2264,8 +2340,10 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse
             storage: state.storage_backend.as_str(),
             auth: ReadyAuthResponse {
                 mode: state.auth.mode.as_str(),
-                enforced: state.auth.enforced(),
                 dev_bypass: state.auth.dev_bypass(),
+                enforcement_level: state.auth.enforcement_level(),
+                protected_endpoint_groups: state.auth.protected_endpoint_groups().to_vec(),
+                bootstrap_admin_configured: state.auth.bootstrap_admin_configured(),
             },
             mqtt,
             worker_plan,
@@ -2487,8 +2565,10 @@ fn is_generic_numeric_suffix(segment: &str) -> bool {
 
 async fn get_entity(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(entity_id): Path<Uuid>,
 ) -> Result<Json<Entity>, ApiError> {
+    require_scope(&state, &auth, "/entities/:entity_id", "entities:read")?;
     let entity = state
         .storage
         .get_entity(state.tenant_id, entity_id)?
@@ -2497,7 +2577,11 @@ async fn get_entity(
     Ok(Json(entity))
 }
 
-async fn list_entities(State(state): State<AppState>) -> Result<Json<Vec<Entity>>, ApiError> {
+async fn list_entities(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<Entity>>, ApiError> {
+    require_scope(&state, &auth, "/entities", "entities:read")?;
     Ok(Json(state.storage.list_entities(state.tenant_id)?))
 }
 
@@ -2558,8 +2642,15 @@ async fn get_payload_profile(
 
 async fn get_entity_context(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(entity_id): Path<Uuid>,
 ) -> Result<Json<EntityContextResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/entities/:entity_id/context",
+        "entities:read",
+    )?;
     let entity = state
         .storage
         .get_entity(state.tenant_id, entity_id)?
@@ -2583,9 +2674,16 @@ async fn get_entity_context(
 
 async fn get_ai_entity_context(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(entity_id): Path<Uuid>,
     Query(query): Query<AiContextQuery>,
 ) -> Result<Json<AiEntityContextResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/ai/context/entity/:entity_id",
+        "ai:context:read",
+    )?;
     Ok(Json(build_ai_entity_context(&state, entity_id, query)?))
 }
 
@@ -2747,18 +2845,24 @@ fn query_events_for_entity(
     Ok(events)
 }
 
-async fn list_mcp_tools() -> Json<Vec<ToolDefinition>> {
-    Json(mcp_tool_definitions())
+async fn list_mcp_tools(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<ToolDefinition>>, ApiError> {
+    require_scope(&state, &auth, "/mcp/tools", "mcp:tools")?;
+    Ok(Json(mcp_tool_definitions()))
 }
 
 async fn handle_mcp_json_rpc(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     body: Bytes,
-) -> (StatusCode, Json<Value>) {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_scope(&state, &auth, "/mcp", "mcp:tools")?;
     let request = match serde_json::from_slice::<Value>(&body) {
         Ok(request) => request,
         Err(error) => {
-            return (
+            return Ok((
                 StatusCode::OK,
                 Json(json_rpc_error(
                     Value::Null,
@@ -2766,14 +2870,14 @@ async fn handle_mcp_json_rpc(
                     format!("parse error: {error}"),
                     None,
                 )),
-            );
+            ));
         }
     };
 
     let object = match request.as_object() {
         Some(object) => object,
         None => {
-            return (
+            return Ok((
                 StatusCode::OK,
                 Json(json_rpc_error(
                     Value::Null,
@@ -2781,23 +2885,23 @@ async fn handle_mcp_json_rpc(
                     "invalid JSON-RPC request",
                     None,
                 )),
-            );
+            ));
         }
     };
 
     let id = object.get("id").cloned().unwrap_or(Value::Null);
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return (
+        return Ok((
             StatusCode::OK,
             Json(json_rpc_error(id, -32600, "jsonrpc must be \"2.0\"", None)),
-        );
+        ));
     }
 
     let Some(method) = object.get("method").and_then(Value::as_str) else {
-        return (
+        return Ok((
             StatusCode::OK,
             Json(json_rpc_error(id, -32600, "method is required", None)),
-        );
+        ));
     };
 
     let response = match method {
@@ -2843,23 +2947,25 @@ async fn handle_mcp_json_rpc(
         ),
     };
 
-    (StatusCode::OK, Json(response))
+    Ok((StatusCode::OK, Json(response)))
 }
 
 async fn invoke_mcp_tool(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(tool_name): Path<String>,
     Json(request): Json<ToolRequest>,
-) -> (StatusCode, Json<ToolResponse>) {
+) -> Result<(StatusCode, Json<ToolResponse>), ApiError> {
+    require_scope(&state, &auth, "/mcp/tools/:tool_name", "mcp:tools")?;
     match invoke_local_mcp_tool(&state, &tool_name, request.arguments) {
-        Ok(content) => (
+        Ok(content) => Ok((
             StatusCode::OK,
             Json(ToolResponse::success(tool_name, content)),
-        ),
-        Err(error) => (
+        )),
+        Err(error) => Ok((
             error.status,
             Json(ToolResponse::error(tool_name, error.code, error.message)),
-        ),
+        )),
     }
 }
 
@@ -3396,8 +3502,15 @@ async fn put_capabilities(
 
 async fn get_capabilities(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(entity_id): Path<Uuid>,
 ) -> Result<Json<Vec<Capability>>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/entities/:entity_id/capabilities",
+        "capabilities:read",
+    )?;
     ensure_entity_exists(&state, entity_id)?;
     Ok(Json(
         state
@@ -3437,8 +3550,10 @@ async fn put_policies(
 
 async fn query_policies(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(query): Query<PolicyQuery>,
 ) -> Result<Json<Vec<Policy>>, ApiError> {
+    require_scope(&state, &auth, "/policies", "policies:read")?;
     Ok(Json(state.storage.query_policies(
         state.tenant_id,
         query.target_entity_id,
@@ -3474,14 +3589,20 @@ async fn create_rule(
     Ok((StatusCode::CREATED, Json(state.storage.store_rule(rule)?)))
 }
 
-async fn list_rules(State(state): State<AppState>) -> Result<Json<Vec<Rule>>, ApiError> {
+async fn list_rules(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<Rule>>, ApiError> {
+    require_scope(&state, &auth, "/rules", "rules:read")?;
     Ok(Json(state.storage.list_rules(state.tenant_id)?))
 }
 
 async fn get_rule(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(rule_id): Path<Uuid>,
 ) -> Result<Json<Rule>, ApiError> {
+    require_scope(&state, &auth, "/rules/:rule_id", "rules:read")?;
     Ok(Json(
         state
             .storage
@@ -3572,14 +3693,18 @@ async fn create_executor(
 
 async fn list_executors(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<ExecutorAgent>>, ApiError> {
+    require_scope(&state, &auth, "/executors", "executors:read")?;
     Ok(Json(state.storage.list_executors(state.tenant_id)?))
 }
 
 async fn get_executor(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(executor_id): Path<Uuid>,
 ) -> Result<Json<ExecutorAgent>, ApiError> {
+    require_scope(&state, &auth, "/executors/:executor_id", "executors:read")?;
     Ok(Json(get_executor_agent(&state, executor_id)?))
 }
 
@@ -3643,8 +3768,15 @@ async fn put_executor_capabilities(
 
 async fn get_executor_capabilities(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(executor_id): Path<Uuid>,
 ) -> Result<Json<Vec<ExecutorCapability>>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/executors/:executor_id/capabilities",
+        "executors:read",
+    )?;
     ensure_executor_exists(&state, executor_id)?;
     Ok(Json(state.storage.list_executor_capabilities(
         state.tenant_id,
@@ -3684,8 +3816,15 @@ async fn put_executor_scopes(
 
 async fn get_executor_scopes(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(executor_id): Path<Uuid>,
 ) -> Result<Json<Vec<ExecutorScope>>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/executors/:executor_id/scopes",
+        "executors:read",
+    )?;
     ensure_executor_exists(&state, executor_id)?;
     Ok(Json(
         state
@@ -4600,8 +4739,10 @@ async fn reject_command(
 
 async fn get_command(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<Command>, ApiError> {
+    require_scope(&state, &auth, "/commands/:command_id", "commands:read")?;
     let command = state
         .storage
         .get_command(state.tenant_id, command_id)?
@@ -4612,8 +4753,10 @@ async fn get_command(
 
 async fn query_commands(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(query): Query<CommandQuery>,
 ) -> Result<Json<Vec<Command>>, ApiError> {
+    require_scope(&state, &auth, "/commands", "commands:read")?;
     Ok(Json(state.storage.query_commands(
         state.tenant_id,
         query.target_entity_id,
@@ -4648,8 +4791,10 @@ async fn create_action(
 
 async fn get_action(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(action_id): Path<Uuid>,
 ) -> Result<Json<Action>, ApiError> {
+    require_scope(&state, &auth, "/actions/:action_id", "actions:read")?;
     let action = state
         .storage
         .get_action(state.tenant_id, action_id)?
@@ -4660,8 +4805,10 @@ async fn get_action(
 
 async fn query_actions(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(query): Query<ActionQuery>,
 ) -> Result<Json<Vec<Action>>, ApiError> {
+    require_scope(&state, &auth, "/actions", "actions:read")?;
     Ok(Json(
         state
             .storage
@@ -4702,8 +4849,10 @@ async fn create_action_result(
 
 async fn query_action_results(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(query): Query<ActionResultQuery>,
 ) -> Result<Json<Vec<ActionResult>>, ApiError> {
+    require_scope(&state, &auth, "/action-results", "actions:read")?;
     Ok(Json(state.storage.query_action_results(
         state.tenant_id,
         query.action_id,
@@ -4761,8 +4910,10 @@ async fn create_event(
 
 async fn get_event(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(event_id): Path<Uuid>,
 ) -> Result<Json<Event>, ApiError> {
+    require_scope(&state, &auth, "/events/:event_id", "events:read")?;
     let event = state
         .storage
         .get_event(state.tenant_id, event_id)?
@@ -4773,8 +4924,10 @@ async fn get_event(
 
 async fn query_events(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
+    require_scope(&state, &auth, "/events", "events:read")?;
     let events = state.storage.query_events(
         state.tenant_id,
         EventFilter {
@@ -4826,8 +4979,10 @@ async fn create_observation(
 
 async fn query_observations(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(query): Query<ObservationQuery>,
 ) -> Result<Json<Vec<Observation>>, ApiError> {
+    require_scope(&state, &auth, "/observations", "observations:read")?;
     let observations = state.storage.query_observations(
         state.tenant_id,
         query.feature_of_interest_id,
@@ -4850,8 +5005,15 @@ async fn query_observations(
 
 async fn get_raw_message(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(raw_message_id): Path<Uuid>,
 ) -> Result<Json<RawMessageResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/raw-messages/:raw_message_id",
+        "raw-messages:read",
+    )?;
     let raw_message = state
         .storage
         .get_raw_message(state.tenant_id, raw_message_id)?
@@ -4862,8 +5024,10 @@ async fn get_raw_message(
 
 async fn query_raw_messages(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(query): Query<RawMessageQuery>,
 ) -> Result<Json<Vec<RawMessageResponse>>, ApiError> {
+    require_scope(&state, &auth, "/raw-messages", "raw-messages:read")?;
     let raw_messages = state
         .storage
         .list_raw_messages(state.tenant_id)?
@@ -4930,8 +5094,10 @@ async fn query_raw_messages(
 
 async fn search_provenance(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(query): Query<ProvenanceSearchQuery>,
 ) -> Result<Json<ProvenanceSearchResponse>, ApiError> {
+    require_scope(&state, &auth, "/provenance/search", "provenance:read")?;
     let limit = query.limit.unwrap_or(100).min(1000);
     let events = state
         .storage
@@ -11894,8 +12060,10 @@ mod tests {
         assert_eq!(body["ready"], true);
         assert_eq!(body["storage"], "memory");
         assert_eq!(body["auth"]["mode"], "dev");
-        assert_eq!(body["auth"]["enforced"], false);
         assert_eq!(body["auth"]["dev_bypass"], true);
+        assert_eq!(body["auth"]["enforcement_level"], "none");
+        assert_eq!(body["auth"]["protected_endpoint_groups"], json!([]));
+        assert_eq!(body["auth"]["bootstrap_admin_configured"], false);
         assert_eq!(body["mqtt"]["enabled"], false);
         assert_eq!(body["migrations_ready"], Value::Null);
     }
@@ -11925,8 +12093,100 @@ mod tests {
 
         let body = to_json(response).await;
         assert_eq!(body["auth"]["mode"], "disabled");
-        assert_eq!(body["auth"]["enforced"], false);
         assert_eq!(body["auth"]["dev_bypass"], false);
+        assert_eq!(body["auth"]["enforcement_level"], "none");
+        assert_eq!(body["auth"]["protected_endpoint_groups"], json!([]));
+        assert_eq!(body["auth"]["bootstrap_admin_configured"], false);
+    }
+
+    #[tokio::test]
+    async fn ready_reports_token_auth_mode_as_partial_enforcement() {
+        let state = AppState::with_backend_storage_and_auth(
+            Arc::new(InMemoryStorage::new()),
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Token,
+                bootstrap_admin_token_hash: None,
+            },
+            Uuid::nil(),
+        );
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_json(response).await;
+        assert_eq!(body["auth"]["mode"], "token");
+        assert_eq!(body["auth"]["dev_bypass"], false);
+        assert_eq!(body["auth"]["enforcement_level"], "partial");
+        assert_eq!(
+            body["auth"]["protected_endpoint_groups"],
+            json!([
+                "auth_tokens",
+                "connector_secrets",
+                "adapters",
+                "executors",
+                "smartsentinel_executor_bridge",
+                "ingestion_connectors",
+                "connector_workers",
+                "connector_aware_ingestion",
+                "generic_http_ingestion",
+                "ttn_device_mappings",
+                "ttn_live_validation",
+                "smartsentinel_snapshot_ingestion",
+                "mcp_tools",
+                "ai_context",
+                "provenance_search",
+                "events",
+                "raw_messages",
+                "entities",
+                "observations",
+                "commands",
+                "actions",
+                "rules",
+                "policies",
+                "capabilities",
+                "executors_read"
+            ])
+        );
+        assert_eq!(body["auth"]["bootstrap_admin_configured"], false);
+    }
+
+    #[tokio::test]
+    async fn ready_reports_bootstrap_admin_configured_without_exposing_token_value() {
+        let bootstrap_token = "bootstrap-admin-token-123456";
+        let state = AppState::with_backend_storage_and_auth(
+            Arc::new(InMemoryStorage::new()),
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Token,
+                bootstrap_admin_token_hash: Some(hash_token_value(bootstrap_token)),
+            },
+            Uuid::nil(),
+        );
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_json(response).await;
+        assert_eq!(body["auth"]["bootstrap_admin_configured"], true);
+        assert!(!body.to_string().contains(bootstrap_token));
+        assert!(body["auth"]["bootstrap_admin_token"].is_null());
     }
 
     #[tokio::test]
@@ -12162,7 +12422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_mode_requires_bearer_for_token_management_but_not_for_existing_endpoints() {
+    async fn token_mode_requires_bearer_for_token_management_and_keeps_open_writes_unchanged() {
         let state = AppState::with_backend_storage_and_auth(
             Arc::new(InMemoryStorage::new()),
             StorageBackendName::Memory,
@@ -12201,17 +12461,24 @@ mod tests {
             .unwrap();
         assert_eq!(create_token.status(), StatusCode::UNAUTHORIZED);
 
-        let entities = app
+        let create_entity = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/entities")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(json_request(
+                "POST",
+                "/entities",
+                json!({
+                    "entity_key": "token-open-write-01",
+                    "entity_type": "aion:Sensor",
+                    "jsonld": {
+                        "@context": {"aion": "https://aioncore.org/ns#"},
+                        "@id": "urn:aion:test:token-open-write-01",
+                        "@type": "aion:Sensor"
+                    }
+                }),
+            ))
             .await
             .unwrap();
-        assert_eq!(entities.status(), StatusCode::OK);
+        assert_eq!(create_entity.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -13273,15 +13540,553 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dev_mode_allows_mcp_tools_without_token() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/mcp/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_mcp_tools_without_token() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mcp/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_mcp_tools_without_required_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("mcp-reader-without-scope"),
+            &["entities:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request("GET", "/mcp/tools", &raw_token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_allows_mcp_tools_with_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("mcp-reader"),
+            &["mcp:tools"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request("GET", "/mcp/tools", &raw_token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_mcp_tool_invocation_with_mcp_tools_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("mcp-tool-invoker-without-scope"),
+            &["entities:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_json_request(
+                "POST",
+                "/mcp/tools/build_ai_context",
+                json!({
+                    "arguments": {
+                        "entity_id": Uuid::nil(),
+                        "include_observations": false,
+                        "include_events": false,
+                        "include_commands": false
+                    }
+                }),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_mcp_json_rpc_tools_list_with_mcp_tools_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let missing_scope_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("json-rpc-without-scope"),
+            &["entities:read"],
+        );
+        let allowed_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("json-rpc-with-scope"),
+            &["mcp:tools"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let denied = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/mcp",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                }),
+                &missing_scope_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let allowed = app
+            .oneshot(auth_json_request(
+                "POST",
+                "/mcp",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                }),
+                &allowed_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_ai_context_with_ai_context_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let entity_id = create_test_entity(&dev_app, "secured-ai-context-01", "aion:Pump").await;
+        let missing_scope_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("ai-context-without-scope"),
+            &["entities:read"],
+        );
+        let allowed_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("ai-context-reader"),
+            &["ai:context:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let denied = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/ai/context/entity/{entity_id}"),
+                &missing_scope_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let allowed = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/ai/context/entity/{entity_id}"),
+                &allowed_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_provenance_search_with_provenance_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let missing_scope_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("provenance-without-scope"),
+            &["events:read"],
+        );
+        let allowed_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("provenance-reader"),
+            &["provenance:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let denied = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                "/provenance/search?trace_id=trace-abc",
+                &missing_scope_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let allowed = app
+            .oneshot(auth_request(
+                "GET",
+                "/provenance/search?trace_id=trace-abc",
+                &allowed_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dev_mode_allows_events_without_token() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&app, "dev-events-pump-01", "aion:Pump").await;
+        create_test_event(&app, "aion:DevEvent", Some(&pump_id), json!({})).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_events_without_token() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_events_without_required_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("events-without-scope"),
+            &["entities:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request("GET", "/events", &raw_token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_allows_events_with_events_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&dev_app, "events-read-pump-01", "aion:Pump").await;
+        create_test_event(&dev_app, "aion:ScopedEvent", Some(&pump_id), json!({})).await;
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("events-reader"),
+            &["events:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request("GET", "/events", &raw_token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_allows_event_detail_with_events_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&dev_app, "events-detail-pump-01", "aion:Pump").await;
+        let event = create_test_event(
+            &dev_app,
+            "aion:ScopedEventDetail",
+            Some(&pump_id),
+            json!({}),
+        )
+        .await;
+        let event_id = event["id"].as_str().unwrap();
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("event-detail-reader"),
+            &["events:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/events/{event_id}"),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_raw_messages_without_token() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/raw-messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_raw_messages_without_required_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("raw-messages-without-scope"),
+            &["events:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request("GET", "/raw-messages", &raw_token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_allows_raw_messages_with_raw_messages_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&dev_app, "raw-read-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "raw-read-plot-01", "aion:Plot").await;
+        ingest_test_senml(&dev_app, &sensor_id, &plot_id).await;
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("raw-messages-reader"),
+            &["raw-messages:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request("GET", "/raw-messages", &raw_token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_allows_raw_message_detail_with_raw_messages_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&dev_app, "raw-detail-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "raw-detail-plot-01", "aion:Plot").await;
+        let ingest = ingest_test_senml(&dev_app, &sensor_id, &plot_id).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+        let raw_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("raw-message-detail-reader"),
+            &["raw-messages:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/raw-messages/{raw_message_id}"),
+                &raw_token,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_all_satisfies_events_and_raw_messages_scope_checks() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&dev_app, "admin-events-pump-01", "aion:Pump").await;
+        create_test_event(&dev_app, "aion:AdminScopedEvent", Some(&pump_id), json!({})).await;
+        let sensor_id = create_test_entity(&dev_app, "admin-raw-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "admin-raw-plot-01", "aion:Plot").await;
+        let ingest = ingest_test_senml(&dev_app, &sensor_id, &plot_id).await;
+        let raw_message_id = ingest["raw_message_id"].as_str().unwrap();
+        let admin_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Admin,
+            Some("admin-all-events-raw"),
+            &["admin:all"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let events = app
+            .clone()
+            .oneshot(auth_request("GET", "/events", &admin_token))
+            .await
+            .unwrap();
+        assert_eq!(events.status(), StatusCode::OK);
+
+        let raw_messages = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/raw-messages/{raw_message_id}"),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(raw_messages.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_all_satisfies_mcp_ai_context_and_provenance_scope_checks() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let entity_id = create_test_entity(&dev_app, "admin-all-context-01", "aion:Tank").await;
+        let admin_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Admin,
+            Some("admin-all"),
+            &["admin:all"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let mcp = app
+            .clone()
+            .oneshot(auth_request("GET", "/mcp/tools", &admin_token))
+            .await
+            .unwrap();
+        assert_eq!(mcp.status(), StatusCode::OK);
+
+        let ai_context = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/ai/context/entity/{entity_id}"),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ai_context.status(), StatusCode::OK);
+
+        let provenance = app
+            .oneshot(auth_request(
+                "GET",
+                "/provenance/search?trace_id=trace-admin",
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(provenance.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn selected_unprotected_endpoints_still_work_in_token_mode_without_token() {
         let storage = Arc::new(InMemoryStorage::new());
         let dev_app = dev_mode_app_with_storage(storage.clone());
         let app = token_mode_app_with_storage(storage);
-        let _sensor_id = create_test_entity(&dev_app, "token-open-sensor-01", "aion:Sensor").await;
-        let plot_id = create_test_entity(&dev_app, "token-open-plot-01", "aion:Plot").await;
-
-        let entities = app
+        let create_entity = app
             .clone()
+            .oneshot(json_request(
+                "POST",
+                "/entities",
+                json!({
+                    "entity_key": "token-still-open-write-01",
+                    "entity_type": "aion:Sensor",
+                    "jsonld": {
+                        "@context": {"aion": "https://aioncore.org/ns#"},
+                        "@id": "urn:aion:test:token-still-open-write-01",
+                        "@type": "aion:Sensor"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_entity.status(), StatusCode::CREATED);
+
+        let whoami = app
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/whoami")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(whoami.status(), StatusCode::OK);
+
+        let created = get_json(&dev_app, "/entities").await;
+        assert_eq!(created.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dev_mode_allows_entities_read_without_token() {
+        let app = app();
+        let response = app
             .oneshot(
                 Request::builder()
                     .uri("/entities")
@@ -13290,20 +14095,409 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(entities.status(), StatusCode::OK);
-        assert_eq!(to_json(entities).await.as_array().unwrap().len(), 2);
 
-        let observations = app
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_entities_read_without_token() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/observations?feature_of_interest_id={plot_id}"))
+                    .uri("/entities")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(observations.status(), StatusCode::OK);
-        assert!(to_json(observations).await.as_array().unwrap().is_empty());
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_entities_read_with_missing_scope_and_allows_entities_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        create_test_entity(&dev_app, "entities-read-sensor-01", "aion:Sensor").await;
+        let missing_scope_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("entities-missing-scope"),
+            &["observations:read"],
+        );
+        let entities_read_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("entities-reader"),
+            &["entities:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let rejected = app
+            .clone()
+            .oneshot(auth_request("GET", "/entities", &missing_scope_token))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let allowed = app
+            .oneshot(auth_request("GET", "/entities", &entities_read_token))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_entity_context_with_entities_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let entity_id = create_test_entity(&dev_app, "entity-context-auth-01", "aion:Tank").await;
+        let token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("entity-context-reader"),
+            &["entities:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/entities/{entity_id}/context"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_observations_read_with_observations_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&dev_app, "obs-auth-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "obs-auth-plot-01", "aion:Plot").await;
+        ingest_test_senml(&dev_app, &sensor_id, &plot_id).await;
+        let token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("observations-reader"),
+            &["observations:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/observations?feature_of_interest_id={plot_id}"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_commands_read_with_commands_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&dev_app, "commands-auth-pump-01", "aion:Pump").await;
+        create_test_command(&dev_app, &pump_id, "StartPump").await;
+        let token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("commands-reader"),
+            &["commands:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/commands?target_entity_id={pump_id}&status=pending"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_actions_read_with_actions_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&dev_app, "actions-auth-pump-01", "aion:Pump").await;
+        let command = create_test_command(&dev_app, &pump_id, "StartPump").await;
+        let command_id = command["id"].as_str().unwrap();
+        let action = dev_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/actions",
+                json!({
+                    "command_id": command_id,
+                    "action_type": "StartPump",
+                    "status": "completed",
+                    "started_at": "2026-05-05T12:00:00Z",
+                    "finished_at": "2026-05-05T12:01:00Z"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(action.status(), StatusCode::CREATED);
+        let action = to_json(action).await;
+        let action_id = action["id"].as_str().unwrap();
+        let result = dev_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/action-results",
+                json!({
+                    "command_id": command_id,
+                    "action_id": action_id,
+                    "status": "succeeded",
+                    "verified": true,
+                    "result_payload": {"ok": true},
+                    "observed_at": "2026-05-05T12:01:30Z"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::CREATED);
+        let token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("actions-reader"),
+            &["actions:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let actions = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/actions?command_id={command_id}"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(actions.status(), StatusCode::OK);
+
+        let action_results = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/action-results?command_id={command_id}"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(action_results.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_rules_read_with_rules_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let tank_id = create_test_entity(&dev_app, "rules-auth-tank-01", "aion:WaterTank").await;
+        let pump_id = create_test_entity(&dev_app, "rules-auth-pump-01", "aion:Pump").await;
+        create_low_water_command_rule(&dev_app, &tank_id, &pump_id, true, 20.0).await;
+        let token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("rules-reader"),
+            &["rules:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let response = app
+            .oneshot(auth_request("GET", "/rules", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_policies_and_capabilities_reads_with_dedicated_scopes() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&dev_app, "policy-auth-pump-01", "aion:Pump").await;
+        put_start_pump_policy(&dev_app, &pump_id, true).await;
+        let capabilities_response = dev_app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/entities/{pump_id}/capabilities"),
+                json!([
+                    {
+                        "capability_name": "pump:start",
+                        "command_type": "StartPump",
+                        "protocol": "http"
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(capabilities_response.status(), StatusCode::OK);
+        let policies_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("policies-reader"),
+            &["policies:read"],
+        );
+        let capabilities_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("capabilities-reader"),
+            &["capabilities:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let policies = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/policies?target_entity_id={pump_id}&command_type=StartPump"),
+                &policies_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(policies.status(), StatusCode::OK);
+
+        let capabilities = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/entities/{pump_id}/capabilities"),
+                &capabilities_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(capabilities.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_executor_inspection_reads_with_executors_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&dev_app, "executor-read-pump-01", "aion:Pump").await;
+        let executor = create_test_executor(&dev_app, "executor-read-01").await;
+        let executor_id = executor["id"].as_str().unwrap();
+        let capabilities = dev_app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/executors/{executor_id}/capabilities"),
+                json!([
+                    {
+                        "command_type": "StartPump",
+                        "protocol": "http"
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(capabilities.status(), StatusCode::OK);
+        let scopes = dev_app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/executors/{executor_id}/scopes"),
+                json!([
+                    {
+                        "target_entity_id": pump_id,
+                        "metadata": {"source": "test"}
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(scopes.status(), StatusCode::OK);
+        let token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("executors-reader"),
+            &["executors:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let list = app
+            .clone()
+            .oneshot(auth_request("GET", "/executors", &token))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+
+        let detail = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/executors/{executor_id}"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+
+        let capabilities = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/executors/{executor_id}/capabilities"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(capabilities.status(), StatusCode::OK);
+
+        let scopes = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/executors/{executor_id}/scopes"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(scopes.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_all_satisfies_new_read_scope_checks() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let pump_id = create_test_entity(&dev_app, "admin-all-read-pump-01", "aion:Pump").await;
+        let sensor_id =
+            create_test_entity(&dev_app, "admin-all-read-sensor-01", "aion:Sensor").await;
+        ingest_test_senml(&dev_app, &sensor_id, &pump_id).await;
+        create_test_command(&dev_app, &pump_id, "StartPump").await;
+        put_start_pump_policy(&dev_app, &pump_id, true).await;
+        let executor = create_test_executor(&dev_app, "admin-all-read-executor-01").await;
+        let executor_id = executor["id"].as_str().unwrap();
+        let admin_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Admin,
+            Some("admin-all-read"),
+            &["admin:all"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        for uri in [
+            "/entities".to_string(),
+            format!("/entities/{pump_id}/context"),
+            format!("/observations?feature_of_interest_id={pump_id}"),
+            format!("/commands?target_entity_id={pump_id}&status=pending"),
+            "/rules".to_string(),
+            format!("/policies?target_entity_id={pump_id}&command_type=StartPump"),
+            format!("/entities/{pump_id}/capabilities"),
+            "/executors".to_string(),
+            format!("/executors/{executor_id}/capabilities"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(auth_request("GET", &uri, &admin_token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "uri={uri}");
+        }
     }
 
     #[tokio::test]
@@ -14291,6 +15485,18 @@ mod tests {
         let error = AuthConfig::from_env_vars(Some("jwt".to_string()), None)
             .expect_err("unknown auth mode should fail");
         assert!(error.to_string().contains("unknown AIONCORE_AUTH_MODE"));
+    }
+
+    #[test]
+    fn auth_config_rejects_short_bootstrap_admin_token() {
+        let error = AuthConfig::from_env_vars(
+            Some("token".to_string()),
+            Some("short-bootstrap-token".to_string()),
+        )
+        .expect_err("short bootstrap token should fail");
+        assert!(error
+            .to_string()
+            .contains("AIONCORE_BOOTSTRAP_ADMIN_TOKEN must be at least 24 characters long"));
     }
 
     #[test]
