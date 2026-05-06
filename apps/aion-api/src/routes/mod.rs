@@ -2,6 +2,7 @@ pub(crate) mod adapters;
 pub(crate) mod ai;
 pub(crate) mod auth;
 pub(crate) mod commands;
+pub(crate) mod entities;
 pub(crate) mod events;
 pub(crate) mod executors;
 pub(crate) mod mcp;

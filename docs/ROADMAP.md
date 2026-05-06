@@ -35,10 +35,11 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 71 route modularization: `apps/aion-api/src/lib.rs` now extracts `GET /provenance/search` into `src/routes/provenance.rs`, preserving endpoint paths, auth semantics, tenant/resource ownership behavior, provenance/event/raw-message/observation filtering behavior, SmartSentinel provenance compatibility, response JSON shapes, count behavior, and the current no-evidence-fetching local-only query flow.
 - Milestone 72 route modularization: `apps/aion-api/src/lib.rs` now extracts the `/events*` and `/raw-messages*` HTTP surface into `src/routes/events.rs` and `src/routes/raw_messages.rs`, preserving endpoint paths, auth semantics, tenant/resource ownership behavior, event/raw-message filtering behavior, response JSON shapes, raw-message response shaping, and provenance-search compatibility through shared query-filter primitives in `src/query_filters.rs`.
 - Milestone 73 route modularization: `apps/aion-api/src/lib.rs` now extracts the `/observations` HTTP surface into `src/routes/observations.rs`, preserving endpoint paths, auth semantics, tenant/resource ownership behavior, direct observation creation behavior, rule-evaluation triggering, observation query filtering behavior, and JSON shapes ahead of later historical time-series API work.
+- Milestone 74 route modularization: `apps/aion-api/src/lib.rs` now extracts the entity-centered `/entities*` and `/relationships` HTTP surface into `src/routes/entities.rs`, preserving endpoint paths, auth semantics, tenant/resource ownership behavior, JSON-LD parsing, `entity_key` derivation, relationship behavior, capability behavior, payload-profile behavior, and JSON shapes before later historical query and dashboard-facing work.
 
 ## Next
 
-1. Continue incremental `aion-api` route extraction only where a route group or shared read/query surface still has enough remaining cohesion to justify a dedicated module after the observations split.
+1. Continue incremental `aion-api` route extraction only where a remaining route group or shared surface still has enough cohesion to justify a dedicated module after the entity-centered split.
 2. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
 3. Add historical observation/time-series query APIs without changing the existing `/observations` behavior.
 4. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
@@ -55,4 +56,4 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 
 - The roadmap is intentionally concise. Canonical details live in the individual model docs and ADRs.
 - Security hardening remains staged after the current selected write-surface rollout to avoid overreaching beyond verified behavior in one milestone.
-- `aion-api` modularization is intentionally incremental; Milestones 61 through 72 establish safe extraction patterns for later route-level and shared-surface splits.
+- `aion-api` modularization is intentionally incremental; Milestones 61 through 74 establish safe extraction patterns for later route-level and shared-surface splits.
