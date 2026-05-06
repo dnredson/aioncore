@@ -12,3 +12,7 @@
 *.rlib
 *.exe
 "@ | Add-Content .gitignore
+/target/
+/target_*/
+/target-*/
+/target_smoke/
