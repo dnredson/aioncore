@@ -24,10 +24,13 @@ use serde_json::{json, Value};
 use std::str::FromStr;
 use uuid::Uuid;
 
+const MAX_RELIABLE_BATCH_ITEMS: usize = 1_000;
+
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/ingest/http", post(ingest_http))
         .route("/ingest/reliable", post(ingest_reliable))
+        .route("/ingest/batch", post(ingest_batch))
         .route(
             "/ingestion/connectors/:connector_id/ingest",
             post(ingest_http_for_connector),
@@ -88,10 +91,69 @@ pub(crate) struct ReliableIngestResponse {
     pub received_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct BatchReliableIngestRequest {
+    pub batch_id: Option<String>,
+    pub sync_session_id: Option<String>,
+    pub source_system: Option<String>,
+    pub source_id: Option<String>,
+    pub connectivity_state: Option<String>,
+    pub continue_on_error: Option<bool>,
+    pub external_flow_id: Option<String>,
+    pub external_flow_name: Option<String>,
+    pub metadata: Option<Value>,
+    pub items: Vec<BatchReliableIngestItemRequest>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct BatchReliableIngestItemRequest {
+    pub producer_entity_id: Uuid,
+    pub feature_of_interest_id: Uuid,
+    pub protocol: Option<String>,
+    pub content_type: Option<String>,
+    pub mapping: Option<Value>,
+    #[serde(flatten)]
+    pub envelope: ReliableIngestionEnvelope,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BatchReliableIngestResponse {
+    pub batch_id: Option<String>,
+    pub sync_session_id: Option<String>,
+    pub source_system: Option<String>,
+    pub received_at: DateTime<Utc>,
+    pub total_items: usize,
+    pub accepted_count: usize,
+    pub duplicate_count: usize,
+    pub failed_count: usize,
+    pub observations_created: usize,
+    pub stopped_early: bool,
+    pub results: Vec<BatchReliableIngestItemResult>,
+    pub event_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BatchReliableIngestItemResult {
+    pub index: usize,
+    pub status: &'static str,
+    pub duplicate: bool,
+    pub idempotency_key: Option<String>,
+    pub raw_message_id: Option<Uuid>,
+    pub observations_created: usize,
+    pub error: Option<BatchReliableIngestItemError>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BatchReliableIngestItemError {
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 struct ReliableIngestionContext {
     source_ref: String,
     envelope: ReliableIngestionEnvelope,
+    extra_metadata: Value,
 }
 
 #[derive(Debug)]
@@ -272,6 +334,147 @@ async fn ingest_reliable(
     require_scope(&state, &auth, "/ingest/reliable", "ingestion:write")?;
     let tenant_id = principal_tenant_or_default(&state, &auth)?;
     let scoped_state = state_for_tenant(&state, tenant_id);
+    ingest_reliable_scoped(&scoped_state, request, "/ingest/reliable", json!({})).await
+}
+
+async fn ingest_batch(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<BatchReliableIngestRequest>,
+) -> Result<(StatusCode, Json<BatchReliableIngestResponse>), ApiError> {
+    require_scope(&state, &auth, "/ingest/batch", "batches:write")?;
+    if request.items.is_empty() {
+        return Err(ApiError::bad_request(
+            "batch items must not be empty for /ingest/batch",
+        ));
+    }
+    if request.items.len() > MAX_RELIABLE_BATCH_ITEMS {
+        return Err(ApiError::bad_request(format!(
+            "batch items must not exceed {MAX_RELIABLE_BATCH_ITEMS} for /ingest/batch"
+        )));
+    }
+
+    let tenant_id = principal_tenant_or_default(&state, &auth)?;
+    let scoped_state = state_for_tenant(&state, tenant_id);
+    let received_at = Utc::now();
+    let continue_on_error = request.continue_on_error.unwrap_or(true);
+    let total_items = request.items.len();
+    let mut accepted_count = 0usize;
+    let mut duplicate_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut observations_created = 0usize;
+    let mut stopped_early = false;
+    let mut results = Vec::with_capacity(total_items);
+
+    for (index, item) in request.items.iter().cloned().enumerate() {
+        let merged_request = merge_batch_item_request(&request, item);
+        let idempotency_key = merged_request.envelope.idempotency_key.clone();
+        let batch_metadata = batch_item_extra_metadata(&request);
+        match ingest_reliable_scoped(
+            &scoped_state,
+            merged_request,
+            "/ingest/batch",
+            batch_metadata,
+        )
+        .await
+        {
+            Ok((_, Json(response))) => {
+                if response.duplicate {
+                    duplicate_count += 1;
+                    results.push(BatchReliableIngestItemResult {
+                        index,
+                        status: "duplicate",
+                        duplicate: true,
+                        idempotency_key: response.idempotency_key,
+                        raw_message_id: Some(response.raw_message_id),
+                        observations_created: 0,
+                        error: None,
+                    });
+                } else {
+                    accepted_count += 1;
+                    observations_created += response.observations_created;
+                    results.push(BatchReliableIngestItemResult {
+                        index,
+                        status: "accepted",
+                        duplicate: false,
+                        idempotency_key: response.idempotency_key,
+                        raw_message_id: Some(response.raw_message_id),
+                        observations_created: response.observations_created,
+                        error: None,
+                    });
+                }
+            }
+            Err(error) => {
+                failed_count += 1;
+                results.push(BatchReliableIngestItemResult {
+                    index,
+                    status: "failed",
+                    duplicate: false,
+                    idempotency_key,
+                    raw_message_id: None,
+                    observations_created: 0,
+                    error: Some(BatchReliableIngestItemError {
+                        code: api_error_code(&error).to_string(),
+                        message: error.message.clone(),
+                    }),
+                });
+                if !continue_on_error {
+                    stopped_early = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let event_metadata = json!({
+        "batch_id": request.batch_id,
+        "sync_session_id": request.sync_session_id,
+        "source_system": request.source_system,
+        "source_id": request.source_id,
+        "total_items": total_items,
+        "accepted_count": accepted_count,
+        "duplicate_count": duplicate_count,
+        "failed_count": failed_count,
+        "observations_created": observations_created,
+        "stopped_early": stopped_early
+    });
+    let event = record_ingest_event_optional(
+        &scoped_state,
+        "aion:ReliableBatchIngested",
+        EventSeverity::Info,
+        None,
+        None,
+        None,
+        Some("Reliable batch ingestion processed".to_string()),
+        event_metadata,
+    )?;
+
+    Ok((
+        StatusCode::OK,
+        Json(BatchReliableIngestResponse {
+            batch_id: request.batch_id,
+            sync_session_id: request.sync_session_id,
+            source_system: request.source_system,
+            received_at,
+            total_items,
+            accepted_count,
+            duplicate_count,
+            failed_count,
+            observations_created,
+            stopped_early,
+            results,
+            event_id: Some(event.id),
+        }),
+    ))
+}
+
+async fn ingest_reliable_scoped(
+    state: &AppState,
+    request: ReliableHttpIngestRequest,
+    source_ref: &str,
+    extra_metadata: Value,
+) -> Result<(StatusCode, Json<ReliableIngestResponse>), ApiError> {
+    let tenant_id = state.tenant_id;
     let payload_format = request
         .envelope
         .payload_format
@@ -283,7 +486,7 @@ async fn ingest_reliable(
     let idempotency_key = request.envelope.idempotency_key.clone();
 
     if let Some(idempotency_key) = idempotency_key.as_deref() {
-        if let Some(existing) = scoped_state
+        if let Some(existing) = state
             .storage
             .find_raw_message_by_idempotency_key(tenant_id, idempotency_key)?
         {
@@ -305,7 +508,7 @@ async fn ingest_reliable(
     }
 
     let outcome = ingest_http_resolved(
-        &scoped_state,
+        state,
         HttpIngestRequest {
             producer_entity_id: request.producer_entity_id,
             feature_of_interest_id: request.feature_of_interest_id,
@@ -319,8 +522,9 @@ async fn ingest_reliable(
         None,
         None,
         Some(ReliableIngestionContext {
-            source_ref: "/ingest/reliable".to_string(),
+            source_ref: source_ref.to_string(),
             envelope: request.envelope,
+            extra_metadata,
         }),
     )
     .await?;
@@ -410,7 +614,7 @@ async fn ingest_http_resolved(
     }
     let reliable_metadata = reliable
         .as_ref()
-        .map(|reliable| reliable_metadata(&reliable.envelope))
+        .map(reliable_context_metadata)
         .unwrap_or_else(|| json!({}));
     merge_json_object(&mut headers, reliable_metadata.clone());
 
@@ -674,6 +878,12 @@ fn merge_metadata(mut base: Value, extra: Value) -> Value {
     base
 }
 
+fn reliable_context_metadata(reliable: &ReliableIngestionContext) -> Value {
+    let mut metadata = reliable_metadata(&reliable.envelope);
+    merge_json_object(&mut metadata, reliable.extra_metadata.clone());
+    metadata
+}
+
 fn reliable_metadata(envelope: &ReliableIngestionEnvelope) -> Value {
     let mut metadata = json!({});
     if let Some(object) = metadata.as_object_mut() {
@@ -756,6 +966,79 @@ fn reliable_metadata(envelope: &ReliableIngestionEnvelope) -> Value {
         }
     }
     metadata
+}
+
+fn merge_batch_item_request(
+    batch: &BatchReliableIngestRequest,
+    mut item: BatchReliableIngestItemRequest,
+) -> ReliableHttpIngestRequest {
+    item.envelope.source_system = item
+        .envelope
+        .source_system
+        .or_else(|| batch.source_system.clone());
+    item.envelope.source_id = item.envelope.source_id.or_else(|| batch.source_id.clone());
+    item.envelope.sync_session_id = item
+        .envelope
+        .sync_session_id
+        .or_else(|| batch.sync_session_id.clone());
+    item.envelope.connectivity_state = item
+        .envelope
+        .connectivity_state
+        .or_else(|| batch.connectivity_state.clone());
+    item.envelope.external_flow_id = item
+        .envelope
+        .external_flow_id
+        .or_else(|| batch.external_flow_id.clone());
+    item.envelope.external_flow_name = item
+        .envelope
+        .external_flow_name
+        .or_else(|| batch.external_flow_name.clone());
+    item.envelope.metadata =
+        merge_optional_json_metadata(batch.metadata.clone(), item.envelope.metadata);
+
+    ReliableHttpIngestRequest {
+        producer_entity_id: item.producer_entity_id,
+        feature_of_interest_id: item.feature_of_interest_id,
+        protocol: item.protocol,
+        content_type: item.content_type,
+        mapping: item.mapping,
+        envelope: item.envelope,
+    }
+}
+
+fn merge_optional_json_metadata(batch: Option<Value>, item: Option<Value>) -> Option<Value> {
+    match (batch, item) {
+        (None, None) => None,
+        (Some(batch), None) => Some(batch),
+        (None, Some(item)) => Some(item),
+        (Some(mut batch), Some(item)) => {
+            merge_json_object(&mut batch, item.clone());
+            if batch.is_object() {
+                Some(batch)
+            } else {
+                Some(item)
+            }
+        }
+    }
+}
+
+fn batch_item_extra_metadata(batch: &BatchReliableIngestRequest) -> Value {
+    let mut metadata = json!({});
+    if let Some(object) = metadata.as_object_mut() {
+        insert_optional_value(object, "external.batch_id", batch.batch_id.clone());
+    }
+    metadata
+}
+
+fn api_error_code(error: &ApiError) -> &'static str {
+    match error.status {
+        StatusCode::BAD_REQUEST => "bad_request",
+        StatusCode::UNAUTHORIZED => "unauthorized",
+        StatusCode::FORBIDDEN => "forbidden",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::CONFLICT => "conflict",
+        _ => "internal_error",
+    }
 }
 
 fn insert_optional_value(

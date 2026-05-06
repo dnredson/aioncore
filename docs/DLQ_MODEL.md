@@ -36,6 +36,8 @@ This milestone does not add:
 
 Milestone 85 now adds reliable-ingestion runtime idempotency handling for `POST /ingest/reliable`, but it still does not add automatic routing from ingestion failures into `DlqRecord`.
 
+Milestone 86 now adds `POST /ingest/batch` for reliable reconnect and backfill submission, but batch item failures still do not create `DlqRecord` automatically.
+
 ## Core Type
 
 `DlqRecord`
@@ -152,6 +154,7 @@ This DLQ foundation is intended to support later work such as:
 - automatic ingestion-to-DLQ routing
 - replay request queues and replay workers
 - batch and backfill sessions
+- batch-to-DLQ automatic failure handoff
 - dashboard DLQ inspection views
 - idempotency-aware reprocessing
 - external provenance drill-through for NiFi or MiNiFi

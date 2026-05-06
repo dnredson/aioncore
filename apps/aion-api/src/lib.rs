@@ -2318,6 +2318,7 @@ mod tests {
                 "connector_aware_ingestion",
                 "generic_http_ingestion",
                 "reliable_ingestion",
+                "batch_ingestion",
                 "ttn_device_mappings",
                 "ttn_live_validation",
                 "smartsentinel_snapshot_ingestion",
@@ -3652,6 +3653,621 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn batch_ingest_creates_multiple_items_and_reports_batch_event() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&app, "batch-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "batch-plot-01", "aion:Plot").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingest/batch",
+                json!({
+                    "batch_id": "batch-01",
+                    "sync_session_id": "sync-01",
+                    "source_system": "smartsentinel",
+                    "source_id": "edge-01",
+                    "connectivity_state": "reconnected_backfill",
+                    "metadata": {"transport": "store-and-forward"},
+                    "items": [
+                        {
+                            "producer_entity_id": sensor_id,
+                            "feature_of_interest_id": plot_id,
+                            "payload_format": "canonical-json",
+                            "idempotency_key": "tenant-a:batch-01",
+                            "payload": {
+                                "observations": [{
+                                    "observed_property": "aion:SoilMoisture",
+                                    "value": {"type": "number", "value": 19.2}
+                                }]
+                            }
+                        },
+                        {
+                            "producer_entity_id": sensor_id,
+                            "feature_of_interest_id": plot_id,
+                            "payload_format": "canonical-json",
+                            "idempotency_key": "tenant-a:batch-02",
+                            "payload": {
+                                "observations": [{
+                                    "observed_property": "aion:SoilTemperature",
+                                    "value": {"type": "number", "value": 25.4},
+                                    "unit": "Cel"
+                                }]
+                            }
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body["total_items"], 2);
+        assert_eq!(body["accepted_count"], 2);
+        assert_eq!(body["duplicate_count"], 0);
+        assert_eq!(body["failed_count"], 0);
+        assert_eq!(body["observations_created"], 2);
+        assert_eq!(body["stopped_early"], false);
+        assert!(body["event_id"].as_str().is_some());
+
+        let results = body["results"].as_array().unwrap();
+        let first_raw_id = results[0]["raw_message_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let second_raw_id = results[1]["raw_message_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let first_raw =
+            aion_storage::RawMessageStore::get_raw_message(&*storage, Uuid::nil(), first_raw_id)
+                .unwrap()
+                .unwrap();
+        let second_raw =
+            aion_storage::RawMessageStore::get_raw_message(&*storage, Uuid::nil(), second_raw_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(first_raw.headers["external.batch_id"], "batch-01");
+        assert_eq!(first_raw.headers["external.source_system"], "smartsentinel");
+        assert_eq!(first_raw.headers["external.sync_session_id"], "sync-01");
+        assert_eq!(
+            first_raw.headers["external.metadata"]["transport"],
+            "store-and-forward"
+        );
+        assert_eq!(second_raw.headers["external.batch_id"], "batch-01");
+
+        let observations = get_json(
+            &app,
+            &format!("/observations?feature_of_interest_id={plot_id}"),
+        )
+        .await;
+        assert_eq!(observations.as_array().unwrap().len(), 2);
+
+        let batch_events = get_json(&app, "/events?event_type=aion:ReliableBatchIngested").await;
+        let batch_event = batch_events.as_array().unwrap().last().unwrap();
+        assert_eq!(batch_event["metadata"]["batch_id"], "batch-01");
+        assert_eq!(batch_event["metadata"]["accepted_count"], 2);
+        assert_eq!(batch_event["metadata"]["observations_created"], 2);
+    }
+
+    #[tokio::test]
+    async fn batch_ingest_deduplicates_across_requests_and_within_batch() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&app, "batch-dedupe-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "batch-dedupe-plot-01", "aion:Plot").await;
+
+        let first_batch = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/ingest/batch",
+                    json!({
+                        "batch_id": "batch-dedupe-01",
+                        "items": [
+                            {
+                                "producer_entity_id": sensor_id,
+                                "feature_of_interest_id": plot_id,
+                                "payload_format": "canonical-json",
+                                "idempotency_key": "tenant-a:batch-dedupe-01",
+                                "payload": {
+                                    "observations": [{
+                                        "observed_property": "aion:SoilMoisture",
+                                        "value": {"type": "number", "value": 20.1}
+                                    }]
+                                }
+                            },
+                            {
+                                "producer_entity_id": sensor_id,
+                                "feature_of_interest_id": plot_id,
+                                "payload_format": "canonical-json",
+                                "idempotency_key": "tenant-a:batch-dedupe-01",
+                                "payload": {
+                                    "observations": [{
+                                        "observed_property": "aion:SoilMoisture",
+                                        "value": {"type": "number", "value": 20.1}
+                                    }]
+                                }
+                            }
+                        ]
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(first_batch["accepted_count"], 1);
+        assert_eq!(first_batch["duplicate_count"], 1);
+        assert_eq!(first_batch["results"][1]["duplicate"], true);
+
+        let second_batch = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/ingest/batch",
+                    json!({
+                        "batch_id": "batch-dedupe-02",
+                        "items": [{
+                            "producer_entity_id": sensor_id,
+                            "feature_of_interest_id": plot_id,
+                            "payload_format": "canonical-json",
+                            "idempotency_key": "tenant-a:batch-dedupe-01",
+                            "payload": {
+                                "observations": [{
+                                    "observed_property": "aion:SoilMoisture",
+                                    "value": {"type": "number", "value": 20.1}
+                                }]
+                            }
+                        }]
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(second_batch["accepted_count"], 0);
+        assert_eq!(second_batch["duplicate_count"], 1);
+        assert_eq!(second_batch["results"][0]["duplicate"], true);
+
+        let observations = get_json(
+            &app,
+            &format!("/observations?feature_of_interest_id={plot_id}"),
+        )
+        .await;
+        assert_eq!(observations.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_ingest_tenant_scoped_idempotency_and_missing_key_behavior_are_preserved() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let sensor_a =
+            create_test_entity(&tenant_a_app, "batch-tenant-a-sensor", "aion:Sensor").await;
+        let plot_a = create_test_entity(&tenant_a_app, "batch-tenant-a-plot", "aion:Plot").await;
+        let sensor_b =
+            create_test_entity(&tenant_b_app, "batch-tenant-b-sensor", "aion:Sensor").await;
+        let plot_b = create_test_entity(&tenant_b_app, "batch-tenant-b-plot", "aion:Plot").await;
+        let token_a = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("batch-tenant-a"),
+            &["batches:write"],
+        );
+        let token_b = store_api_token_for_tenant(
+            &storage,
+            tenant_b,
+            ApiTokenPrincipalType::Service,
+            Some("batch-tenant-b"),
+            &["batches:write"],
+        );
+
+        let create_a = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_json_request(
+                    "POST",
+                    "/ingest/batch",
+                    json!({
+                        "items": [{
+                            "producer_entity_id": sensor_a,
+                            "feature_of_interest_id": plot_a,
+                            "payload_format": "canonical-json",
+                            "idempotency_key": "shared-batch-key-01",
+                            "payload": {
+                                "observations": [{
+                                    "observed_property": "aion:SoilMoisture",
+                                    "value": {"type": "number", "value": 10.0}
+                                }]
+                            }
+                        }]
+                    }),
+                    &token_a,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let create_b = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_json_request(
+                    "POST",
+                    "/ingest/batch",
+                    json!({
+                        "items": [{
+                            "producer_entity_id": sensor_b,
+                            "feature_of_interest_id": plot_b,
+                            "payload_format": "canonical-json",
+                            "idempotency_key": "shared-batch-key-01",
+                            "payload": {
+                                "observations": [{
+                                    "observed_property": "aion:SoilMoisture",
+                                    "value": {"type": "number", "value": 30.0}
+                                }]
+                            }
+                        }]
+                    }),
+                    &token_b,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(create_a["duplicate_count"], 0);
+        assert_eq!(create_b["duplicate_count"], 0);
+        assert_ne!(
+            create_a["results"][0]["raw_message_id"],
+            create_b["results"][0]["raw_message_id"]
+        );
+
+        let no_key_batch = to_json(
+            tenant_a_app
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/ingest/batch",
+                    json!({
+                        "items": [
+                            {
+                                "producer_entity_id": sensor_a,
+                                "feature_of_interest_id": plot_a,
+                                "payload_format": "canonical-json",
+                                "payload": {
+                                    "observations": [{
+                                        "observed_property": "aion:SoilTemperature",
+                                        "value": {"type": "number", "value": 21.0}
+                                    }]
+                                }
+                            },
+                            {
+                                "producer_entity_id": sensor_a,
+                                "feature_of_interest_id": plot_a,
+                                "payload_format": "canonical-json",
+                                "payload": {
+                                    "observations": [{
+                                        "observed_property": "aion:SoilTemperature",
+                                        "value": {"type": "number", "value": 22.0}
+                                    }]
+                                }
+                            }
+                        ]
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(no_key_batch["accepted_count"], 2);
+        assert_eq!(no_key_batch["duplicate_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn batch_ingest_validates_limits_and_continue_on_error_modes() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&app, "batch-limit-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "batch-limit-plot-01", "aion:Plot").await;
+
+        let empty = app
+            .clone()
+            .oneshot(json_request("POST", "/ingest/batch", json!({"items": []})))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        let items = (0..1_001)
+            .map(|index| {
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "canonical-json",
+                    "idempotency_key": format!("tenant-a:overflow-{index}"),
+                    "payload": {
+                        "observations": [{
+                            "observed_property": "aion:SoilMoisture",
+                            "value": {"type": "number", "value": index}
+                        }]
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let overflow = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingest/batch",
+                json!({"items": items}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(overflow.status(), StatusCode::BAD_REQUEST);
+
+        let continue_true = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/ingest/batch",
+                    json!({
+                        "continue_on_error": true,
+                        "items": [
+                            {
+                                "producer_entity_id": sensor_id,
+                                "feature_of_interest_id": plot_id,
+                                "payload_format": "senml-json",
+                                "idempotency_key": "tenant-a:continue-fail",
+                                "payload": "not json"
+                            },
+                            {
+                                "producer_entity_id": sensor_id,
+                                "feature_of_interest_id": plot_id,
+                                "payload_format": "canonical-json",
+                                "idempotency_key": "tenant-a:continue-ok",
+                                "payload": {
+                                    "observations": [{
+                                        "observed_property": "aion:SoilMoisture",
+                                        "value": {"type": "number", "value": 55.0}
+                                    }]
+                                }
+                            }
+                        ]
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(continue_true["accepted_count"], 1);
+        assert_eq!(continue_true["failed_count"], 1);
+        assert_eq!(continue_true["stopped_early"], false);
+        assert_eq!(continue_true["results"][0]["status"], "failed");
+        assert_eq!(continue_true["results"][1]["status"], "accepted");
+
+        let continue_false = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/ingest/batch",
+                    json!({
+                        "continue_on_error": false,
+                        "items": [
+                            {
+                                "producer_entity_id": sensor_id,
+                                "feature_of_interest_id": plot_id,
+                                "payload_format": "senml-json",
+                                "idempotency_key": "tenant-a:stop-fail",
+                                "payload": "not json"
+                            },
+                            {
+                                "producer_entity_id": sensor_id,
+                                "feature_of_interest_id": plot_id,
+                                "payload_format": "canonical-json",
+                                "idempotency_key": "tenant-a:stop-ok",
+                                "payload": {
+                                    "observations": [{
+                                        "observed_property": "aion:SoilMoisture",
+                                        "value": {"type": "number", "value": 99.0}
+                                    }]
+                                }
+                            }
+                        ]
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(continue_false["accepted_count"], 0);
+        assert_eq!(continue_false["failed_count"], 1);
+        assert_eq!(continue_false["stopped_early"], true);
+        assert_eq!(continue_false["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_ingest_inherits_and_overrides_batch_level_provenance() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&app, "batch-prov-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "batch-prov-plot-01", "aion:Plot").await;
+
+        let body = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/ingest/batch",
+                    json!({
+                        "batch_id": "batch-prov-01",
+                        "sync_session_id": "sync-prov-01",
+                        "source_system": "minifi",
+                        "source_id": "edge-default",
+                        "connectivity_state": "reconnected_backfill",
+                        "external_flow_id": "flow-default",
+                        "external_flow_name": "Default Flow",
+                        "metadata": {
+                            "shared": "batch",
+                            "batch_only": true
+                        },
+                        "items": [
+                            {
+                                "producer_entity_id": sensor_id,
+                                "feature_of_interest_id": plot_id,
+                                "payload_format": "canonical-json",
+                                "idempotency_key": "tenant-a:prov-01",
+                                "payload": {
+                                    "observations": [{
+                                        "observed_property": "aion:SoilMoisture",
+                                        "value": {"type": "number", "value": 1.0}
+                                    }]
+                                }
+                            },
+                            {
+                                "producer_entity_id": sensor_id,
+                                "feature_of_interest_id": plot_id,
+                                "payload_format": "canonical-json",
+                                "idempotency_key": "tenant-a:prov-02",
+                                "source_system": "smartsentinel",
+                                "source_id": "edge-override",
+                                "connectivity_state": "replayed_after_outage",
+                                "external_flow_id": "flow-override",
+                                "external_flow_name": "Override Flow",
+                                "metadata": {
+                                    "shared": "item",
+                                    "item_only": true
+                                },
+                                "payload": {
+                                    "observations": [{
+                                        "observed_property": "aion:SoilTemperature",
+                                        "value": {"type": "number", "value": 2.0}
+                                    }]
+                                }
+                            }
+                        ]
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let first_raw_id = body["results"][0]["raw_message_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let second_raw_id = body["results"][1]["raw_message_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let first_raw =
+            aion_storage::RawMessageStore::get_raw_message(&*storage, Uuid::nil(), first_raw_id)
+                .unwrap()
+                .unwrap();
+        let second_raw =
+            aion_storage::RawMessageStore::get_raw_message(&*storage, Uuid::nil(), second_raw_id)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(first_raw.headers["external.source_system"], "minifi");
+        assert_eq!(first_raw.headers["external.source_id"], "edge-default");
+        assert_eq!(
+            first_raw.headers["external.connectivity_state"],
+            "reconnected_backfill"
+        );
+        assert_eq!(first_raw.headers["external.flow_id"], "flow-default");
+        assert_eq!(first_raw.headers["external.flow_name"], "Default Flow");
+        assert_eq!(first_raw.headers["external.metadata"]["shared"], "batch");
+        assert_eq!(first_raw.headers["external.metadata"]["batch_only"], true);
+
+        assert_eq!(
+            second_raw.headers["external.source_system"],
+            "smartsentinel"
+        );
+        assert_eq!(second_raw.headers["external.source_id"], "edge-override");
+        assert_eq!(
+            second_raw.headers["external.connectivity_state"],
+            "replayed_after_outage"
+        );
+        assert_eq!(second_raw.headers["external.flow_id"], "flow-override");
+        assert_eq!(second_raw.headers["external.flow_name"], "Override Flow");
+        assert_eq!(second_raw.headers["external.metadata"]["shared"], "item");
+        assert_eq!(second_raw.headers["external.metadata"]["batch_only"], true);
+        assert_eq!(second_raw.headers["external.metadata"]["item_only"], true);
+    }
+
+    #[tokio::test]
+    async fn batch_ingest_auth_respects_batch_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&dev_app, "batch-auth-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "batch-auth-plot-01", "aion:Plot").await;
+        let body = json!({
+            "items": [{
+                "producer_entity_id": sensor_id,
+                "feature_of_interest_id": plot_id,
+                "payload_format": "canonical-json",
+                "idempotency_key": "tenant-a:batch-auth-01",
+                "payload": {
+                    "observations": [{
+                        "observed_property": "aion:SoilMoisture",
+                        "value": {"type": "number", "value": 11.2}
+                    }]
+                }
+            }]
+        });
+
+        let missing_token = token_app
+            .clone()
+            .oneshot(json_request("POST", "/ingest/batch", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_scope = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/ingest/batch",
+                body.clone(),
+                &store_api_token(
+                    &storage,
+                    ApiTokenPrincipalType::Service,
+                    Some("batch-ingest-reader"),
+                    &["ingestion:write"],
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+        let allowed = token_app
+            .oneshot(auth_json_request(
+                "POST",
+                "/ingest/batch",
+                body,
+                &store_api_token(
+                    &storage,
+                    ApiTokenPrincipalType::Service,
+                    Some("batch-ingest-writer"),
+                    &["batches:write"],
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 
     #[tokio::test]

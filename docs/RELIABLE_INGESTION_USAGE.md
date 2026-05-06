@@ -1,8 +1,8 @@
 # Reliable Ingestion Usage
 
-This guide covers Milestone 85: the reliable ingestion envelope and tenant-scoped idempotency-key foundation.
+This guide covers Milestones 85 and 86: the reliable ingestion envelope, tenant-scoped idempotency-key foundation, and the batch/backfill ingestion API foundation.
 
-For the model background, also see [Ingestion Model](INGESTION_MODEL.md), [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md), [DLQ Model](DLQ_MODEL.md), and [Security Model](SECURITY_MODEL.md).
+For the model background, also see [Ingestion Model](INGESTION_MODEL.md), [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md), [Batch Ingestion Usage](BATCH_INGESTION_USAGE.md), [DLQ Model](DLQ_MODEL.md), and [Security Model](SECURITY_MODEL.md).
 
 ## Endpoint
 
@@ -11,6 +11,12 @@ POST /ingest/reliable
 ```
 
 This endpoint is additive. Existing `POST /ingest/http` behavior is unchanged.
+
+For multi-item reconnect or backfill submissions, use:
+
+```text
+POST /ingest/batch
+```
 
 ## Current Request Shape
 
@@ -190,8 +196,8 @@ In `AIONCORE_AUTH_MODE=token`:
 
 ## Current Limitations
 
-- no batch ingestion API yet
-- no backfill session API yet
+- no batch session table yet
+- no backfill session persistence beyond raw-message and event metadata
 - no replay execution yet
 - no automatic DLQ routing yet
 - no connector-aware reliable ingestion endpoint yet

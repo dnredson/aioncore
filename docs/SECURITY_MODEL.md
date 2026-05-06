@@ -401,7 +401,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - SmartSentinel executor bridge scopes are intentionally separate from generic executor scopes so bridge tokens can stay narrow.
 - `mcp:tools` should authorize local or production MCP tool invocation, not generic write access.
 - `dlq:write` covers DLQ record creation and status updates by trusted machine clients or operators.
-- `batches:write` is reserved for future machine writers that create batch or backfill session records.
+- `batches:write` covers `POST /ingest/batch` for trusted machine writers that submit reconnect or backfill batches.
 - `auth:tokens:admin` covers token issuance, listing, inspection, and revocation.
 - `admin:all` is a reserved break-glass scope and satisfies any route scope check.
 
@@ -422,7 +422,7 @@ User and admin APIs should eventually support API tokens first, with JWT or OAut
 
 Devices, adapters, executors, connectors, and bridges should use dedicated machine credentials rather than user tokens reused across automation.
 
-External reliable flow engines such as NiFi or MiNiFi should also authenticate as dedicated machine principals. The likely minimum future scope for runtime delivery is `ingestion:write`. Read-only operational integrations may also need `flows:read`, `dashboard:read`, or `dlq:read`. Reliable-ingestion integrations can now use dedicated `dlq:write` and `dlq:read` scopes, while `batches:write` remains future work.
+External reliable flow engines such as NiFi or MiNiFi should also authenticate as dedicated machine principals. Current runtime delivery scopes are `ingestion:write` for `POST /ingest/reliable` and `batches:write` for `POST /ingest/batch`. Read-only operational integrations may also need `flows:read`, `dashboard:read`, or `dlq:read`. Reliable-ingestion integrations can now use dedicated `dlq:write`, `dlq:read`, and `batches:write` scopes without requiring broad operator tokens.
 
 ### Secret Storage For API Credentials
 
@@ -541,7 +541,8 @@ The table below describes the intended future protection model. It does not chan
 | `/ingestion/connectors` POST, PATCH, enable, disable, and `/ingestion/workers/reconcile` | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 51 for selected connector administration and worker reconciliation only. |
 | `/ingestion/connectors` selected GET routes, TTN device-mapping GET/list routes, and `/ingestion/workers/plan`, `/ingestion/workers/status` | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:read` | Implemented across Milestones 51 and 52 for selected connector and worker operational reads plus TTN mapping inspection. |
 | `/ingestion/connectors/{connector_id}/ttn-device-mappings` POST, PATCH, enable, disable, and DELETE | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 52 for TTN device-mapping administration. |
-| `/ingestion/connectors/{connector_id}/ingest`, `/ingest/http`, and `/ingest/reliable` | `ConnectorPrincipal`, `DevicePrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `ingestion:write` | Reliable generic HTTP ingestion is now implemented in Milestone 85; connector-aware reliable ingestion remains future work. |
+| `/ingestion/connectors/{connector_id}/ingest`, `/ingest/http`, and `/ingest/reliable` | `ConnectorPrincipal`, `DevicePrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `ingestion:write` | Reliable generic HTTP ingestion is implemented; connector-aware reliable ingestion remains future work. |
+| `/ingest/batch` | `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `batches:write` | Batch/backfill reliable ingestion is intended for trusted machine reconnect and store-and-forward flows; item writes remain tenant-scoped and `admin:all` satisfies the scope. |
 | `/secrets/connectors/*` | `UserPrincipal`, `AdminPrincipal` | `secrets:admin` | Implemented in Milestone 50. Highest sensitivity operator surface. |
 | `/commands/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:create` for creation, `commands:approve` for approve/reject, `commands:write` for selected lifecycle writes, `commands:claim` for generic claim, `commands:lease` for selected lease writes | Selected generic write authorization now applies in Milestone 60. Executor-specific flows still use executor scopes. |
 | `/actions/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `actions:read` for GET, `actions:write` for selected POST routes | Selected generic write authorization now applies in Milestone 60. |

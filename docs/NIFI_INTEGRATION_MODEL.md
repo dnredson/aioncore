@@ -120,7 +120,9 @@ AionCore should preserve enough metadata to interoperate with future AionCore fe
 - DLQ handoff metadata
 - backfill session markers
 
-Milestone 85 now implements the first generic HTTP runtime adoption of this contract through `POST /ingest/reliable`, while still deferring runtime DLQ routing, replay execution, and batch ingestion logic.
+Milestone 85 implements the first generic HTTP runtime adoption of this contract through `POST /ingest/reliable`.
+
+Milestone 86 extends that runtime adoption with `POST /ingest/batch` for reconnect and backfill submissions that contain multiple reliable envelopes, while still deferring runtime DLQ routing and replay execution.
 
 ## SmartSentinel And Store-And-Forward
 
@@ -331,6 +333,8 @@ Future batch or backfill session records:
 
 - should use `external.sync_session_id`, `external.idempotency_key`, and replay counters consistently
 
+Milestone 86 does not add a persistent batch session table yet. The current runtime preserves batch identifiers in raw-message and event metadata instead.
+
 ## Trust And Validation Notes
 
 - External provenance is evidence, not proof.
@@ -348,5 +352,12 @@ Milestones 83 through 85 now provide:
 - a typed `ReliableIngestionEnvelope`
 - generic `POST /ingest/reliable` runtime handling
 - tenant-scoped idempotency-key lookup and duplicate responses
+
+Milestone 86 now also provides:
+
+- generic `POST /ingest/batch` runtime handling for multiple reliable items
+- batch-level provenance inheritance for items when item fields are absent
+- per-item duplicate and failure reporting for reconnect/backfill submissions
+- `aion:ReliableBatchIngested` batch-level audit events
 
 The current runtime preserves the documented provenance contract in `RawMessage.headers` and `Event.metadata` and keeps existing `POST /ingest/http` behavior unchanged.

@@ -21,6 +21,7 @@ Current HTTP endpoint:
 ```text
 POST /ingest/http
 POST /ingest/reliable
+POST /ingest/batch
 ```
 
 HTTP ingestion accepts a producer entity, a feature of interest, a payload format, and the payload itself. The current runtime stores the raw message, selects the decoder, produces canonical observations, and then updates raw-message status.
@@ -34,6 +35,17 @@ Reliable HTTP ingestion is additive:
 - it applies tenant-scoped idempotency-key lookup when `idempotency_key` is present
 - it returns `duplicate = true` with the existing `raw_message_id` instead of creating duplicate raw messages or observations
 - it does not change existing `POST /ingest/http` behavior
+
+Batch reliable ingestion is also additive:
+
+- `POST /ingest/batch` accepts multiple reliable-ingestion items in one request
+- items are processed sequentially and independently
+- item results are returned individually as `accepted`, `duplicate`, or `failed`
+- batch-level provenance such as `source_system`, `source_id`, `sync_session_id`, `connectivity_state`, `external_flow_id`, `external_flow_name`, and `metadata` can be inherited by items when item fields are absent
+- tenant-scoped idempotency applies per item and remains isolated across tenants
+- `continue_on_error` defaults to `true`; when `false`, processing stops after the first failed item
+- the runtime does not create a global transaction for the full batch
+- the runtime emits `aion:ReliableBatchIngested` as a batch-level audit event
 
 HTTP payload formats supported by the local runtime:
 
@@ -66,6 +78,21 @@ Receive reliable envelope
   -> decode payload
   -> write canonical observations
   -> preserve external.* provenance metadata on raw message and event records
+```
+
+Batch reliable HTTP flow adds:
+
+```text
+Receive reliable batch
+  -> validate item count and batch shape
+  -> resolve authenticated tenant
+  -> for each item in order:
+       -> inherit batch-level provenance when item fields are absent
+       -> resolve tenant-scoped idempotency key when present
+       -> if duplicate: return existing raw_message_id with duplicate=true for that item
+       -> otherwise store raw message first, decode, normalize, and emit existing item-level events
+  -> optionally stop early on first failure when continue_on_error=false
+  -> emit aion:ReliableBatchIngested batch-level audit event
 ```
 
 ## Ingestion Connector Registry

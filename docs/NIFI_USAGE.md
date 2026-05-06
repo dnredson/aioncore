@@ -8,6 +8,7 @@ This guide shows how to use the Milestone 83 NiFi/MiNiFi integration contract wi
 - a recommended envelope shape for reliable upstream producers
 - consistent provenance metadata keys for future replay, DLQ, and backfill work
 - a DLQ API foundation for trusted integrations to preserve failed or quarantined records explicitly
+- a batch/backfill ingestion runtime at `POST /ingest/batch` for reconnect catch-up submissions
 - explicit deployment guidance for edge, fog, and cloud flow topologies
 
 This milestone does not add:
@@ -16,7 +17,7 @@ This milestone does not add:
 - a NiFi runtime dependency
 - flow execution
 - DLQ runtime behavior
-- batch or backfill ingestion runtime
+- replay execution
 
 ## Recommended Producer Behavior
 
@@ -27,6 +28,7 @@ An external NiFi or MiNiFi flow should:
 3. preserve external runtime identifiers such as `external_flowfile_uuid`
 4. send timing fields that distinguish observation, buffering, and send time
 5. forward payloads to `POST /ingest/reliable` when replay-safe deduplication is desired
+6. use `POST /ingest/batch` when reconnecting with many buffered envelopes
 
 ## Suggested Ingestion Targets
 
@@ -34,10 +36,14 @@ Depending on deployment shape, NiFi or MiNiFi can target:
 
 - `POST /ingest/http`
 - `POST /ingest/reliable`
+- `POST /ingest/batch`
 - `POST /ingestion/connectors/{connector_id}/ingest`
 - a broker path that AionCore MQTT ingestion already consumes
 
-The preferred current path for provenance-rich reliable ingestion is `POST /ingest/reliable`.
+The preferred current paths for provenance-rich reliable ingestion are:
+
+- `POST /ingest/reliable` for one envelope
+- `POST /ingest/batch` for backfill or reconnect batches
 
 ## Recommended Envelope
 
@@ -135,7 +141,7 @@ Useful present or planned scopes:
 - `dashboard:read`
 - `dlq:write`
 - `dlq:read`
-- `batches:write` in a future milestone
+- `batches:write`
 
 Do not use broad operator credentials for automated upstream flow engines.
 
@@ -154,9 +160,11 @@ This makes future backfill and replay features easier to explain and audit.
 ## Current Limitations
 
 - AionCore now supports the generic reliable envelope at `POST /ingest/reliable`.
+- AionCore now supports multi-item reliable backfill batches at `POST /ingest/batch`.
 - AionCore now enforces tenant-scoped idempotency-key deduplication for reliable HTTP ingestion when `idempotency_key` is present.
+- AionCore now supports batch-level provenance inheritance and per-item duplicate reporting.
 - AionCore now provides explicit DLQ record APIs, but it does not route records into DLQ automatically and does not execute replay.
-- AionCore does not yet implement backfill session APIs.
+- AionCore does not yet implement a persistent batch session table.
 - AionCore does not yet distinguish late data in rule execution behavior.
 - Connector-aware reliable ingestion is not implemented yet.
 

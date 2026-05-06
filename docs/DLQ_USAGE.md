@@ -8,6 +8,12 @@ Milestone 85 note:
 - future DLQ routing can reuse that preserved metadata
 - reliable-ingestion failures still do not create `DlqRecord` automatically in this milestone
 
+Milestone 86 note:
+
+- `POST /ingest/batch` now preserves the same upstream provenance and idempotency metadata per item, including reconnect/backfill metadata such as `batch_id` and inherited `sync_session_id`
+- batch item failures still do not create `DlqRecord` automatically
+- later DLQ routing can reuse preserved batch and item provenance from raw messages and events
+
 ## Scope
 
 - `POST /dlq/records`
