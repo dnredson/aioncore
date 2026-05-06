@@ -1,6 +1,6 @@
 # AionCore Dashboard
 
-This app is the Milestone 91 static frontend for the AionCore dashboard.
+This app is the Milestone 92 static frontend for the AionCore dashboard.
 
 ## Scope
 
@@ -12,7 +12,7 @@ The dashboard remains plain HTML, CSS, and JavaScript:
 - no external CDN dependencies
 - no backend behavior changes
 
-Milestone 91 extends the Milestone 89 and 90 dashboard with a static entity/property time-series explorer backed only by existing AionCore APIs.
+Milestone 92 extends the Milestone 89, 90, and 91 dashboard with a static form-based Flow Builder foundation backed only by existing AionCore APIs.
 
 ## Files
 
@@ -31,6 +31,7 @@ Read-oriented dashboard APIs:
 - `GET /dashboard/connectors/overview`
 - `GET /dashboard/flows`
 - `GET /dashboard/flows/{flow_id}`
+- `GET /flows/{flow_id}/validation`
 
 Connector and worker operational reads:
 
@@ -50,6 +51,16 @@ Connector and worker admin actions:
 - `PUT /ingestion/connectors/{connector_id}/disable`
 - `POST /ingestion/workers/reconcile`
 
+Flow builder and stored-flow actions:
+
+- `POST /flows`
+- `POST /flows/validate`
+- `POST /flows/dry-run`
+- `POST /flows/{flow_id}/dry-run`
+- `PUT /flows/{flow_id}/enable`
+- `PUT /flows/{flow_id}/disable`
+- `DELETE /flows/{flow_id}`
+
 ## UI Sections
 
 - Overview cards from `GET /dashboard/overview`
@@ -67,6 +78,14 @@ Connector and worker admin actions:
 - Manual reconcile action using `POST /ingestion/workers/reconcile`
 - Manual TTN validation and dry-run readiness loading only when explicitly triggered
 - Flow inventory and detail views from `GET /dashboard/flows` and `GET /dashboard/flows/{flow_id}`
+- Guided source -> transform -> sink flow builder with generated linear edges
+- Redacted flow JSON preview and optional advanced JSON override
+- Manual proposed-flow validation using `POST /flows/validate`
+- Manual proposed-flow dry-run using `POST /flows/dry-run`
+- Manual flow creation using `POST /flows`
+- Stored flow validation using `GET /flows/{flow_id}/validation`
+- Stored flow dry-run using `POST /flows/{flow_id}/dry-run`
+- Stored flow enable, disable, and explicit confirm-before-delete actions
 
 ## Auth Scopes
 
@@ -76,6 +95,8 @@ In `AIONCORE_AUTH_MODE=token`:
 - `timeseries:read` for `/timeseries/entities/{entity_id}/properties` and `/timeseries/query`
 - `connectors:read` for connector list, detail, status, TTN validation reads, worker plan, and worker status
 - `connectors:admin` for connector create, patch, enable, disable, and worker reconcile
+- `flows:read` for `/flows/validate`, `/flows/dry-run`, `/flows/{flow_id}/validation`, and `/flows/{flow_id}/dry-run`
+- `flows:write` for `POST /flows`, `PUT /flows/{flow_id}/enable`, `PUT /flows/{flow_id}/disable`, and `DELETE /flows/{flow_id}`
 
 The UI continues to support development mode with no token. If token mode returns `401` or `403`, the UI shows clear user-facing errors and never logs token values.
 
@@ -86,6 +107,7 @@ The UI continues to support development mode with no token. If token mode return
 - Secret values are never displayed.
 - Secret values are never stored in `localStorage`.
 - Secret-like keys are redacted in JSON previews.
+- Flow previews and stored flow details also redact secret-like keys such as `password`, `secret`, `token`, `api_key`, `access_key`, `private_key`, and `credential`.
 
 ## Local Run
 
@@ -122,13 +144,23 @@ The UI supports an optional bearer token for local development. The API base URL
 
 This keeps the dashboard static and low-risk while still supporting InfluxDB/Grafana-style operator exploration.
 
+## Flow Builder Notes
+
+- The builder is guided and linear: source -> transform -> sink.
+- Generated previews include `nodes`, `edges`, and `metadata`.
+- An optional advanced JSON override can replace the guided output for low-risk editing.
+- Validation and dry-run never save automatically.
+- Dry-run remains planning-only and surfaces `side_effects_performed = false` and `execution_supported = false`.
+- The UI does not execute flows, subscribe to brokers, publish MQTT, forward HTTP, or create observations, events, commands, or DLQ records.
+
 ## Deliberate Deferrals
 
 This milestone does not implement:
 
 - secret creation UI
 - secret inspection UI
-- flow editing
+- drag-and-drop flow editing
+- visual graph editing
 - flow execution
 - MQTT publish
 - HTTP forwarding

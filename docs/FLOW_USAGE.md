@@ -142,6 +142,8 @@ Validation returns:
 
 Validation is read-only. It does not enable, execute, publish, write observations, or create DLQ records.
 
+The static dashboard Flow Builder uses this endpoint before create and shows structured issue detail without auto-saving.
+
 ## Dry-Run
 
 Use `POST /flows/dry-run` to dry-run a proposed flow, or `POST /flows/{flow_id}/dry-run` for a stored flow.
@@ -175,6 +177,8 @@ Dry-run returns planning-oriented fields such as:
 
 Dry-run does not execute the flow or perform any side effects.
 
+The static dashboard Flow Builder uses this endpoint for both proposed drafts and stored flows. It surfaces planning fields such as `planned_path`, `planned_sinks`, `referenced_connectors`, and the conceptual sink flags while keeping `execution_supported = false`.
+
 ## List And Get
 
 ```powershell
@@ -207,6 +211,8 @@ Invoke-RestMethod -Method Put -Uri "http://localhost:8080/flows/<flow-id>/disabl
 ```powershell
 Invoke-WebRequest -Method Delete -Uri "http://localhost:8080/flows/<flow-id>"
 ```
+
+The static dashboard uses an explicit browser `confirm()` prompt before calling delete.
 
 ## Token Mode
 
@@ -245,3 +251,18 @@ Validation and dry-run scope rules:
 - `POST /flows/{flow_id}/dry-run`: `flows:read`
 
 Validation and dry-run also preserve tenant-aware flow ownership checks for stored flows in token mode.
+
+## Static Dashboard Builder Notes
+
+Milestone 92 adds a form-based builder in `apps/aion-dashboard/` that consumes the existing flow APIs only.
+
+It supports:
+
+- guided source -> transform -> sink draft creation
+- redacted preview JSON
+- optional advanced JSON override
+- proposed validation and dry-run
+- stored-flow validation and dry-run
+- explicit create, enable, disable, and delete operations
+
+It still does not support drag-and-drop, arbitrary graph editing, or flow execution.

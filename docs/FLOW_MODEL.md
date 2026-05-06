@@ -28,7 +28,7 @@ The current flow foundation now adds:
 
 The current flow milestones still do not add:
 
-- visual UI
+- visual graph editing
 - drag-and-drop editing
 - flow execution
 - runtime packet forwarding
@@ -197,6 +197,7 @@ Dry-run does not:
 This model is the backend contract for later milestones:
 
 - dashboard flow list and detail views
+- a form-based dashboard builder foundation before graph editing exists
 - Node-RED-like graph editing
 - dashboard-driven validation and dry-run inspection
 - flow execution engine
@@ -220,3 +221,19 @@ The flow dashboard endpoints are additive and do not replace `/flows`:
 - `/dashboard/flows` and `/dashboard/flows/{flow_id}` provide inventory/detail shapes optimized for future UI panels and graph rendering.
 
 Dashboard flow detail redacts secret-like node config keys using the same behavior as validation and dry-run output.
+
+## Static Flow Builder Relationship
+
+Milestone 92 adds a static frontend-only Flow Builder foundation under `apps/aion-dashboard/`.
+
+That UI:
+
+- uses a guided source -> transform -> sink form rather than arbitrary graph editing
+- generates linear edges from the form
+- shows a redacted JSON preview before save
+- allows an optional advanced JSON override for low-risk manual editing
+- uses `POST /flows/validate` and `POST /flows/dry-run` before create
+- uses `GET /flows/{flow_id}/validation` and `POST /flows/{flow_id}/dry-run` for stored flow inspection
+- still does not execute flows or create side effects
+
+This keeps the backend model stable while giving operators a safe authoring surface before a future Node-RED-like builder arrives.

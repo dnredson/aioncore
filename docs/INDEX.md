@@ -45,6 +45,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 
 Recent dashboard and flow ADRs:
 
+- [ADR 0087: Flow Builder UI foundation](ADR/0087-flow-builder-ui-foundation.md)
 - [ADR 0086: Time-series explorer UI](ADR/0086-timeseries-explorer-ui.md)
 - [ADR 0085: Connector and broker management UI](ADR/0085-connector-broker-management-ui.md)
 - [ADR 0084: Dashboard frontend skeleton](ADR/0084-dashboard-frontend-skeleton.md)

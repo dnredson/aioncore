@@ -10,9 +10,9 @@
   <div class="app-shell">
     <aside class="sidebar" aria-label="Primary">
       <div class="brand">
-        <p class="eyebrow">Milestone 90</p>
+        <p class="eyebrow">Milestone 92</p>
         <h1>AionCore Dashboard</h1>
-        <p class="lede">Static operator UI for dashboard overview, connector operations, worker inspection, and flow visibility.</p>
+        <p class="lede">Static operator UI for dashboard overview, connector operations, worker inspection, time-series exploration, and form-based flow planning.</p>
       </div>
 
       <nav class="nav-tabs" aria-label="Dashboard sections">
@@ -522,36 +522,239 @@
       <section id="flows-section" class="content-section" aria-labelledby="section-title">
         <div class="section-header">
           <div>
-            <h3>Flow Inventory</h3>
-            <p>Inventory and detail views from <code>GET /dashboard/flows</code> and <code>GET /dashboard/flows/{flow_id}</code>.</p>
+            <h3>Flow Builder</h3>
+            <p>Guided flow drafting, validation, dry-run planning, and stored flow inspection using existing <code>/flows</code> and <code>/dashboard/flows</code> APIs only.</p>
+          </div>
+          <div class="button-row">
+            <button class="button subtle" id="refresh-flows-button" type="button">Refresh Flows</button>
+            <button class="button subtle" id="refresh-flow-connectors-button" type="button">Refresh Connectors</button>
+          </div>
+        </div>
+
+        <div class="notice-panel">
+          Form-based builder only. This milestone does not add drag-and-drop, visual graph editing, execution, broker subscriptions, MQTT publish, HTTP forward, observation writes, event creation, command creation, or DLQ writes.
+        </div>
+
+        <div class="notice-panel">
+          Token mode guidance: <code>flows:read</code> for flow reads, validation, and dry-run; <code>flows:write</code> for create, enable, disable, and delete; <code>dashboard:read</code> for <code>/dashboard/flows*</code>; <code>connectors:read</code> for connector selectors.
+        </div>
+
+        <div class="panel-grid">
+          <article class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Admin area</p>
+                <h3>Guided Builder</h3>
+                <p id="flow-builder-status" class="detail-title">Define a simple source -&gt; transform -&gt; sink flow, review the redacted preview, then validate or dry-run before creating it.</p>
+              </div>
+            </div>
+
+            <form id="flow-builder-form" class="form-grid">
+              <label>
+                <span>Flow Key</span>
+                <input name="flow_key" type="text" required placeholder="mqtt-normalize-store">
+              </label>
+              <label>
+                <span>Name</span>
+                <input name="name" type="text" required placeholder="MQTT Normalize Store">
+              </label>
+              <label class="full-span">
+                <span>Description</span>
+                <input name="description" type="text" placeholder="Source decode and canonical storage flow">
+              </label>
+              <label class="checkbox-field">
+                <input name="enabled" type="checkbox">
+                <span>Enabled</span>
+              </label>
+              <label class="full-span">
+                <span>Metadata JSON</span>
+                <textarea id="flow-metadata-json" name="metadata" rows="6" placeholder='{"category":"ingestion","notes":"execution not implemented"}'></textarea>
+              </label>
+
+              <div class="builder-stage full-span">
+                <div class="builder-stage-header">
+                  <p class="eyebrow">Stage 1</p>
+                  <h4>Source Node</h4>
+                </div>
+                <div class="form-grid compact-grid">
+                  <label>
+                    <span>Node ID</span>
+                    <input name="source_node_id" type="text" required placeholder="source-1">
+                  </label>
+                  <label>
+                    <span>Name</span>
+                    <input name="source_name" type="text" placeholder="MQTT Source">
+                  </label>
+                  <label>
+                    <span>Kind</span>
+                    <select id="flow-source-kind" name="source_kind">
+                      <option value="mqtt_subscribe">mqtt_subscribe</option>
+                      <option value="http_input">http_input</option>
+                      <option value="ttn_uplink">ttn_uplink</option>
+                      <option value="internal_observation">internal_observation</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Connector</span>
+                    <select id="flow-source-connector" name="source_connector_id"></select>
+                  </label>
+                </div>
+              </div>
+
+              <div class="builder-stage full-span">
+                <div class="builder-stage-header">
+                  <p class="eyebrow">Stage 2</p>
+                  <h4>Decoder / Transform Node</h4>
+                </div>
+                <div class="form-grid compact-grid">
+                  <label>
+                    <span>Node ID</span>
+                    <input name="transform_node_id" type="text" required placeholder="decoder-1">
+                  </label>
+                  <label>
+                    <span>Name</span>
+                    <input name="transform_name" type="text" placeholder="SenML Decode">
+                  </label>
+                  <label>
+                    <span>Kind</span>
+                    <select id="flow-transform-kind" name="transform_kind">
+                      <option value="senml_decode">senml_decode</option>
+                      <option value="ultralight_decode">ultralight_decode</option>
+                      <option value="canonical_json">canonical_json</option>
+                      <option value="json_map">json_map</option>
+                      <option value="filter_condition">filter_condition</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+
+              <div class="builder-stage full-span">
+                <div class="builder-stage-header">
+                  <p class="eyebrow">Stage 3</p>
+                  <h4>Sink Node</h4>
+                </div>
+                <div class="form-grid compact-grid">
+                  <label>
+                    <span>Node ID</span>
+                    <input name="sink_node_id" type="text" required placeholder="sink-1">
+                  </label>
+                  <label>
+                    <span>Name</span>
+                    <input name="sink_name" type="text" placeholder="Observation Store">
+                  </label>
+                  <label>
+                    <span>Kind</span>
+                    <select id="flow-sink-kind" name="sink_kind">
+                      <option value="internal_observation_store">internal_observation_store</option>
+                      <option value="raw_message_store">raw_message_store</option>
+                      <option value="mqtt_publish">mqtt_publish</option>
+                      <option value="http_forward">http_forward</option>
+                      <option value="event_create">event_create</option>
+                      <option value="command_create">command_create</option>
+                      <option value="dlq">dlq</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Connector</span>
+                    <select id="flow-sink-connector" name="sink_connector_id"></select>
+                  </label>
+                </div>
+              </div>
+
+              <label class="full-span">
+                <span>Advanced JSON Override</span>
+                <textarea id="flow-advanced-json" name="advanced_json" rows="12" placeholder="Optional. Leave blank to use the guided builder output."></textarea>
+              </label>
+
+              <div class="form-actions full-span">
+                <button class="button subtle" id="flow-builder-preview-button" type="button">Refresh Preview</button>
+                <button class="button subtle" id="flow-builder-validate-button" type="button">Validate Proposed Flow</button>
+                <button class="button subtle" id="flow-builder-dry-run-button" type="button">Dry-Run Proposed Flow</button>
+                <button class="button primary" id="flow-builder-create-button" type="submit">Create Flow</button>
+                <button class="button subtle" id="flow-builder-reset-button" type="button">Reset Builder</button>
+              </div>
+            </form>
+          </article>
+
+          <article class="detail-panel" aria-live="polite">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Planning</p>
+                <h3>Preview and Draft Checks</h3>
+                <p class="detail-title">Preview is redacted for display. Requests still use the current draft or advanced JSON override.</p>
+              </div>
+            </div>
+
+            <section class="mini-panel">
+              <h4>Flow Preview JSON</h4>
+              <pre id="flow-preview-json" class="mono-block"></pre>
+            </section>
+
+            <section class="mini-panel">
+              <div class="panel-heading compact">
+                <h4>Proposed Validation</h4>
+              </div>
+              <div id="flow-proposed-validation-summary">Validate the proposed flow to inspect structured issues before saving.</div>
+            </section>
+
+            <section class="mini-panel">
+              <div class="panel-heading compact">
+                <h4>Proposed Dry-Run</h4>
+              </div>
+              <label>
+                <span>Sample Payload JSON</span>
+                <textarea id="flow-proposed-sample-payload" rows="8" placeholder='{"temperature":21.4}'></textarea>
+              </label>
+              <div id="flow-proposed-dry-run-summary" class="top-gap">Dry-run stays planning-only. No side effects are performed.</div>
+            </section>
           </div>
         </div>
 
         <div class="flows-layout">
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Flow</th>
-                  <th>Enabled</th>
-                  <th>Nodes</th>
-                  <th>Edges</th>
-                  <th>Sources</th>
-                  <th>Sinks</th>
-                  <th>DLQ</th>
-                  <th>Validation</th>
-                  <th>Errors</th>
-                  <th>Warnings</th>
-                </tr>
-              </thead>
-              <tbody id="flows-table-body"></tbody>
-            </table>
-          </div>
+          <article class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Inventory</p>
+                <h3>Stored Flows</h3>
+                <p class="detail-title">Read from <code>GET /dashboard/flows</code>. Select a stored flow to load detail and run safe checks.</p>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Flow</th>
+                    <th>Enabled</th>
+                    <th>Nodes</th>
+                    <th>Edges</th>
+                    <th>Sources</th>
+                    <th>Sinks</th>
+                    <th>DLQ</th>
+                    <th>Validation</th>
+                    <th>Errors</th>
+                    <th>Warnings</th>
+                  </tr>
+                </thead>
+                <tbody id="flows-table-body"></tbody>
+              </table>
+            </div>
+          </article>
 
           <article class="detail-panel" aria-live="polite">
             <div class="panel-heading">
-              <h3>Flow Detail</h3>
-              <p id="flow-detail-title" class="detail-title">Select a flow to inspect metadata, validation, graph summary, nodes, and edges.</p>
+              <div>
+                <h3>Stored Flow Detail</h3>
+                <p id="flow-detail-title" class="detail-title">Select a flow to inspect metadata, validation, graph summary, nodes, and edges.</p>
+              </div>
+              <div class="button-row">
+                <button class="button subtle" id="flow-refresh-detail-button" type="button" disabled>Refresh Detail</button>
+                <button class="button subtle" id="flow-validate-stored-button" type="button" disabled>Validate Stored Flow</button>
+                <button class="button subtle" id="flow-dry-run-stored-button" type="button" disabled>Dry-Run Stored Flow</button>
+                <button class="button subtle" id="flow-enable-button" type="button" disabled>Enable</button>
+                <button class="button subtle" id="flow-disable-button" type="button" disabled>Disable</button>
+                <button class="button subtle danger-button" id="flow-delete-button" type="button" disabled>Delete</button>
+              </div>
             </div>
 
             <div id="flow-detail-empty" class="empty-state">No flow selected.</div>
@@ -567,6 +770,24 @@
                 <section class="mini-panel">
                   <h4>Execution Status</h4>
                   <div id="flow-execution-summary"></div>
+                </section>
+              </div>
+
+              <section class="mini-panel">
+                <label>
+                  <span>Stored Flow Dry-Run Sample Payload JSON</span>
+                  <textarea id="flow-stored-sample-payload" rows="8" placeholder='{"temperature":31.2}'></textarea>
+                </label>
+              </section>
+
+              <div class="mini-panels">
+                <section class="mini-panel">
+                  <h4>Stored Validation Result</h4>
+                  <div id="flow-stored-validation-summary">Load validation only when explicitly requested.</div>
+                </section>
+                <section class="mini-panel">
+                  <h4>Stored Dry-Run Result</h4>
+                  <div id="flow-stored-dry-run-summary">Load dry-run only when explicitly requested.</div>
                 </section>
               </div>
 

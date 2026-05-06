@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, and 91 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, and a simple entity/property time-series explorer so operators can inspect entities, connectors, workers, pipeline inventory, and historical observations without changing ingestion or flow execution behavior.
+The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, and 92 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, and a form-based flow builder foundation so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
 
 ## Current Intent
 
@@ -9,6 +9,7 @@ The AionCore dashboard is currently a static operational surface served from `ap
 - Support a future exploration flow of `entity -> observed property -> historical chart`.
 - Support operational views for connectors, brokers, and workers.
 - Provide a no-build UI that can safely consume existing APIs during backend iteration.
+- Provide a safe flow-definition authoring path before any future visual graph editor exists.
 - Preserve Grafana as a valid future option for advanced charting and long-range analytics.
 
 ## Current Read Surface
@@ -20,6 +21,10 @@ The AionCore dashboard is currently a static operational surface served from `ap
 - `GET /timeseries/entities/{entity_id}/properties`
 - `GET /timeseries/query`
 - `GET /dashboard/connectors/overview`
+- `GET /flows/{flow_id}/validation`
+- `POST /flows/dry-run`
+- `POST /flows/{flow_id}/dry-run`
+- `POST /flows/validate`
 - `GET /ingestion/connectors`
 - `GET /ingestion/connectors/{connector_id}`
 - `GET /ingestion/connectors/{connector_id}/status`
@@ -39,6 +44,10 @@ Milestone 90 adds explicit operator actions, but only by consuming already exist
 - `PUT /ingestion/connectors/{connector_id}/enable`
 - `PUT /ingestion/connectors/{connector_id}/disable`
 - `POST /ingestion/workers/reconcile`
+- `POST /flows`
+- `PUT /flows/{flow_id}/enable`
+- `PUT /flows/{flow_id}/disable`
+- `DELETE /flows/{flow_id}`
 
 The dashboard does not change backend semantics and does not add any new endpoint.
 
@@ -53,6 +62,7 @@ The current and future AionCore dashboard is intended to emphasize:
 - worker planning and runtime health
 - later pipeline and flow visibility
 - flow list, detail, and graph rendering from dashboard-friendly read models
+- form-based flow authoring with redacted preview JSON
 - flow validation and dry-run inspection without execution
 - later reliability and provenance visibility for external flow engines such as NiFi and MiNiFi
 
@@ -86,6 +96,11 @@ It currently provides:
 - manual TTN validation and dry-run readiness inspection using existing TTN read endpoints only when the operator requests them
 - flow inventory table from `GET /dashboard/flows`
 - flow detail inspection panel from `GET /dashboard/flows/{flow_id}`
+- a guided source -> transform -> sink builder that generates a flow definition with linear edges
+- proposed-flow validation from `POST /flows/validate`
+- proposed-flow dry-run planning from `POST /flows/dry-run`
+- explicit flow create, enable, disable, and confirm-before-delete actions using the existing `/flows` write surface
+- explicit stored-flow validation and dry-run actions using the existing planning endpoints
 
 ## Auth And Safety
 
@@ -100,6 +115,8 @@ In token mode the consumed scopes are:
 - `timeseries:read` for `/timeseries/*` explorer reads
 - `connectors:read` for connector, TTN validation, and worker operational reads
 - `connectors:admin` for connector mutation and worker reconcile
+- `flows:read` for flow validation and dry-run reads
+- `flows:write` for flow creation and stored-flow mutations
 
 Milestone 90 keeps several safety boundaries:
 
@@ -107,9 +124,11 @@ Milestone 90 keeps several safety boundaries:
 - no secret value display
 - no secret value persistence in browser storage
 - redaction of secret-like fields in JSON previews
+- redaction of secret-like fields in flow preview JSON and stored flow details
 - no automatic TTN live validation
 - no flow execution
-- no flow editing
+- no drag-and-drop flow editing
+- no visual graph editing
 - no external chart library
 - no Grafana integration in the static dashboard milestone
 
@@ -120,6 +139,7 @@ The following are still explicitly out of scope for the current dashboard phase:
 - heavy frontend build tooling
 - drag-and-drop graph canvas
 - drag-and-drop flow editor
+- arbitrary graph editing
 - flow execution
 - broker subscription changes outside connector config
 - MQTT publish

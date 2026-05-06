@@ -172,3 +172,16 @@ A future dashboard or Node-RED-like flow builder should use:
 - `POST /flows/validate` and `POST /flows/dry-run` for unsaved draft graphs
 
 The dashboard flow inventory and detail endpoints complement these APIs. They provide inventory counts, redacted node detail, graph summaries, and validation summaries for saved flows, but they still do not execute anything and are not a substitute for the validation and dry-run endpoints.
+
+## Static Flow Builder Usage
+
+Milestone 92 adds a static Flow Builder foundation in `apps/aion-dashboard/`.
+
+The UI uses:
+
+- `POST /flows/validate` for unsaved proposed flows
+- `POST /flows/dry-run` for unsaved proposed flows with optional `sample_payload`
+- `GET /flows/{flow_id}/validation` for stored flows
+- `POST /flows/{flow_id}/dry-run` for stored flows with optional `sample_payload`
+
+The builder remains form-based and intentionally does not implement drag-and-drop, arbitrary visual graph editing, or execution. It shows redacted preview JSON and result panels so operators can inspect `validation_issues`, `planned_path`, `planned_sinks`, and connector references before taking any write action.

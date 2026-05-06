@@ -13,6 +13,7 @@ Dashboard-oriented reads:
 - `GET /timeseries/entities/{entity_id}/properties`
 - `GET /timeseries/query`
 - `GET /dashboard/connectors/overview`
+- `GET /flows/{flow_id}/validation`
 
 Connector and worker operational reads used by the dashboard:
 
@@ -32,7 +33,35 @@ Connector and worker admin actions used by the dashboard:
 - `PUT /ingestion/connectors/{connector_id}/disable`
 - `POST /ingestion/workers/reconcile`
 
+Flow actions used by the dashboard:
+
+- `POST /flows`
+- `POST /flows/validate`
+- `POST /flows/dry-run`
+- `POST /flows/{flow_id}/dry-run`
+- `PUT /flows/{flow_id}/enable`
+- `PUT /flows/{flow_id}/disable`
+- `DELETE /flows/{flow_id}`
+
 These endpoints provide compact summaries and operator workflows that the static dashboard can use directly. The dashboard now also consumes the existing `/timeseries/*` read surface for entity/property exploration.
+
+## Flow Builder
+
+The Flow Builder section in `apps/aion-dashboard/` is deliberately form-based in this milestone.
+
+It provides:
+
+- a guided source -> transform -> sink builder
+- generated flow JSON with `nodes`, `edges`, and `metadata`
+- a redacted preview pane
+- an optional advanced JSON override textarea
+- explicit proposed-flow validation with `POST /flows/validate`
+- explicit proposed-flow dry-run with `POST /flows/dry-run`
+- explicit create with `POST /flows`
+- explicit stored-flow validation and dry-run against the selected saved flow
+- explicit enable, disable, and confirm-before-delete controls for stored flows
+
+The dashboard does not execute flows. Validation and dry-run remain planning-only and do not perform side effects.
 
 ## Time-Series Explorer
 
@@ -263,6 +292,8 @@ In `AIONCORE_AUTH_MODE=token`, the dashboard UI requires:
 - `timeseries:read` for `GET /timeseries/entities/{entity_id}/properties` and `GET /timeseries/query`
 - `connectors:read` for `GET /ingestion/connectors`, connector detail/status, TTN validation reads, and worker plan/status
 - `connectors:admin` for connector create, patch, enable, disable, and worker reconcile
+- `flows:read` for `POST /flows/validate`, `POST /flows/dry-run`, `GET /flows/{flow_id}/validation`, and `POST /flows/{flow_id}/dry-run`
+- `flows:write` for `POST /flows`, `PUT /flows/{flow_id}/enable`, `PUT /flows/{flow_id}/disable`, and `DELETE /flows/{flow_id}`
 
 Example:
 
@@ -319,12 +350,14 @@ The UI supports:
 - enable, disable, and reconcile controls
 - worker plan and runtime inspection
 - manual TTN validation and dry-run readiness reads
+- guided flow creation, validation, dry-run, and stored-flow lifecycle operations
 
 The app intentionally still does not implement:
 
 - flow execution
-- flow editing
+- form-free arbitrary flow editing
 - drag-and-drop flow building
+- visual graph editing
 - secret creation
 - live TTN validation triggers
 - MQTT publish

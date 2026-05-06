@@ -53,10 +53,11 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 89 dashboard frontend skeleton: AionCore now adds `apps/aion-dashboard/` as a no-build static frontend using plain HTML, CSS, and JavaScript; operator-configurable API base URL plus optional local-development bearer token storage; read-only overview, time-series entity, connector overview, flow inventory, and flow detail panels backed by the existing `/dashboard/*` APIs; and focused documentation for local serving and future migration, while intentionally deferring charting libraries, flow editing, flow execution, connector mutation, broker subscription changes, and any frontend build toolchain.
 - Milestone 90 connector and broker management UI: AionCore now extends `apps/aion-dashboard/` with connector detail, create, safe patch, enable, disable, TTN dry-run validation reads, worker plan/runtime views, and manual reconcile controls backed only by existing `/dashboard/*`, `/ingestion/connectors*`, and `/ingestion/workers*` APIs; keeps secret creation and live TTN validation deferred; preserves the no-build static frontend stance; and does not change backend behavior.
 - Milestone 91 entity/property time-series explorer UI: AionCore now extends `apps/aion-dashboard/` with a static entity/property explorer backed only by `GET /dashboard/timeseries/entities`, `GET /timeseries/entities/{entity_id}/properties`, and `GET /timeseries/query`; supports optional `from`/`to`, whole-range aggregation selection, raw point tables, truncation visibility, and a small dependency-free SVG chart for numeric raw points; preserves the no-build static frontend stance; and intentionally defers external chart libraries, interval bucket exploration, and Grafana integration.
+- Milestone 92 flow builder UI foundation: AionCore now extends `apps/aion-dashboard/` with a static form-based Flow Builder backed only by existing `POST /flows`, `GET /dashboard/flows*`, `POST /flows/validate`, `GET /flows/{flow_id}/validation`, `POST /flows/dry-run`, `POST /flows/{flow_id}/dry-run`, `PUT /flows/{flow_id}/enable`, `PUT /flows/{flow_id}/disable`, `DELETE /flows/{flow_id}`, and connector read APIs; supports a guided source -> transform -> sink builder, redacted preview JSON, optional advanced JSON override, proposed validation and dry-run, stored-flow validation and dry-run, and explicit enable/disable/delete actions; preserves the no-build static frontend stance; and intentionally defers drag-and-drop editing, arbitrary graph editing, execution, broker subscriptions, MQTT/HTTP side effects, and secret-management UI.
 
 ## Next
 
-1. Flow builder UI foundation.
+1. Add the first Node-RED-like visual flow builder layer on top of the existing form-based foundation without introducing execution yet.
 2. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
 3. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
 4. Extend the time-series explorer with richer charting, interval bucket views, and broader result navigation without weakening the current no-build stance unless the UI surface justifies a dedicated frontend stack.
@@ -66,7 +67,7 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 
 - Cassandra telemetry adapter.
 - richer dashboard exploration UI and optional Grafana interoperability.
-- Node-RED-like flow editor and flow execution model.
+- Node-RED-like visual flow editor and flow execution model.
 - deeper flow simulation and typed node-kind validation.
 - MCP time-series query tools.
 - Production MCP transport.
