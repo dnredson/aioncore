@@ -16,3 +16,12 @@
 /target_*/
 /target-*/
 /target_smoke/
+
+# Rust build artifacts
+/target/
+/target_*/
+/target-*/
+/target_smoke/
+*.pdb
+*.rlib
+*.exe
