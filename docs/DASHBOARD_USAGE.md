@@ -10,6 +10,8 @@ Dashboard-oriented reads:
 - `GET /dashboard/flows`
 - `GET /dashboard/flows/{flow_id}`
 - `GET /dashboard/timeseries/entities`
+- `GET /timeseries/entities/{entity_id}/properties`
+- `GET /timeseries/query`
 - `GET /dashboard/connectors/overview`
 
 Connector and worker operational reads used by the dashboard:
@@ -30,7 +32,46 @@ Connector and worker admin actions used by the dashboard:
 - `PUT /ingestion/connectors/{connector_id}/disable`
 - `POST /ingestion/workers/reconcile`
 
-These endpoints do not replace `/timeseries/query`. They provide compact summaries and operator workflows that the static dashboard can use directly.
+These endpoints provide compact summaries and operator workflows that the static dashboard can use directly. The dashboard now also consumes the existing `/timeseries/*` read surface for entity/property exploration.
+
+## Time-Series Explorer
+
+Entity inventory:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/dashboard/timeseries/entities"
+```
+
+Observed property discovery:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/timeseries/entities/<entity_id>/properties"
+```
+
+Raw series query:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/timeseries/query?entity_id=<entity_id>&observed_property=soil.moisture&limit=1000"
+```
+
+Aggregation examples:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/timeseries/query?entity_id=<entity_id>&observed_property=soil.moisture&aggregation=last"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/timeseries/query?entity_id=<entity_id>&observed_property=soil.moisture&aggregation=count"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/timeseries/query?entity_id=<entity_id>&observed_property=soil.moisture&aggregation=avg"
+```
+
+The static dashboard explorer provides:
+
+- entity selection and refresh from `GET /dashboard/timeseries/entities`
+- observed-property loading from `GET /timeseries/entities/{entity_id}/properties`
+- optional `from`, `to`, `aggregation`, and `limit` query controls
+- raw point tables showing `time`, `value`, `unit`, `observation_id`, and optional `raw_message_id`
+- compact whole-range aggregation summaries using the existing `points` response shape
+- a simple inline SVG chart for numeric raw points only, with table fallback for non-numeric values
+
+This remains a no-build static UI with no external chart dependency.
 
 ## Overview
 
@@ -219,6 +260,7 @@ The dashboard does not call live validation automatically. It does not call `POS
 In `AIONCORE_AUTH_MODE=token`, the dashboard UI requires:
 
 - `dashboard:read` for `GET /dashboard/overview`, `GET /dashboard/timeseries/entities`, `GET /dashboard/connectors/overview`, `GET /dashboard/flows`, and `GET /dashboard/flows/{flow_id}`
+- `timeseries:read` for `GET /timeseries/entities/{entity_id}/properties` and `GET /timeseries/query`
 - `connectors:read` for `GET /ingestion/connectors`, connector detail/status, TTN validation reads, and worker plan/status
 - `connectors:admin` for connector create, patch, enable, disable, and worker reconcile
 
@@ -269,6 +311,9 @@ The UI supports:
 - optional bearer token input for local development
 - `Authorization: Bearer <token>` only when a token is present
 - refresh and section switching
+- entity/property time-series exploration with optional date filters, aggregation, and limit
+- result counts and truncation visibility from `/timeseries/query`
+- a dependency-free numeric raw-point SVG chart
 - connector overview and detail inspection
 - connector create and safe patch actions
 - enable, disable, and reconcile controls
@@ -285,3 +330,4 @@ The app intentionally still does not implement:
 - MQTT publish
 - HTTP forwarding
 - charting libraries
+- Grafana integration

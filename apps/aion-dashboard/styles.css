@@ -63,6 +63,7 @@ pre {
 .config-panel,
 .detail-panel,
 .mini-panel,
+.notice-panel,
 .status-strip,
 .error-banner,
 .table-wrap,
@@ -199,6 +200,15 @@ label span,
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.notice-panel {
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  background: rgba(142, 75, 38, 0.08);
+  border: 1px solid rgba(142, 75, 38, 0.18);
+  border-radius: var(--radius-sm);
+  color: var(--ink-muted);
 }
 
 .button.primary {
@@ -393,6 +403,11 @@ tbody tr:hover {
   margin-bottom: 4px;
 }
 
+.detail-item.selected {
+  background: rgba(142, 75, 38, 0.12);
+  border-color: rgba(142, 75, 38, 0.3);
+}
+
 .mini-panels {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -426,6 +441,54 @@ tbody tr:hover {
   white-space: pre-wrap;
   word-break: break-word;
   font-size: 0.84rem;
+}
+
+.chart-shell {
+  min-height: 260px;
+}
+
+.chart-shell svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: var(--radius-sm);
+  background:
+    linear-gradient(180deg, rgba(255, 253, 250, 0.95) 0%, rgba(247, 242, 235, 0.95) 100%);
+  border: 1px solid rgba(216, 200, 180, 0.75);
+}
+
+.chart-placeholder {
+  padding: 18px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  color: var(--ink-muted);
+}
+
+.chart-axis,
+.chart-grid-line {
+  stroke: rgba(95, 103, 95, 0.3);
+  stroke-width: 1;
+}
+
+.chart-grid-line {
+  stroke-dasharray: 4 4;
+}
+
+.chart-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+.chart-point {
+  fill: var(--accent-strong);
+}
+
+.chart-label {
+  fill: var(--ink-muted);
+  font-family: var(--font-ui);
+  font-size: 12px;
 }
 
 .hidden {

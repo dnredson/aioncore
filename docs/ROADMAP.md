@@ -52,19 +52,20 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 88 dashboard flow inventory and detail API: `aion-api` now adds `GET /dashboard/flows` and `GET /dashboard/flows/{flow_id}` as dashboard-friendly read-only flow inventory and detail views; graph-type counts; validation status, error, and warning summaries; redacted node config detail; planned-path, connector-reference, and planned-sink inspection; tenant-aware token-mode protection on `dashboard:read`; and low-risk dashboard overview additions for invalid-flow and warning counts, while intentionally deferring any frontend UI, flow execution, broker subscription, MQTT/HTTP dispatch, observation/event/command/DLQ creation, and changes to existing `/flows`, validation, or dry-run behavior.
 - Milestone 89 dashboard frontend skeleton: AionCore now adds `apps/aion-dashboard/` as a no-build static frontend using plain HTML, CSS, and JavaScript; operator-configurable API base URL plus optional local-development bearer token storage; read-only overview, time-series entity, connector overview, flow inventory, and flow detail panels backed by the existing `/dashboard/*` APIs; and focused documentation for local serving and future migration, while intentionally deferring charting libraries, flow editing, flow execution, connector mutation, broker subscription changes, and any frontend build toolchain.
 - Milestone 90 connector and broker management UI: AionCore now extends `apps/aion-dashboard/` with connector detail, create, safe patch, enable, disable, TTN dry-run validation reads, worker plan/runtime views, and manual reconcile controls backed only by existing `/dashboard/*`, `/ingestion/connectors*`, and `/ingestion/workers*` APIs; keeps secret creation and live TTN validation deferred; preserves the no-build static frontend stance; and does not change backend behavior.
+- Milestone 91 entity/property time-series explorer UI: AionCore now extends `apps/aion-dashboard/` with a static entity/property explorer backed only by `GET /dashboard/timeseries/entities`, `GET /timeseries/entities/{entity_id}/properties`, and `GET /timeseries/query`; supports optional `from`/`to`, whole-range aggregation selection, raw point tables, truncation visibility, and a small dependency-free SVG chart for numeric raw points; preserves the no-build static frontend stance; and intentionally defers external chart libraries, interval bucket exploration, and Grafana integration.
 
 ## Next
 
 1. Flow builder UI foundation.
 2. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
 3. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
-4. Add lightweight charting for time-series property exploration without weakening the current no-build stance unless the UI surface justifies a dedicated frontend stack.
+4. Extend the time-series explorer with richer charting, interval bucket views, and broader result navigation without weakening the current no-build stance unless the UI surface justifies a dedicated frontend stack.
 5. Add secret-management UI only after the underlying operator and security posture is ready for a higher-sensitivity browser workflow.
 
 ## Future
 
 - Cassandra telemetry adapter.
-- richer dashboard exploration UI.
+- richer dashboard exploration UI and optional Grafana interoperability.
 - Node-RED-like flow editor and flow execution model.
 - deeper flow simulation and typed node-kind validation.
 - MCP time-series query tools.

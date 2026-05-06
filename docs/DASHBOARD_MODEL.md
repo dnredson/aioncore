@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, and 90 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, and connector and broker management UI so operators can inspect entities, connectors, workers, and pipeline inventory without changing ingestion or flow execution behavior.
+The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, and 91 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, and a simple entity/property time-series explorer so operators can inspect entities, connectors, workers, pipeline inventory, and historical observations without changing ingestion or flow execution behavior.
 
 ## Current Intent
 
@@ -17,6 +17,8 @@ The AionCore dashboard is currently a static operational surface served from `ap
 - `GET /dashboard/flows`
 - `GET /dashboard/flows/{flow_id}`
 - `GET /dashboard/timeseries/entities`
+- `GET /timeseries/entities/{entity_id}/properties`
+- `GET /timeseries/query`
 - `GET /dashboard/connectors/overview`
 - `GET /ingestion/connectors`
 - `GET /ingestion/connectors/{connector_id}`
@@ -70,6 +72,10 @@ It currently provides:
 
 - overview cards from `GET /dashboard/overview`
 - time-series entity discovery table from `GET /dashboard/timeseries/entities`
+- entity selection, observed-property loading, and historical query controls using `GET /timeseries/entities/{entity_id}/properties` and `GET /timeseries/query`
+- raw point result tables with `time`, `value`, `unit`, `observation_id`, and optional `raw_message_id`
+- compact whole-range aggregation summaries for `last`, `count`, `avg`, `min`, and `max`
+- a small dependency-free SVG chart for numeric raw points only
 - connector overview table from `GET /dashboard/connectors/overview`
 - connector detail panel from `GET /ingestion/connectors/{connector_id}` and `GET /ingestion/connectors/{connector_id}/status`
 - create connector form using `POST /ingestion/connectors`
@@ -91,6 +97,7 @@ The UI stores only operator-provided local development settings:
 In token mode the consumed scopes are:
 
 - `dashboard:read` for the dashboard aggregation routes
+- `timeseries:read` for `/timeseries/*` explorer reads
 - `connectors:read` for connector, TTN validation, and worker operational reads
 - `connectors:admin` for connector mutation and worker reconcile
 
@@ -103,6 +110,8 @@ Milestone 90 keeps several safety boundaries:
 - no automatic TTN live validation
 - no flow execution
 - no flow editing
+- no external chart library
+- no Grafana integration in the static dashboard milestone
 
 ## Deferred Work
 
@@ -116,6 +125,7 @@ The following are still explicitly out of scope for the current dashboard phase:
 - MQTT publish
 - HTTP forwarding
 - in-browser charting libraries
+- rich chart interactions such as zoom or bucket editing
 - secret creation workflows
 - live TTN validation triggers
 - automated pipeline or rule authoring from the dashboard

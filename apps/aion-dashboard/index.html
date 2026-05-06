@@ -17,7 +17,7 @@
 
       <nav class="nav-tabs" aria-label="Dashboard sections">
         <button class="nav-tab active" type="button" data-section="overview">Overview</button>
-        <button class="nav-tab" type="button" data-section="timeseries">Time-Series Entities</button>
+        <button class="nav-tab" type="button" data-section="timeseries">Time Series</button>
         <button class="nav-tab" type="button" data-section="connectors">Connectors</button>
         <button class="nav-tab" type="button" data-section="flows">Flows</button>
       </nav>
@@ -78,25 +78,156 @@
       <section id="timeseries-section" class="content-section" aria-labelledby="section-title">
         <div class="section-header">
           <div>
-            <h3>Entity Discovery</h3>
-            <p>Compact time-series inventory from <code>GET /dashboard/timeseries/entities</code>.</p>
+            <h3>Entity and Property Explorer</h3>
+            <p>Explore entity/property series with <code>GET /dashboard/timeseries/entities</code>, <code>GET /timeseries/entities/{entity_id}/properties</code>, and <code>GET /timeseries/query</code>.</p>
+          </div>
+          <div class="button-row">
+            <button class="button subtle" id="refresh-timeseries-button" type="button">Refresh Inventory</button>
           </div>
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Entity Key</th>
-                <th>Type</th>
-                <th>Display Name</th>
-                <th>Observed Properties</th>
-                <th>Observations</th>
-                <th>Last Observed</th>
-              </tr>
-            </thead>
-            <tbody id="timeseries-table-body"></tbody>
-          </table>
+
+        <div class="panel-grid">
+          <article class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Read-only explorer</p>
+                <h3>Query Controls</h3>
+                <p class="detail-title">Select an entity, load observed properties, then query raw points or a whole-range aggregation.</p>
+              </div>
+            </div>
+
+            <div class="notice-panel">
+              Token mode requires <code>dashboard:read</code> for <code>/dashboard/timeseries/entities</code> and <code>timeseries:read</code> for <code>/timeseries/*</code>.
+            </div>
+
+            <div id="timeseries-selection-summary" class="detail-grid"></div>
+
+            <form id="timeseries-query-form" class="form-grid">
+              <label>
+                <span>Entity</span>
+                <select id="timeseries-entity-select" name="entity_id"></select>
+              </label>
+              <label>
+                <span>Observed Property</span>
+                <select id="timeseries-property-select" name="observed_property" disabled></select>
+              </label>
+              <label>
+                <span>From</span>
+                <input id="timeseries-from" name="from" type="datetime-local">
+              </label>
+              <label>
+                <span>To</span>
+                <input id="timeseries-to" name="to" type="datetime-local">
+              </label>
+              <label>
+                <span>Aggregation</span>
+                <select id="timeseries-aggregation" name="aggregation">
+                  <option value="none" selected>none</option>
+                  <option value="last">last</option>
+                  <option value="count">count</option>
+                  <option value="avg">avg</option>
+                  <option value="min">min</option>
+                  <option value="max">max</option>
+                </select>
+              </label>
+              <label>
+                <span>Limit</span>
+                <input id="timeseries-limit" name="limit" type="number" min="1" max="10000" step="1" value="1000">
+              </label>
+              <div class="form-actions full-span">
+                <button class="button subtle" id="load-timeseries-properties-button" type="button">Load Properties</button>
+                <button class="button primary" id="query-timeseries-button" type="submit">Query Series</button>
+                <button class="button subtle" id="reset-timeseries-query-button" type="button">Reset Filters</button>
+              </div>
+            </form>
+          </article>
+
+          <article class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Inventory</p>
+                <h3>Entities and Properties</h3>
+                <p id="timeseries-local-status" class="detail-title">Load inventory to begin exploring time-series data.</p>
+              </div>
+            </div>
+
+            <div class="mini-panels stacked">
+              <section class="mini-panel">
+                <h4>Entities</h4>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Entity</th>
+                        <th>Type</th>
+                        <th>Display Name</th>
+                        <th>Observed Properties</th>
+                        <th>Observations</th>
+                        <th>Last Observed</th>
+                      </tr>
+                    </thead>
+                    <tbody id="timeseries-table-body"></tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section class="mini-panel">
+                <h4>Observed Properties</h4>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Property</th>
+                        <th>Units</th>
+                        <th>Count</th>
+                        <th>First Observed</th>
+                        <th>Last Observed</th>
+                      </tr>
+                    </thead>
+                    <tbody id="timeseries-properties-table-body"></tbody>
+                  </table>
+                </div>
+              </section>
+            </div>
+          </article>
         </div>
+
+        <article class="detail-panel" aria-live="polite">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Results</p>
+              <h3>Query Results</h3>
+              <p id="timeseries-results-meta" class="detail-title">No query executed yet.</p>
+            </div>
+          </div>
+
+          <div id="timeseries-results-empty" class="empty-state">Select an entity, load properties, then query raw points or an aggregation.</div>
+
+          <section id="timeseries-chart-panel" class="mini-panel hidden">
+            <div class="panel-heading compact">
+              <h4>Simple SVG Chart</h4>
+            </div>
+            <div id="timeseries-chart-note" class="form-note">Chart appears only for numeric raw points.</div>
+            <div id="timeseries-chart" class="chart-shell"></div>
+          </section>
+
+          <div id="timeseries-aggregation-summary" class="detail-grid hidden"></div>
+
+          <div id="timeseries-results-table-wrap" class="table-wrap hidden">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Value</th>
+                  <th>Unit</th>
+                  <th>Observation ID</th>
+                  <th>Raw Message ID</th>
+                </tr>
+              </thead>
+              <tbody id="timeseries-results-table-body"></tbody>
+            </table>
+          </div>
+        </article>
       </section>
 
       <section id="connectors-section" class="content-section" aria-labelledby="section-title">
