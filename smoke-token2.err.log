@@ -1,0 +1,9 @@
+[31;1m=token: [31;1mThe term '=token' is not recognized as a name of a cmdlet, function, script file, or executable program.[0m
+[31;1m[31;1mCheck the spelling of the name, or if a path was included, verify that the path is correct and try again.[0m
+[31;1m=aioncore-bootstrap-token-1234567890: [31;1mThe term '=aioncore-bootstrap-token-1234567890' is not recognized as a name of a cmdlet, function, script file, or executable program.[0m
+[31;1m[31;1mCheck the spelling of the name, or if a path was included, verify that the path is correct and try again.[0m
+warn: could not canonicalize path C:\Users\dnred
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running `target\debug\aion-api.exe`
+startup storage backend=memory, database_url_provided=false, migrations_applied=n/a, auth_mode=dev, auth_enforcement_level=none, auth_dev_bypass=true, bootstrap_admin_configured=false
+warning: authentication is not enforced; development-mode bypass is active

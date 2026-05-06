@@ -645,6 +645,15 @@ pub trait ObservationStore {
         to: Option<DateTime<Utc>>,
         limit: u32,
     ) -> StorageResult<Vec<Observation>>;
+    fn query_observations_chronological(
+        &self,
+        tenant_id: Uuid,
+        feature_of_interest_id: Option<Uuid>,
+        observed_property: Option<&str>,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> StorageResult<Vec<Observation>>;
     fn list_all_observations(&self) -> StorageResult<Vec<Observation>>;
 }
 
@@ -1428,6 +1437,46 @@ impl ObservationStore for InMemoryStorage {
             .collect::<Vec<_>>();
 
         observations.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
+        observations.truncate(limit as usize);
+        Ok(observations)
+    }
+
+    fn query_observations_chronological(
+        &self,
+        tenant_id: Uuid,
+        feature_of_interest_id: Option<Uuid>,
+        observed_property: Option<&str>,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> StorageResult<Vec<Observation>> {
+        let mut observations = self
+            .read_state()?
+            .observations
+            .values()
+            .filter(|observation| observation.tenant_id == tenant_id)
+            .filter(|observation| {
+                feature_of_interest_id
+                    .map(|id| observation.feature_of_interest_id == id)
+                    .unwrap_or(true)
+            })
+            .filter(|observation| {
+                observed_property
+                    .map(|property| observation.observed_property == property)
+                    .unwrap_or(true)
+            })
+            .filter(|observation| {
+                from.map(|from| observation.observed_at >= from)
+                    .unwrap_or(true)
+            })
+            .filter(|observation| to.map(|to| observation.observed_at <= to).unwrap_or(true))
+            .cloned()
+            .collect::<Vec<_>>();
+        observations.sort_by(|left, right| {
+            left.observed_at
+                .cmp(&right.observed_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         observations.truncate(limit as usize);
         Ok(observations)
     }
@@ -2949,6 +2998,69 @@ mod tests {
 
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].observed_property, "temperature");
+    }
+
+    #[test]
+    fn in_memory_storage_queries_observations_chronologically() {
+        use aion_observation::ObservationValue;
+        use chrono::TimeZone;
+        use serde_json::json;
+
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let producer_entity_id = Uuid::new_v4();
+        let feature_of_interest_id = Uuid::new_v4();
+        let times = [
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 2, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 1, 0).unwrap(),
+        ];
+
+        for observed_at in times {
+            let observation = Observation::new(
+                tenant_id,
+                producer_entity_id,
+                feature_of_interest_id,
+                "temperature",
+                ObservationValue::Number {
+                    value: observed_at.timestamp() as f64,
+                },
+                Some("Cel".to_string()),
+                observed_at,
+                observed_at,
+                "http",
+                "json_mapping",
+                None,
+                json!({}),
+                json!({}),
+            )
+            .unwrap();
+            storage.store_observation(observation).unwrap();
+        }
+
+        let observations = storage
+            .query_observations_chronological(
+                tenant_id,
+                Some(feature_of_interest_id),
+                Some("temperature"),
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(observations.len(), 3);
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.observed_at)
+                .collect::<Vec<_>>(),
+            vec![
+                Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 4, 27, 12, 1, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 4, 27, 12, 2, 0).unwrap(),
+            ]
+        );
     }
 
     #[test]

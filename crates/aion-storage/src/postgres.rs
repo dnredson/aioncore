@@ -1597,6 +1597,67 @@ impl ObservationStore for PostgresStorage {
         })
     }
 
+    fn query_observations_chronological(
+        &self,
+        tenant_id: Uuid,
+        feature_of_interest_id: Option<Uuid>,
+        observed_property: Option<&str>,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> StorageResult<Vec<Observation>> {
+        self.with_client(|client| {
+            let mut sql = String::from(
+                "
+                SELECT id, tenant_id, producer_entity_id, feature_of_interest_id, observed_property, value_number, value_string, value_bool, value_json, unit, observed_at, received_at, protocol, payload_format, raw_message_id, quality, metadata
+                FROM observations
+                WHERE tenant_id = $1
+                ",
+            );
+            let feature_of_interest_id = feature_of_interest_id;
+            let observed_property = observed_property.map(|value| value.to_string());
+            let from = from;
+            let to = to;
+            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&tenant_id];
+            let mut next_index = 2;
+
+            if let Some(feature_of_interest_id) = feature_of_interest_id.as_ref() {
+                sql.push_str(&format!(" AND feature_of_interest_id = ${next_index}"));
+                params.push(feature_of_interest_id);
+                next_index += 1;
+            }
+
+            if let Some(observed_property) = observed_property.as_ref() {
+                sql.push_str(&format!(" AND observed_property = ${next_index}"));
+                params.push(observed_property);
+                next_index += 1;
+            }
+
+            if let Some(from) = from.as_ref() {
+                sql.push_str(&format!(" AND observed_at >= ${next_index}"));
+                params.push(from);
+                next_index += 1;
+            }
+
+            if let Some(to) = to.as_ref() {
+                sql.push_str(&format!(" AND observed_at <= ${next_index}"));
+                params.push(to);
+                next_index += 1;
+            }
+
+            let limit = limit as i64;
+            sql.push_str(&format!(
+                " ORDER BY observed_at ASC, id ASC LIMIT ${next_index}"
+            ));
+            params.push(&limit);
+
+            let rows = client.query(&sql, &params).map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_observation)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
     fn list_all_observations(&self) -> StorageResult<Vec<Observation>> {
         self.with_client(|client| {
             let rows = client

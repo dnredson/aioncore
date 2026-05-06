@@ -508,6 +508,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .merge(routes::provenance::router())
         .merge(routes::events::router())
         .merge(routes::observations::router())
+        .merge(routes::timeseries::router())
         .merge(routes::ingestion::router())
         .merge(routes::ttn::router())
         .merge(routes::workers::router())
@@ -2289,6 +2290,7 @@ mod tests {
                 "raw_messages",
                 "entities",
                 "observations",
+                "timeseries",
                 "commands",
                 "actions",
                 "rules",
@@ -4828,6 +4830,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dev_mode_allows_timeseries_query_without_token() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&app, "timeseries-dev-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "timeseries-dev-plot-01", "aion:Plot").await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "soil.moisture",
+            json!({"type": "number", "value": 12.3}),
+            Some("%"),
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/timeseries/query?entity_id={plot_id}&observed_property=soil.moisture"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_timeseries_query_without_token() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/timeseries/query?entity_id=00000000-0000-0000-0000-000000000001&observed_property=temperature")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_requires_timeseries_read_scope_and_allows_it() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let sensor_id =
+            create_test_entity(&dev_app, "timeseries-auth-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "timeseries-auth-plot-01", "aion:Plot").await;
+        create_test_observation_at(
+            &dev_app,
+            &sensor_id,
+            &plot_id,
+            "temperature",
+            json!({"type": "number", "value": 21.4}),
+            Some("Cel"),
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+        let missing_scope_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("timeseries-missing-scope"),
+            &["observations:read"],
+        );
+        let timeseries_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("timeseries-reader"),
+            &["timeseries:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let rejected = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/timeseries/query?entity_id={plot_id}&observed_property=temperature"),
+                &missing_scope_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let allowed = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/timeseries/query?entity_id={plot_id}&observed_property=temperature"),
+                &timeseries_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let properties = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/timeseries/entities/{plot_id}/properties"),
+                &timeseries_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(properties.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn token_mode_protects_commands_read_with_commands_read_scope() {
         let storage = Arc::new(InMemoryStorage::new());
         let dev_app = dev_mode_app_with_storage(storage.clone());
@@ -5113,6 +5227,8 @@ mod tests {
             "/entities".to_string(),
             format!("/entities/{pump_id}/context"),
             format!("/observations?feature_of_interest_id={pump_id}"),
+            format!("/timeseries/query?entity_id={pump_id}&observed_property=temperature"),
+            format!("/timeseries/entities/{pump_id}/properties"),
             format!("/commands?target_entity_id={pump_id}&status=pending"),
             "/rules".to_string(),
             format!("/policies?target_entity_id={pump_id}&command_type=StartPump"),
@@ -5543,6 +5659,293 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied_event.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_denies_cross_tenant_timeseries_queries_for_non_admins() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let sensor_a =
+            create_test_entity(&tenant_a_app, "timeseries-tenant-a-sensor", "aion:Sensor").await;
+        let plot_a =
+            create_test_entity(&tenant_a_app, "timeseries-tenant-a-plot", "aion:Plot").await;
+        let sensor_b =
+            create_test_entity(&tenant_b_app, "timeseries-tenant-b-sensor", "aion:Sensor").await;
+        let plot_b =
+            create_test_entity(&tenant_b_app, "timeseries-tenant-b-plot", "aion:Plot").await;
+        create_test_observation_at(
+            &tenant_a_app,
+            &sensor_a,
+            &plot_a,
+            "temperature",
+            json!({"type": "number", "value": 10.0}),
+            Some("Cel"),
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+        create_test_observation_at(
+            &tenant_b_app,
+            &sensor_b,
+            &plot_b,
+            "temperature",
+            json!({"type": "number", "value": 20.0}),
+            Some("Cel"),
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+        let tenant_b_token = store_api_token_for_tenant(
+            &storage,
+            tenant_b,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-b-timeseries-reader"),
+            &["timeseries:read"],
+        );
+
+        let denied = app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/timeseries/query?entity_id={plot_a}&observed_property=temperature"),
+                &tenant_b_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let denied_properties = app
+            .oneshot(auth_request(
+                "GET",
+                &format!("/timeseries/entities/{plot_a}/properties"),
+                &tenant_b_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_properties.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn timeseries_query_returns_chronological_points_and_filters_by_property_and_time_range()
+    {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&app, "timeseries-order-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "timeseries-order-plot-01", "aion:Plot").await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "temperature",
+            json!({"type": "number", "value": 30.0}),
+            Some("Cel"),
+            "2026-05-05T12:02:00Z",
+        )
+        .await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "humidity",
+            json!({"type": "number", "value": 40.0}),
+            Some("%"),
+            "2026-05-05T12:00:30Z",
+        )
+        .await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "temperature",
+            json!({"type": "number", "value": 10.0}),
+            Some("Cel"),
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "temperature",
+            json!({"type": "number", "value": 20.0}),
+            Some("Cel"),
+            "2026-05-05T12:01:00Z",
+        )
+        .await;
+
+        let response = get_json(
+            &app,
+            &format!(
+                "/timeseries/query?entity_id={plot_id}&observed_property=temperature&from=2026-05-05T12:00:00Z&to=2026-05-05T12:02:00Z"
+            ),
+        )
+        .await;
+        let points = response["points"].as_array().unwrap();
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[0]["time"], "2026-05-05T12:00:00Z");
+        assert_eq!(points[1]["time"], "2026-05-05T12:01:00Z");
+        assert_eq!(points[2]["time"], "2026-05-05T12:02:00Z");
+        assert!(points
+            .iter()
+            .all(|point| point["value"]["value"].as_f64().is_some()));
+
+        let filtered = get_json(
+            &app,
+            &format!(
+                "/timeseries/query?entity_id={plot_id}&observed_property=temperature&from=2026-05-05T12:00:30Z&to=2026-05-05T12:01:30Z"
+            ),
+        )
+        .await;
+        let filtered_points = filtered["points"].as_array().unwrap();
+        assert_eq!(filtered_points.len(), 1);
+        assert_eq!(filtered_points[0]["time"], "2026-05-05T12:01:00Z");
+    }
+
+    #[tokio::test]
+    async fn timeseries_properties_endpoint_lists_properties_for_entity() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&app, "timeseries-props-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "timeseries-props-plot-01", "aion:Plot").await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "soil.moisture",
+            json!({"type": "number", "value": 15.0}),
+            Some("%"),
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "temperature",
+            json!({"type": "number", "value": 21.0}),
+            Some("Cel"),
+            "2026-05-05T12:01:00Z",
+        )
+        .await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "soil.moisture",
+            json!({"type": "number", "value": 17.0}),
+            Some("%"),
+            "2026-05-05T12:02:00Z",
+        )
+        .await;
+
+        let response = get_json(&app, &format!("/timeseries/entities/{plot_id}/properties")).await;
+        let properties = response["properties"].as_array().unwrap();
+        assert_eq!(properties.len(), 2);
+        assert_eq!(properties[0]["observed_property"], "soil.moisture");
+        assert_eq!(properties[0]["count"], 2);
+        assert_eq!(properties[0]["units"], json!(["%"]));
+        assert_eq!(properties[0]["first_observed_at"], "2026-05-05T12:00:00Z");
+        assert_eq!(properties[0]["last_observed_at"], "2026-05-05T12:02:00Z");
+        assert_eq!(properties[1]["observed_property"], "temperature");
+    }
+
+    #[tokio::test]
+    async fn timeseries_query_supports_last_count_avg_min_and_max_aggregations() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&app, "timeseries-agg-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "timeseries-agg-plot-01", "aion:Plot").await;
+        for (time, value) in [
+            ("2026-05-05T12:00:00Z", 10.0),
+            ("2026-05-05T12:01:00Z", 20.0),
+            ("2026-05-05T12:02:00Z", 30.0),
+        ] {
+            create_test_observation_at(
+                &app,
+                &sensor_id,
+                &plot_id,
+                "temperature",
+                json!({"type": "number", "value": value}),
+                Some("Cel"),
+                time,
+            )
+            .await;
+        }
+
+        let last = get_json(
+            &app,
+            &format!("/timeseries/query?entity_id={plot_id}&observed_property=temperature&aggregation=last"),
+        )
+        .await;
+        assert_eq!(last["points"][0]["time"], "2026-05-05T12:02:00Z");
+        assert_eq!(last["points"][0]["value"]["value"], 30.0);
+
+        let count = get_json(
+            &app,
+            &format!("/timeseries/query?entity_id={plot_id}&observed_property=temperature&aggregation=count"),
+        )
+        .await;
+        assert_eq!(count["points"][0]["value"]["value"], 3.0);
+
+        let avg = get_json(
+            &app,
+            &format!("/timeseries/query?entity_id={plot_id}&observed_property=temperature&aggregation=avg"),
+        )
+        .await;
+        assert_eq!(avg["points"][0]["value"]["value"], 20.0);
+
+        let min = get_json(
+            &app,
+            &format!("/timeseries/query?entity_id={plot_id}&observed_property=temperature&aggregation=min"),
+        )
+        .await;
+        assert_eq!(min["points"][0]["value"]["value"], 10.0);
+
+        let max = get_json(
+            &app,
+            &format!("/timeseries/query?entity_id={plot_id}&observed_property=temperature&aggregation=max"),
+        )
+        .await;
+        assert_eq!(max["points"][0]["value"]["value"], 30.0);
+    }
+
+    #[tokio::test]
+    async fn timeseries_numeric_aggregation_handles_non_numeric_values_safely() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&app, "timeseries-text-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "timeseries-text-plot-01", "aion:Plot").await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "status",
+            json!({"type": "text", "value": "ok"}),
+            None,
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/timeseries/query?entity_id={plot_id}&observed_property=status&aggregation=avg"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_json(response).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("numeric aggregation"));
     }
 
     #[tokio::test]
@@ -12400,6 +12803,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        to_json(response).await
+    }
+
+    async fn create_test_observation_at(
+        app: &Router,
+        producer_entity_id: &str,
+        feature_of_interest_id: &str,
+        observed_property: &str,
+        value: Value,
+        unit: Option<&str>,
+        observed_at: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/observations",
+                json!({
+                    "producer_entity_id": producer_entity_id,
+                    "feature_of_interest_id": feature_of_interest_id,
+                    "observed_property": observed_property,
+                    "value": value,
+                    "unit": unit,
+                    "observed_at": observed_at,
+                    "received_at": observed_at,
+                    "protocol": "http",
+                    "payload_format": "json_mapping",
+                    "raw_message_id": null,
+                    "quality": {},
+                    "metadata": {"suite": "timeseries"}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
         to_json(response).await
     }
 

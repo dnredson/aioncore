@@ -41,17 +41,19 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 77 route modularization: `apps/aion-api/src/lib.rs` now extracts the TTN mapping, TTN validation, TTN live-readiness, and TTN live-validation HTTP surface into `src/routes/ttn.rs`, preserving endpoint paths, auth semantics, tenant/resource ownership behavior, TTN device mapping behavior, TTN validation diagnostics, dry-run/live-preflight safety behavior, and JSON shapes while intentionally leaving ingestion worker plan/status/reconcile routes in `lib.rs` for the next extraction step.
 - Milestone 78 route modularization: `apps/aion-api/src/lib.rs` now extracts the ingestion worker plan/status/reconcile HTTP surface into `src/routes/workers.rs`, preserving endpoint paths, auth semantics, `/ready` worker summaries, worker planner output, dynamic reconciliation behavior, MQTT worker behavior, TTN worker skip behavior, and JSON shapes while intentionally leaving shared worker planner/runtime orchestration in `lib.rs` for a later cleanup pass.
 - Milestone 79 support cleanup: `apps/aion-api/src/lib.rs` now extracts shared connector, TTN, and worker support into `src/connector_support.rs`, `src/ttn_support.rs`, and `src/worker_support.rs`, preserving connector admin behavior, connector-aware ingestion behavior, TTN mapping/validation/live-preflight behavior, worker planning and reconciliation behavior, MQTT worker behavior, readiness summaries, auth semantics, and JSON shapes while intentionally leaving broader ingest decode/event helpers in `lib.rs`.
+- Milestone 80 historical time-series query API foundation: `aion-api` now adds dedicated `GET /timeseries/query` and `GET /timeseries/entities/{entity_id}/properties` routes for dashboard-oriented historical observation reads, preserving existing `/observations` behavior, reusing tenant-aware entity ownership checks, adding `timeseries:read` token-mode scope protection, and intentionally deferring interval bucket aggregation, dashboard UI, MCP time-series tools, and storage-engine-specific optimization.
 
 ## Next
 
-1. Add historical observation/time-series query APIs without changing the existing `/observations` behavior.
+1. Add the first dashboard exploration skeleton on top of the historical time-series API foundation without coupling UI work to MCP tooling.
 2. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
 3. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
 
 ## Future
 
 - Cassandra telemetry adapter.
-- Dashboard.
+- Dashboard exploration UI.
+- MCP time-series query tools.
 - Production MCP transport.
 - SmartSentinel runtime and agent integration.
 - Aion Edge Adapter runtime.

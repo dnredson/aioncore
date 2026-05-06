@@ -19,6 +19,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 
 - [Authentication Usage](AUTH_USAGE.md)
 - [Ingestion Usage](INGESTION_USAGE.md)
+- [Time-Series Usage](TIMESERIES_USAGE.md)
 - [TTN Usage](TTN_USAGE.md)
 - [SmartSentinel Usage](SMARTSENTINEL_USAGE.md)
 - [MCP Usage](MCP_USAGE.md)

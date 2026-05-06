@@ -88,6 +88,7 @@ Operational usage guides:
 
 - [Authentication Usage](docs/AUTH_USAGE.md)
 - [Ingestion Usage](docs/INGESTION_USAGE.md)
+- [Time-Series Usage](docs/TIMESERIES_USAGE.md)
 - [TTN Usage](docs/TTN_USAGE.md)
 - [SmartSentinel Usage](docs/SMARTSENTINEL_USAGE.md)
 - [MCP Usage](docs/MCP_USAGE.md)

@@ -1,0 +1,5 @@
+warn: could not canonicalize path C:\Users\dnred
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running `target\debug\aion-api.exe`
+startup storage backend=memory, database_url_provided=false, migrations_applied=n/a, auth_mode=token, auth_enforcement_level=partial, auth_dev_bypass=false, bootstrap_admin_configured=true
+warning: AIONCORE_BOOTSTRAP_ADMIN_TOKEN is intended only for local bootstrap and development; remove it after creating real admin tokens; do not expose it publicly
