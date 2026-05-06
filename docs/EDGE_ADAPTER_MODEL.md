@@ -4,6 +4,8 @@ The Aion Edge Adapter is a future optional edge/fog component for collecting tel
 
 It is not required by the AionCore runtime. Existing AionCore server-side ingestion paths, including HTTP ingestion, MQTT ingestion, connector-aware HTTP ingestion, and dynamic MQTT connector workers, remain valid.
 
+MiNiFi can be used instead of, or alongside, a future Aion Edge Adapter when a deployment prefers an external reliable flow runtime. See [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md).
+
 ## Responsibilities
 
 ### AionCore
@@ -34,6 +36,8 @@ The adapter owns local collection and transport adaptation:
 - Preserve local provenance such as adapter ID, parser name, source protocol, source topic/path, connector ID, and replay status.
 
 The adapter may be implemented in Rust, Python, or another deployment-specific language later. This milestone does not import or integrate the existing Python prototype.
+
+When the adapter coexists with MiNiFi or NiFi, the adapter should preserve compatible external provenance fields so upstream replay and buffering state can survive delivery into AionCore.
 
 ## Why Optional
 
@@ -203,6 +207,8 @@ DLQ records may include raw payload only if local deployment policy allows it. R
 
 AionCore should not implement the adapter DLQ in this milestone. When replayed messages are eventually published to AionCore, adapter metadata should set `dlq_replayed = true`.
 
+Where NiFi or MiNiFi is used as the reliable upstream runtime, the same replay and buffering concepts should map into the shared `external.*` provenance keys documented in [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md).
+
 ## Retries And Backoff
 
 The adapter should use bounded retry policies:
@@ -279,6 +285,16 @@ Adapter-published messages should preserve metadata that helps explain origin an
 - optional local site or node identifiers
 
 AionCore should preserve this metadata in RawMessages and ingestion Events. Observations may also carry relevant adapter metadata when the decoder or request shape includes it.
+
+For compatibility with NiFi/MiNiFi-style reliable ingestion, adapter implementations should prefer stable metadata keys such as:
+
+- `external.source_system`
+- `external.idempotency_key`
+- `external.sync_session_id`
+- `external.replay_count`
+- `external.retry_count`
+- `external.stored_at_edge`
+- `external.sent_at`
 
 Future adapter heartbeats may be represented as Observations or Events:
 

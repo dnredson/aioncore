@@ -87,6 +87,7 @@ Core architecture and models:
 - [Security Model](docs/SECURITY_MODEL.md)
 - [Dashboard Model](docs/DASHBOARD_MODEL.md)
 - [Flow Model](docs/FLOW_MODEL.md)
+- [NiFi Integration Model](docs/NIFI_INTEGRATION_MODEL.md)
 - [Aion Edge Adapter Model](docs/EDGE_ADAPTER_MODEL.md)
 - [SmartSentinel Integration Model](docs/SMARTSENTINEL_INTEGRATION.md)
 
@@ -100,6 +101,7 @@ Operational usage guides:
 - [TTN Usage](docs/TTN_USAGE.md)
 - [SmartSentinel Usage](docs/SMARTSENTINEL_USAGE.md)
 - [MCP Usage](docs/MCP_USAGE.md)
+- [NiFi/MiNiFi Usage](docs/NIFI_USAGE.md)
 - [Commands, Rules, and Executors Usage](docs/COMMANDS_RULES_EXECUTORS_USAGE.md)
 - [Runtime Validation](docs/RUNTIME_VALIDATION.md)
 

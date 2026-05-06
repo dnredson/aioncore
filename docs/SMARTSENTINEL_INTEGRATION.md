@@ -4,6 +4,8 @@ SmartSentinel is an optional operational integration for AionCore. It is not a c
 
 AionCore remains domain-agnostic. SmartSentinel can participate as an observer, executor, or evidence source in operational and infrastructure monitoring deployments.
 
+For deployments that also use NiFi or MiNiFi for reliable transport, replay, or store-and-forward, use the shared external provenance conventions documented in [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md).
+
 ## Integration Roles
 
 ### Optional Observer
@@ -44,6 +46,14 @@ Examples:
 - ActionResult: remediation failed due to permission error.
 
 Critical remediation must not be automatic by default. AionCore should require explicit capability, policy, and authorization design before allowing SmartSentinel or any integration to execute critical actions.
+
+## Relationship To Reliable Flow Engines
+
+SmartSentinel and NiFi/MiNiFi solve different problems and can coexist:
+
+- SmartSentinel focuses on operational context, evidence, and optional executor workflows.
+- NiFi and MiNiFi focus on transport reliability, buffering, retry, routing, and replay.
+- AionCore remains the semantic destination and audit surface.
 
 ## Snapshot Ingestion
 

@@ -4,11 +4,15 @@ AionCore ingestion is payload-agnostic. HTTP and MQTT ingestion both preserve th
 
 Future optional edge/fog collection is described in [Aion Edge Adapter Model](EDGE_ADAPTER_MODEL.md). That adapter model does not replace AionCore server-side ingestion connectors.
 
+Optional reliable upstream flow-engine compatibility, including NiFi and MiNiFi envelope and provenance conventions, is described in [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md). That model does not change current ingestion behavior and does not add a NiFi dependency.
+
 ## Core Rule
 
 Raw messages must always be stored before normalization.
 
 This preserves auditability and enables later replay when decoders, payload profiles, or entity registrations change.
+
+For external reliable-ingestion runtimes such as NiFi, MiNiFi, SmartSentinel, or future edge adapters, AionCore should preserve external provenance in raw-message headers or equivalent metadata rather than replacing core ingest timestamps or source semantics.
 
 ## HTTP Ingestion
 
@@ -586,6 +590,7 @@ TTN connector validation in this milestone is deliberately limited to local conf
 
 ## Limitations
 
+- NiFi and MiNiFi integration is documentation-only in this milestone; current ingestion handlers do not interpret a dedicated reliable-ingestion envelope automatically.
 - Connector registry persistence is available for in-memory and PostgreSQL storage.
 - Dynamic MQTT workers are implemented for `generic-aion-mqtt`, `generic-mqtt`, and `ttn-v3` connector profiles and must be explicitly enabled.
 - TTN/The Things Stack live validation is limited to an explicit MQTT connection/subscription preflight. It does not validate account semantics beyond broker authentication/subscription behavior and does not ingest messages.

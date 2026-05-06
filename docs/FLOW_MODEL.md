@@ -33,6 +33,7 @@ The current milestone does not add:
 - MQTT publish or HTTP forward sinks
 - broker subscriptions driven by flows
 - DLQ runtime processing
+- external flow-engine execution, including NiFi or MiNiFi execution
 
 ## Core Types
 
@@ -128,6 +129,8 @@ Examples:
 - `RawMessage` remains the required pre-normalization persistence layer.
 - future `dlq` flow nodes are intended to model operational error paths, but no DLQ runtime is introduced in this milestone.
 
+Flows may also reference external operational flow engines through metadata only. For example, a Flow can document that its real transport or replay path is implemented in NiFi or MiNiFi while AionCore continues to own the semantic destination model. See [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md).
+
 Flows do not replace these models. They provide an explicit graph representation for how operators expect source, processing, and sink stages to be configured.
 
 ## Validation Rules
@@ -152,3 +155,10 @@ This model is the backend contract for later milestones:
 - runtime source binding and sink dispatch
 - operational validation and simulation
 - DLQ visibility and replay tooling
+
+External flow references should use stable metadata keys where applicable:
+
+- `external.source_system`
+- `external.flow_id`
+- `external.flow_name`
+- `external.process_group_id`

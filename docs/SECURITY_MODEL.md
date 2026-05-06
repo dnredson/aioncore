@@ -330,6 +330,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `dashboard:read`
 - `flows:read`
 - `flows:write`
+- `provenance:read`
 - `events:read`
 - `raw-messages:read`
 - `secrets:admin`
@@ -348,6 +349,8 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `capabilities:write`
 - `mcp:tools`
 - `smartsentinel:ingest`
+- `dlq:write`
+- `batches:write`
 - `adapters:register`
 - `adapters:heartbeat`
 - `executors:register`
@@ -375,6 +378,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `dashboard:read` covers read-only dashboard aggregation routes that summarize entities, time-series discovery, connectors, brokers, and worker health.
 - `flows:read` covers flow list and detail inspection.
 - `flows:write` covers flow creation, update, enable, disable, and deletion.
+- `provenance:read` covers provenance-oriented aggregate search and future provenance-heavy operational APIs.
 - `events:read` covers `/events` list and detail reads without broadening command, observation, or provenance access.
 - `raw-messages:read` covers `/raw-messages` list and detail reads, which can expose raw payloads, ingestion headers, connector metadata, and provenance-linked evidence references.
 - `commands:read` covers command visibility through generic, executor, and AI-context read paths.
@@ -394,6 +398,8 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `executors:write` and `executors:admin` cover selected executor capability and scope configuration writes.
 - SmartSentinel executor bridge scopes are intentionally separate from generic executor scopes so bridge tokens can stay narrow.
 - `mcp:tools` should authorize local or production MCP tool invocation, not generic write access.
+- `dlq:write` is reserved for future machine writers that submit DLQ records or acknowledgements.
+- `batches:write` is reserved for future machine writers that create batch or backfill session records.
 - `auth:tokens:admin` covers token issuance, listing, inspection, and revocation.
 - `admin:all` is a reserved break-glass scope and satisfies any route scope check.
 
@@ -413,6 +419,8 @@ User and admin APIs should eventually support API tokens first, with JWT or OAut
 ### Machine-Facing APIs
 
 Devices, adapters, executors, connectors, and bridges should use dedicated machine credentials rather than user tokens reused across automation.
+
+External reliable flow engines such as NiFi or MiNiFi should also authenticate as dedicated machine principals. The likely minimum future scope for runtime delivery is `ingestion:write`. Read-only operational integrations may also need `flows:read` or `dashboard:read`. Future reliable-ingestion extensions may use dedicated `dlq:write` and `batches:write` scopes.
 
 ### Secret Storage For API Credentials
 
@@ -777,6 +785,8 @@ Implemented shape:
 
 ## Open Questions For Later Milestones
 
+- How strictly the platform should validate and constrain externally supplied provenance before later replay and batch features depend on it.
+- Whether NiFi or MiNiFi-style reliable machine writers should get a dedicated principal type or continue to use scoped service-style tokens.
 - Whether command approval should get its own dedicated scope.
 - Whether connector-aware ingestion should distinguish connector administration from connector write traffic with a separate scope.
 - Whether `ready` should be fully authenticated in all production deployments or only kept network-private.

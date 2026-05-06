@@ -16,6 +16,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [Security Model](SECURITY_MODEL.md)
 - [Dashboard Model](DASHBOARD_MODEL.md)
 - [Flow Model](FLOW_MODEL.md)
+- [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md)
 
 ## Usage Guides
 
@@ -27,6 +28,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [TTN Usage](TTN_USAGE.md)
 - [SmartSentinel Usage](SMARTSENTINEL_USAGE.md)
 - [MCP Usage](MCP_USAGE.md)
+- [NiFi/MiNiFi Usage](NIFI_USAGE.md)
 - [Commands, Rules, and Executors Usage](COMMANDS_RULES_EXECUTORS_USAGE.md)
 - [Runtime Validation](RUNTIME_VALIDATION.md)
 
