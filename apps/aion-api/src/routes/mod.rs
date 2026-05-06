@@ -13,3 +13,4 @@ pub(crate) mod provenance;
 pub(crate) mod raw_messages;
 pub(crate) mod smartsentinel;
 pub(crate) mod ttn;
+pub(crate) mod workers;
