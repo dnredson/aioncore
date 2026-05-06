@@ -30,6 +30,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
+use routes::executors::{ExecutorClaimCommandRequest, PutExecutorScopeRequest};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -53,8 +54,8 @@ use auth::hash_token_value;
 use auth::issue_api_token;
 use auth::{
     deny_cross_tenant_write, is_admin_all, map_principal_type_from_storage, principal_tenant_id,
-    principal_tenant_or_default, require_any_scope, require_scope, require_scope_for_write,
-    resolve_auth_context, tenant_for_created_resource, AuthContext, TokenRejectionReason,
+    principal_tenant_or_default, require_scope, require_scope_for_write, resolve_auth_context,
+    tenant_for_created_resource, AuthContext, TokenRejectionReason,
 };
 pub use auth::{AuthConfig, AuthEnforcementLevel, AuthMode, PrincipalType};
 use error::ApiError;
@@ -343,7 +344,7 @@ impl AppState {
     }
 }
 
-fn state_for_tenant(state: &AppState, tenant_id: Uuid) -> AppState {
+pub(crate) fn state_for_tenant(state: &AppState, tenant_id: Uuid) -> AppState {
     let mut scoped = state.clone();
     scoped.tenant_id = tenant_id;
     scoped
@@ -1009,73 +1010,14 @@ pub struct PutCapabilityRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateExecutorRequest {
-    pub agent_key: String,
-    pub agent_type: String,
-    pub display_name: Option<String>,
-    pub status: Option<ExecutorAgentStatus>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ExecutorHeartbeatRequest {
-    pub status: ExecutorAgentStatus,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ExecutorClaimCommandRequest {
-    pub lease_duration_seconds: Option<i64>,
-    pub max_retries: Option<u32>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PutExecutorCapabilityRequest {
-    pub command_type: String,
-    pub protocol: Option<String>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PutExecutorScopeRequest {
-    pub target_entity_id: Option<Uuid>,
-    pub entity_type: Option<String>,
-    pub relationship_type: Option<String>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ExecutorCompleteCommandRequest {
-    pub result_payload: Value,
-    pub verified: Option<bool>,
-    pub status: Option<String>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ExecutorFailCommandRequest {
-    pub failure_reason: String,
-    pub result_payload: Option<Value>,
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ExecutorCommandCompletionResponse {
-    pub command: Command,
-    pub action: Action,
-    pub action_result: ActionResult,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RegisterSmartSentinelExecutorRequest {
-    pub agent_key: String,
-    pub display_name: Option<String>,
-    pub metadata: Option<Value>,
+pub(crate) struct RegisterSmartSentinelExecutorRequest {
+    pub(crate) agent_key: String,
+    pub(crate) display_name: Option<String>,
+    pub(crate) metadata: Option<Value>,
     #[serde(default)]
-    pub capabilities: Vec<SmartSentinelExecutorCapabilityRequest>,
+    pub(crate) capabilities: Vec<SmartSentinelExecutorCapabilityRequest>,
     #[serde(default)]
-    pub scopes: Vec<PutExecutorScopeRequest>,
+    pub(crate) scopes: Vec<PutExecutorScopeRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1478,33 +1420,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/rules/:rule_id", get(get_rule))
         .route("/rules/:rule_id/enable", put(enable_rule))
         .route("/rules/:rule_id/disable", put(disable_rule))
-        .route("/executors", post(create_executor).get(list_executors))
-        .route("/executors/:executor_id", get(get_executor))
-        .route("/executors/:executor_id/heartbeat", put(heartbeat_executor))
-        .route(
-            "/executors/:executor_id/capabilities",
-            put(put_executor_capabilities).get(get_executor_capabilities),
-        )
-        .route(
-            "/executors/:executor_id/scopes",
-            put(put_executor_scopes).get(get_executor_scopes),
-        )
-        .route(
-            "/executors/:executor_id/commands/pending",
-            get(poll_executor_pending_commands),
-        )
-        .route(
-            "/executors/:executor_id/commands/:command_id/claim",
-            post(claim_executor_command),
-        )
-        .route(
-            "/executors/:executor_id/commands/:command_id/complete",
-            post(complete_executor_command),
-        )
-        .route(
-            "/executors/:executor_id/commands/:command_id/fail",
-            post(fail_executor_command),
-        )
+        .merge(routes::executors::router())
         .merge(routes::adapters::router())
         .route("/commands", post(create_command).get(query_commands))
         .route(
@@ -3138,495 +3054,6 @@ async fn evaluate_rules_manually(
     let event = require_same_tenant_for_target_event(&state, &auth, "/rules/evaluate", event_id)?;
     let scoped_state = state_for_tenant(&state, event.tenant_id);
     evaluate_rules_for_event(&scoped_state, &event, false).map(Json)
-}
-
-async fn create_executor(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Json(request): Json<CreateExecutorRequest>,
-) -> Result<(StatusCode, Json<ExecutorAgent>), ApiError> {
-    require_scope(&state, &auth, "/executors", "executors:register")?;
-    let now = Utc::now();
-    let executor = ExecutorAgent::new(
-        state.tenant_id,
-        request.agent_key,
-        request.agent_type,
-        request.display_name,
-        request.status.unwrap_or(ExecutorAgentStatus::Online),
-        request.metadata,
-        now,
-    )
-    .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let executor = state.storage.create_executor(executor)?;
-    record_executor_event(
-        &state,
-        "aion:ExecutorRegistered",
-        &executor,
-        None,
-        Some(json!({"agent_type": executor.agent_type})),
-    )?;
-
-    Ok((StatusCode::CREATED, Json(executor)))
-}
-
-async fn list_executors(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-) -> Result<Json<Vec<ExecutorAgent>>, ApiError> {
-    require_scope(&state, &auth, "/executors", "executors:read")?;
-    let executors = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
-        state.storage.list_executors(state.tenant_id)?
-    } else if is_admin_all(&auth) {
-        state.storage.list_all_executors()?
-    } else {
-        state.storage.list_executors(principal_tenant_id(&auth)?)?
-    };
-    Ok(Json(executors))
-}
-
-async fn get_executor(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(executor_id): Path<Uuid>,
-) -> Result<Json<ExecutorAgent>, ApiError> {
-    require_scope(&state, &auth, "/executors/:executor_id", "executors:read")?;
-    let executor = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
-        state
-            .storage
-            .get_executor(state.tenant_id, executor_id)?
-            .ok_or_else(ApiError::not_found)?
-    } else if is_admin_all(&auth) {
-        state
-            .storage
-            .get_executor_any_tenant(executor_id)?
-            .ok_or_else(ApiError::not_found)?
-    } else {
-        let tenant_id = principal_tenant_id(&auth)?;
-        match state.storage.get_executor(tenant_id, executor_id)? {
-            Some(executor) => executor,
-            None => {
-                if state
-                    .storage
-                    .get_executor_any_tenant(executor_id)?
-                    .is_some()
-                {
-                    return Err(ApiError::forbidden(
-                        "principal tenant does not own the resource for /executors/:executor_id",
-                    ));
-                }
-                return Err(ApiError::not_found());
-            }
-        }
-    };
-    Ok(Json(executor))
-}
-
-async fn heartbeat_executor(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(executor_id): Path<Uuid>,
-    Json(request): Json<ExecutorHeartbeatRequest>,
-) -> Result<Json<ExecutorAgent>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/executors/:executor_id/heartbeat",
-        "executors:heartbeat",
-    )?;
-    let mut executor = get_executor_agent(&state, executor_id)?;
-    executor.heartbeat(request.status, Utc::now());
-    if request.metadata.is_some() {
-        executor.metadata = request.metadata;
-    }
-    let executor = state.storage.update_executor(executor)?;
-    record_executor_event(
-        &state,
-        "aion:ExecutorHeartbeat",
-        &executor,
-        None,
-        Some(json!({"status": executor.status})),
-    )?;
-
-    Ok(Json(executor))
-}
-
-async fn put_executor_capabilities(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(executor_id): Path<Uuid>,
-    Json(requests): Json<Vec<PutExecutorCapabilityRequest>>,
-) -> Result<(StatusCode, Json<Vec<ExecutorCapability>>), ApiError> {
-    require_any_scope(
-        &state,
-        &auth,
-        "/executors/:executor_id/capabilities",
-        &["executors:admin", "executors:write"],
-    )?;
-    let executor = require_same_tenant_for_target_executor(
-        &state,
-        &auth,
-        "/executors/:executor_id/capabilities",
-        executor_id,
-    )?;
-    let scoped_state = state_for_tenant(&state, executor.tenant_id);
-    let capabilities = requests
-        .into_iter()
-        .map(|request| {
-            ExecutorCapability::new(
-                executor_id,
-                request.command_type,
-                request.protocol,
-                request.metadata,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
-
-    Ok((
-        StatusCode::OK,
-        Json(scoped_state.storage.put_executor_capabilities(
-            scoped_state.tenant_id,
-            executor_id,
-            capabilities,
-        )?),
-    ))
-}
-
-async fn get_executor_capabilities(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(executor_id): Path<Uuid>,
-) -> Result<Json<Vec<ExecutorCapability>>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/executors/:executor_id/capabilities",
-        "executors:read",
-    )?;
-    let executor = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
-        state
-            .storage
-            .get_executor(state.tenant_id, executor_id)?
-            .ok_or_else(ApiError::not_found)?
-    } else if is_admin_all(&auth) {
-        state
-            .storage
-            .get_executor_any_tenant(executor_id)?
-            .ok_or_else(ApiError::not_found)?
-    } else {
-        let tenant_id = principal_tenant_id(&auth)?;
-        match state.storage.get_executor(tenant_id, executor_id)? {
-            Some(executor) => executor,
-            None => {
-                if state
-                    .storage
-                    .get_executor_any_tenant(executor_id)?
-                    .is_some()
-                {
-                    return Err(ApiError::forbidden(
-                        "principal tenant does not own the resource for /executors/:executor_id/capabilities",
-                    ));
-                }
-                return Err(ApiError::not_found());
-            }
-        }
-    };
-    Ok(Json(state.storage.list_executor_capabilities(
-        executor.tenant_id,
-        executor_id,
-    )?))
-}
-
-async fn put_executor_scopes(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(executor_id): Path<Uuid>,
-    Json(requests): Json<Vec<PutExecutorScopeRequest>>,
-) -> Result<(StatusCode, Json<Vec<ExecutorScope>>), ApiError> {
-    require_any_scope(
-        &state,
-        &auth,
-        "/executors/:executor_id/scopes",
-        &["executors:admin", "executors:write"],
-    )?;
-    let executor = require_same_tenant_for_target_executor(
-        &state,
-        &auth,
-        "/executors/:executor_id/scopes",
-        executor_id,
-    )?;
-    let scoped_state = state_for_tenant(&state, executor.tenant_id);
-    let mut scopes = Vec::with_capacity(requests.len());
-    for request in requests {
-        if let Some(target_entity_id) = request.target_entity_id {
-            require_same_tenant_for_target_entity(
-                &state,
-                &auth,
-                "/executors/:executor_id/scopes",
-                target_entity_id,
-            )?;
-        }
-        scopes.push(ExecutorScope::new(
-            executor_id,
-            request.target_entity_id,
-            request.entity_type,
-            request.relationship_type,
-            request.metadata,
-        ));
-    }
-
-    Ok((
-        StatusCode::OK,
-        Json(scoped_state.storage.put_executor_scopes(
-            scoped_state.tenant_id,
-            executor_id,
-            scopes,
-        )?),
-    ))
-}
-
-async fn get_executor_scopes(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(executor_id): Path<Uuid>,
-) -> Result<Json<Vec<ExecutorScope>>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/executors/:executor_id/scopes",
-        "executors:read",
-    )?;
-    let executor = if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
-        state
-            .storage
-            .get_executor(state.tenant_id, executor_id)?
-            .ok_or_else(ApiError::not_found)?
-    } else if is_admin_all(&auth) {
-        state
-            .storage
-            .get_executor_any_tenant(executor_id)?
-            .ok_or_else(ApiError::not_found)?
-    } else {
-        let tenant_id = principal_tenant_id(&auth)?;
-        match state.storage.get_executor(tenant_id, executor_id)? {
-            Some(executor) => executor,
-            None => {
-                if state
-                    .storage
-                    .get_executor_any_tenant(executor_id)?
-                    .is_some()
-                {
-                    return Err(ApiError::forbidden(
-                        "principal tenant does not own the resource for /executors/:executor_id/scopes",
-                    ));
-                }
-                return Err(ApiError::not_found());
-            }
-        }
-    };
-    Ok(Json(
-        state
-            .storage
-            .list_executor_scopes(executor.tenant_id, executor_id)?,
-    ))
-}
-
-async fn poll_executor_pending_commands(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(executor_id): Path<Uuid>,
-) -> Result<Json<Vec<Command>>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/executors/:executor_id/commands/pending",
-        "executors:poll",
-    )?;
-    ensure_executor_exists(&state, executor_id)?;
-    let commands = state
-        .storage
-        .query_commands(state.tenant_id, None, Some(CommandStatus::Pending))?
-        .into_iter()
-        .filter(|command| executor_can_run_command(&state, executor_id, command).unwrap_or(false))
-        .collect::<Vec<_>>();
-
-    Ok(Json(commands))
-}
-
-async fn claim_executor_command(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
-    request: Option<Json<ExecutorClaimCommandRequest>>,
-) -> Result<Json<Command>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/executors/:executor_id/commands/:command_id/claim",
-        "executors:claim",
-    )?;
-    let executor = get_executor_agent(&state, executor_id)?;
-    ensure_executor_can_run_command(&state, executor_id, command_id)?;
-    let request = request.map(|Json(request)| request);
-    let command = claim_command_for_executor(
-        &state,
-        command_id,
-        &executor,
-        request
-            .as_ref()
-            .and_then(|request| request.lease_duration_seconds),
-        request.as_ref().and_then(|request| request.max_retries),
-        request.and_then(|request| request.metadata),
-    )?;
-    record_executor_event(
-        &state,
-        "aion:ExecutorClaimedCommand",
-        &executor,
-        Some(&command),
-        None,
-    )?;
-
-    Ok(Json(command))
-}
-
-async fn complete_executor_command(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
-    Json(request): Json<ExecutorCompleteCommandRequest>,
-) -> Result<Json<ExecutorCommandCompletionResponse>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/executors/:executor_id/commands/:command_id/complete",
-        "executors:report",
-    )?;
-    let executor = get_executor_agent(&state, executor_id)?;
-    let command = get_command_for_executor_mutation(&state, command_id, &executor.agent_key)?;
-    let now = Utc::now();
-    let action = Action::new(
-        state.tenant_id,
-        command.id,
-        None,
-        command.command_type.clone(),
-        "completed",
-        command.claimed_at,
-        Some(now),
-        Some(json!({
-            "executor_id": executor.id,
-            "agent_key": executor.agent_key,
-            "source": "executor_api"
-        })),
-    )
-    .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let action = state.storage.store_action(action)?;
-    let action_result = ActionResult::new(
-        state.tenant_id,
-        command.id,
-        action.id,
-        request.status.unwrap_or_else(|| "succeeded".to_string()),
-        request.verified.unwrap_or(true),
-        request.result_payload,
-        now,
-        Some(enrich_executor_result_metadata(&executor, request.metadata)),
-    )
-    .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let action_result = state.storage.store_action_result(action_result)?;
-    let command = mutate_command_raw(&state, command_id, |command, now| {
-        command.mark_executed(now)
-    })?;
-    mark_active_lease_completed(&state, command_id, executor_id)?;
-    record_command_event(
-        &state,
-        "aion:CommandExecuted",
-        EventSeverity::Info,
-        &command,
-        None,
-    )?;
-    record_executor_event(
-        &state,
-        "aion:ExecutorCompletedCommand",
-        &executor,
-        Some(&command),
-        Some(json!({"action_id": action.id, "action_result_id": action_result.id})),
-    )?;
-
-    Ok(Json(ExecutorCommandCompletionResponse {
-        command,
-        action,
-        action_result,
-    }))
-}
-
-async fn fail_executor_command(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path((executor_id, command_id)): Path<(Uuid, Uuid)>,
-    Json(request): Json<ExecutorFailCommandRequest>,
-) -> Result<Json<ExecutorCommandCompletionResponse>, ApiError> {
-    require_scope(
-        &state,
-        &auth,
-        "/executors/:executor_id/commands/:command_id/fail",
-        "executors:report",
-    )?;
-    let executor = get_executor_agent(&state, executor_id)?;
-    let command = get_command_for_executor_mutation(&state, command_id, &executor.agent_key)?;
-    let now = Utc::now();
-    let action = Action::new(
-        state.tenant_id,
-        command.id,
-        None,
-        command.command_type.clone(),
-        "failed",
-        command.claimed_at,
-        Some(now),
-        Some(json!({
-            "executor_id": executor.id,
-            "agent_key": executor.agent_key,
-            "source": "executor_api"
-        })),
-    )
-    .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let action = state.storage.store_action(action)?;
-    let action_result = ActionResult::new(
-        state.tenant_id,
-        command.id,
-        action.id,
-        "failed",
-        false,
-        request
-            .result_payload
-            .unwrap_or_else(|| json!({"failure_reason": request.failure_reason})),
-        now,
-        Some(enrich_executor_result_metadata(&executor, request.metadata)),
-    )
-    .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let action_result = state.storage.store_action_result(action_result)?;
-    let command = mutate_command_raw(&state, command_id, |command, now| {
-        command.mark_failed(request.failure_reason, now)
-    })?;
-    mark_active_lease_failed(&state, command_id, executor_id)?;
-    record_command_event(
-        &state,
-        "aion:CommandFailed",
-        EventSeverity::Error,
-        &command,
-        None,
-    )?;
-    record_executor_event(
-        &state,
-        "aion:ExecutorFailedCommand",
-        &executor,
-        Some(&command),
-        Some(json!({"action_id": action.id, "action_result_id": action_result.id})),
-    )?;
-
-    Ok(Json(ExecutorCommandCompletionResponse {
-        command,
-        action,
-        action_result,
-    }))
 }
 
 async fn register_smartsentinel_executor(
@@ -6825,7 +6252,7 @@ fn validate_smartsentinel_observation_items(
     Ok(())
 }
 
-fn require_same_tenant_for_target_entity(
+pub(crate) fn require_same_tenant_for_target_entity(
     state: &AppState,
     auth: &AuthContext,
     endpoint: &'static str,
@@ -6924,7 +6351,7 @@ fn require_same_tenant_for_target_rule(
     }
 }
 
-fn require_same_tenant_for_target_executor(
+pub(crate) fn require_same_tenant_for_target_executor(
     state: &AppState,
     auth: &AuthContext,
     endpoint: &'static str,
@@ -10373,7 +9800,7 @@ fn ensure_raw_message_exists(state: &AppState, raw_message_id: Uuid) -> Result<(
         .ok_or_else(ApiError::not_found)
 }
 
-fn ensure_executor_exists(state: &AppState, executor_id: Uuid) -> Result<(), ApiError> {
+pub(crate) fn ensure_executor_exists(state: &AppState, executor_id: Uuid) -> Result<(), ApiError> {
     state
         .storage
         .get_executor(state.tenant_id, executor_id)?
@@ -10381,7 +9808,10 @@ fn ensure_executor_exists(state: &AppState, executor_id: Uuid) -> Result<(), Api
         .ok_or_else(ApiError::not_found)
 }
 
-fn get_executor_agent(state: &AppState, executor_id: Uuid) -> Result<ExecutorAgent, ApiError> {
+pub(crate) fn get_executor_agent(
+    state: &AppState,
+    executor_id: Uuid,
+) -> Result<ExecutorAgent, ApiError> {
     state
         .storage
         .get_executor(state.tenant_id, executor_id)?
@@ -10540,7 +9970,7 @@ fn insert_optional_string(
     }
 }
 
-fn ensure_executor_can_run_command(
+pub(crate) fn ensure_executor_can_run_command(
     state: &AppState,
     executor_id: Uuid,
     command_id: Uuid,
@@ -10559,7 +9989,7 @@ fn ensure_executor_can_run_command(
     Ok(command)
 }
 
-fn executor_can_run_command(
+pub(crate) fn executor_can_run_command(
     state: &AppState,
     executor_id: Uuid,
     command: &Command,
@@ -10634,7 +10064,7 @@ fn executor_scope_matches_command(
     Ok(true)
 }
 
-fn get_command_for_executor_mutation(
+pub(crate) fn get_command_for_executor_mutation(
     state: &AppState,
     command_id: Uuid,
     agent_key: &str,
@@ -10659,7 +10089,7 @@ fn get_command_for_executor_mutation(
     Ok(command)
 }
 
-fn claim_command_for_executor(
+pub(crate) fn claim_command_for_executor(
     state: &AppState,
     command_id: Uuid,
     executor: &ExecutorAgent,
@@ -10772,7 +10202,7 @@ fn release_active_lease(
     Ok(lease)
 }
 
-fn mark_active_lease_completed(
+pub(crate) fn mark_active_lease_completed(
     state: &AppState,
     command_id: Uuid,
     executor_id: Uuid,
@@ -10782,7 +10212,7 @@ fn mark_active_lease_completed(
     Ok(state.storage.update_command_lease(lease)?)
 }
 
-fn mark_active_lease_failed(
+pub(crate) fn mark_active_lease_failed(
     state: &AppState,
     command_id: Uuid,
     executor_id: Uuid,
@@ -10831,7 +10261,10 @@ fn record_lease_event(
     )
 }
 
-fn enrich_executor_result_metadata(executor: &ExecutorAgent, metadata: Option<Value>) -> Value {
+pub(crate) fn enrich_executor_result_metadata(
+    executor: &ExecutorAgent,
+    metadata: Option<Value>,
+) -> Value {
     let mut enriched = json!({
         "executor_id": executor.id,
         "agent_key": executor.agent_key,
@@ -10844,7 +10277,7 @@ fn enrich_executor_result_metadata(executor: &ExecutorAgent, metadata: Option<Va
     enriched
 }
 
-fn record_executor_event(
+pub(crate) fn record_executor_event(
     state: &AppState,
     event_type: impl Into<String>,
     executor: &ExecutorAgent,
@@ -10887,7 +10320,7 @@ fn record_executor_event(
     )
 }
 
-fn record_command_event(
+pub(crate) fn record_command_event(
     state: &AppState,
     event_type: impl Into<String>,
     severity: EventSeverity,
@@ -11262,7 +10695,7 @@ fn mutate_command(
     Ok(Json(command))
 }
 
-fn mutate_command_raw(
+pub(crate) fn mutate_command_raw(
     state: &AppState,
     command_id: Uuid,
     mutate: impl FnOnce(&mut Command, DateTime<Utc>) -> Result<(), aion_action::ActionModelError>,

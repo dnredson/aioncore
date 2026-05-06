@@ -1,0 +1,9 @@
+C:\Users\dnred\OneDrive\projetos\AionCore\target-m65-aion-api\debug\deps\stringprep-984081faf9fda014.d: C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\lib.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\rfc3454.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\tables.rs
+
+C:\Users\dnred\OneDrive\projetos\AionCore\target-m65-aion-api\debug\deps\libstringprep-984081faf9fda014.rlib: C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\lib.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\rfc3454.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\tables.rs
+
+C:\Users\dnred\OneDrive\projetos\AionCore\target-m65-aion-api\debug\deps\libstringprep-984081faf9fda014.rmeta: C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\lib.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\rfc3454.rs C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\tables.rs
+
+C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\lib.rs:
+C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\rfc3454.rs:
+C:\Users\dnred\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\stringprep-0.1.5\src\tables.rs:
