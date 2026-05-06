@@ -34,3 +34,6 @@
 *.pdb
 *.rlib
 *.exe
+
+# Local smoke/runtime logs
+smoke-*.log

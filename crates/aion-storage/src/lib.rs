@@ -681,6 +681,7 @@ pub trait IngestionConnectorStore {
         connector_id: Uuid,
     ) -> StorageResult<Option<IngestionConnector>>;
     fn list_ingestion_connectors(&self, tenant_id: Uuid) -> StorageResult<Vec<IngestionConnector>>;
+    fn list_all_ingestion_connectors(&self) -> StorageResult<Vec<IngestionConnector>>;
     fn update_ingestion_connector(
         &self,
         connector: IngestionConnector,
@@ -1570,6 +1571,22 @@ impl IngestionConnectorStore for InMemoryStorage {
             .collect::<Vec<_>>();
 
         connectors.sort_by(|left, right| left.connector_key.cmp(&right.connector_key));
+        Ok(connectors)
+    }
+
+    fn list_all_ingestion_connectors(&self) -> StorageResult<Vec<IngestionConnector>> {
+        let mut connectors = self
+            .read_state()?
+            .ingestion_connectors
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        connectors.sort_by(|left, right| {
+            left.tenant_id
+                .cmp(&right.tenant_id)
+                .then_with(|| left.connector_key.cmp(&right.connector_key))
+        });
         Ok(connectors)
     }
 

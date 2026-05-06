@@ -738,7 +738,7 @@ pub(crate) fn set_connector_workers_enabled(state: &AppState, enabled: bool) {
     }
 }
 
-fn connector_worker_spec(
+pub(crate) fn connector_worker_spec(
     state: &AppState,
     connector: IngestionConnector,
 ) -> Result<IngestionWorkerSpec, ApiError> {

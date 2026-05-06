@@ -3,6 +3,7 @@ pub(crate) mod ai;
 pub(crate) mod auth;
 pub(crate) mod commands;
 pub(crate) mod connectors;
+pub(crate) mod dashboard;
 pub(crate) mod entities;
 pub(crate) mod events;
 pub(crate) mod executors;

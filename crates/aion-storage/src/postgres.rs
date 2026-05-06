@@ -2795,6 +2795,28 @@ impl IngestionConnectorStore for PostgresStorage {
         })
     }
 
+    fn list_all_ingestion_connectors(&self) -> StorageResult<Vec<IngestionConnector>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, connector_key, connector_type, connector_profile,
+                        enabled, display_name, protocol, endpoint, broker_url, client_id,
+                        topic_filter, http_path, payload_format, content_type,
+                        secret_ref_id, default_producer_entity_id, default_feature_of_interest_id, metadata,
+                        created_at, updated_at
+                    FROM ingestion_connectors
+                    ORDER BY tenant_id ASC, connector_key ASC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_ingestion_connector)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
     fn update_ingestion_connector(
         &self,
         connector: IngestionConnector,

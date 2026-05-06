@@ -30,6 +30,7 @@ Milestone 60 adds selected tenant-aware write authorization on top of the Milest
   - `POST /relationships` requires `relationships:write`
   - `/observations` requires `observations:read`
   - `POST /observations` requires `observations:write`
+  - `/dashboard/overview`, `/dashboard/timeseries/entities`, and `/dashboard/connectors/overview` require `dashboard:read`
   - `/commands` and `/commands/{command_id}` require `commands:read`
   - selected generic command writes require `commands:create`, `commands:approve`, `commands:write`, `commands:claim`, or `commands:lease`
   - `/actions`, `/actions/{action_id}`, and `/action-results` require `actions:read`
@@ -324,6 +325,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `ingestion:write`
 - `connectors:read`
 - `connectors:admin`
+- `dashboard:read`
 - `events:read`
 - `raw-messages:read`
 - `secrets:admin`
@@ -366,6 +368,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `ingestion:write` protects both generic `/ingest/http` and connector-aware machine writes at `/ingestion/connectors/{connector_id}/ingest`.
 - `connectors:read` covers selected connector and worker operational reads without granting mutation.
 - `connectors:admin` covers connector lifecycle mutation, TTN device-mapping administration, worker reconciliation, TTN live validation preflight, validation-related operator actions, enable/disable, and configuration updates.
+- `dashboard:read` covers read-only dashboard aggregation routes that summarize entities, time-series discovery, connectors, brokers, and worker health.
 - `events:read` covers `/events` list and detail reads without broadening command, observation, or provenance access.
 - `raw-messages:read` covers `/raw-messages` list and detail reads, which can expose raw payloads, ingestion headers, connector metadata, and provenance-linked evidence references.
 - `commands:read` covers command visibility through generic, executor, and AI-context read paths.
@@ -513,6 +516,7 @@ The table below describes the intended future protection model. It does not chan
 | `/entities` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `entities:read` for GET, `entities:write` for POST | Includes standard entity CRUD-style growth over time. |
 | `/relationships` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `relationships:write`; future `relationships:read` if standalone read routes are added | Selected write authorization now applies in Milestone 60. |
 | `/observations` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` for GET, `observations:write` for POST | Direct write path should remain limited; most machine writers should prefer ingestion endpoints. |
+| `/dashboard/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `dashboard:read` | Implemented in Milestone 81 for read-only dashboard aggregation and discovery routes. Non-admin principals remain tenant-filtered. |
 | `/raw-messages` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `raw-messages:read` | Implemented in Milestone 55 for list and detail reads. Sensitive because raw payloads and headers may include operational metadata. |
 | `/ingest/http` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Primary generic ingestion write surface. |
 | `/ingestion/connectors` POST, PATCH, enable, disable, and `/ingestion/workers/reconcile` | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 51 for selected connector administration and worker reconciliation only. |
@@ -593,6 +597,8 @@ The table below describes the intended future protection model. It does not chan
   - `raw_messages`
   - `entities`
   - `observations`
+  - `timeseries`
+  - `dashboard`
   - `commands`
   - `actions`
   - `rules`

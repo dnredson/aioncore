@@ -502,6 +502,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .merge(routes::adapters::router())
         .merge(routes::commands::router())
         .merge(routes::connectors::router())
+        .merge(routes::dashboard::router())
         .merge(routes::smartsentinel::router())
         .merge(routes::mcp::router())
         .merge(routes::ai::router())
@@ -2291,6 +2292,7 @@ mod tests {
                 "entities",
                 "observations",
                 "timeseries",
+                "dashboard",
                 "commands",
                 "actions",
                 "rules",
@@ -2309,6 +2311,37 @@ mod tests {
             ])
         );
         assert_eq!(body["auth"]["bootstrap_admin_configured"], false);
+    }
+
+    #[tokio::test]
+    async fn ready_reports_dashboard_as_protected_group_in_token_mode() {
+        let state = AppState::with_backend_storage_and_auth(
+            Arc::new(InMemoryStorage::new()),
+            StorageBackendName::Memory,
+            AuthConfig {
+                mode: AuthMode::Token,
+                bootstrap_admin_token_hash: None,
+            },
+            Uuid::nil(),
+        );
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_json(response).await;
+        assert!(body["auth"]["protected_endpoint_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group == "dashboard"));
     }
 
     #[tokio::test]
@@ -4939,6 +4972,322 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(properties.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dev_mode_dashboard_overview_works_without_token() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&app, "dashboard-dev-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "dashboard-dev-plot-01", "aion:Plot").await;
+        create_test_observation_at(
+            &app,
+            &sensor_id,
+            &plot_id,
+            "temperature",
+            json!({"type": "number", "value": 22.5}),
+            Some("Cel"),
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+        create_http_connector(
+            &app,
+            "dashboard-dev-http-01",
+            Some(&sensor_id),
+            Some(&plot_id),
+        )
+        .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body["entities_count"], 2);
+        assert_eq!(body["observations_count"], 1);
+        assert_eq!(body["connectors_count"], 1);
+        assert_eq!(body["enabled_connectors_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn token_mode_dashboard_overview_without_token_returns_401() {
+        let app = token_mode_app_with_storage(Arc::new(InMemoryStorage::new()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_dashboard_overview_with_wrong_scope_returns_403() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("dashboard-wrong-scope"),
+            &["timeseries:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+        let response = app
+            .oneshot(auth_request("GET", "/dashboard/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_dashboard_overview_with_dashboard_read_succeeds() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("dashboard-reader"),
+            &["dashboard:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+        let response = app
+            .oneshot(auth_request("GET", "/dashboard/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_all_satisfies_dashboard_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Admin,
+            Some("dashboard-admin"),
+            &["admin:all"],
+        );
+        let app = token_mode_app_with_storage(storage);
+        let response = app
+            .oneshot(auth_request("GET", "/dashboard/overview", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dashboard_timeseries_entities_lists_entities_with_observed_properties() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor = create_test_entity(&app, "dashboard-ts-sensor-01", "aion:Sensor").await;
+        let named_plot = create_native_entity(
+            &app,
+            json!({
+                "entity_key": "dashboard-ts-plot-01",
+                "entity_type": "aion:Plot",
+                "jsonld": {
+                    "@context": {"aion": "https://aioncore.org/ns#"},
+                    "@id": "urn:aion:test:dashboard-ts-plot-01",
+                    "@type": "aion:Plot",
+                    "aion:name": "North Plot"
+                }
+            }),
+        )
+        .await;
+        let plot_id = named_plot["id"].as_str().unwrap().to_string();
+
+        create_test_observation_at(
+            &app,
+            &sensor,
+            &plot_id,
+            "temperature",
+            json!({"type": "number", "value": 21.0}),
+            Some("Cel"),
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+        create_test_observation_at(
+            &app,
+            &sensor,
+            &plot_id,
+            "soil.moisture",
+            json!({"type": "number", "value": 18.5}),
+            Some("%"),
+            "2026-05-05T12:05:00Z",
+        )
+        .await;
+
+        let body = get_json(&app, "/dashboard/timeseries/entities").await;
+        let entity = body["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["entity_key"] == "dashboard-ts-plot-01")
+            .unwrap();
+
+        assert_eq!(entity["display_name"], "North Plot");
+        assert_eq!(entity["observed_property_count"], 2);
+        assert_eq!(entity["observation_count"], 2);
+        assert_eq!(entity["last_observed_at"], "2026-05-05T12:05:00Z");
+    }
+
+    #[tokio::test]
+    async fn dashboard_connector_overview_returns_status_without_secret_values() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let secret = create_connector_secret(
+            &app,
+            "dashboard-mqtt-secret",
+            "farm-user",
+            "super-secret-value",
+        )
+        .await;
+        create_mqtt_connector_with_secret(
+            &app,
+            "dashboard-mqtt-01",
+            true,
+            Some("mqtt://farm-user:super-secret-value@broker.example:1883"),
+            Some("sensors/+/up"),
+            Some("senml-json"),
+            Some(secret["id"].as_str().unwrap()),
+        )
+        .await;
+
+        let body = get_json(&app, "/dashboard/connectors/overview").await;
+        let connector = body["connectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["connector_key"] == "dashboard-mqtt-01")
+            .unwrap();
+        let serialized = serde_json::to_string(&body).unwrap();
+
+        assert_eq!(connector["secret_configured"], true);
+        assert_eq!(connector["topic_filter"], "sensors/+/up");
+        assert_eq!(connector["payload_format"], "senml-json");
+        assert_eq!(connector["broker_url"], "mqtt://broker.example:1883");
+        assert!(!serialized.contains("super-secret-value"));
+        assert!(!serialized.contains("secret_value"));
+    }
+
+    #[tokio::test]
+    async fn tenant_filtering_applies_for_non_admin_dashboard_tokens() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+
+        let sensor_a =
+            create_test_entity(&tenant_a_app, "dashboard-tenant-a-sensor", "aion:Sensor").await;
+        let plot_a =
+            create_test_entity(&tenant_a_app, "dashboard-tenant-a-plot", "aion:Plot").await;
+        create_test_observation_at(
+            &tenant_a_app,
+            &sensor_a,
+            &plot_a,
+            "temperature",
+            json!({"type": "number", "value": 20.0}),
+            Some("Cel"),
+            "2026-05-05T12:00:00Z",
+        )
+        .await;
+        create_http_connector(
+            &tenant_a_app,
+            "dashboard-tenant-a-http",
+            Some(&sensor_a),
+            Some(&plot_a),
+        )
+        .await;
+
+        let sensor_b =
+            create_test_entity(&tenant_b_app, "dashboard-tenant-b-sensor", "aion:Sensor").await;
+        let plot_b =
+            create_test_entity(&tenant_b_app, "dashboard-tenant-b-plot", "aion:Plot").await;
+        create_test_observation_at(
+            &tenant_b_app,
+            &sensor_b,
+            &plot_b,
+            "temperature",
+            json!({"type": "number", "value": 30.0}),
+            Some("Cel"),
+            "2026-05-05T12:10:00Z",
+        )
+        .await;
+        create_http_connector(
+            &tenant_b_app,
+            "dashboard-tenant-b-http",
+            Some(&sensor_b),
+            Some(&plot_b),
+        )
+        .await;
+
+        let tenant_a_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("dashboard-tenant-a-reader"),
+            &["dashboard:read"],
+        );
+        let app = token_mode_app_with_storage(storage);
+
+        let overview = to_json(
+            app.clone()
+                .oneshot(auth_request("GET", "/dashboard/overview", &tenant_a_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(overview["entities_count"], 2);
+        assert_eq!(overview["observations_count"], 1);
+        assert_eq!(overview["connectors_count"], 1);
+
+        let timeseries = to_json(
+            app.clone()
+                .oneshot(auth_request(
+                    "GET",
+                    "/dashboard/timeseries/entities",
+                    &tenant_a_token,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let timeseries_entities = timeseries["entities"].as_array().unwrap();
+        assert_eq!(timeseries_entities.len(), 1);
+        assert_eq!(
+            timeseries_entities[0]["entity_key"],
+            "dashboard-tenant-a-plot"
+        );
+
+        let connectors = to_json(
+            app.clone()
+                .oneshot(auth_request(
+                    "GET",
+                    "/dashboard/connectors/overview",
+                    &tenant_a_token,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let connector_items = connectors["connectors"].as_array().unwrap();
+        assert_eq!(connector_items.len(), 1);
+        assert_eq!(
+            connector_items[0]["connector_key"],
+            "dashboard-tenant-a-http"
+        );
     }
 
     #[tokio::test]

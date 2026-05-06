@@ -2,6 +2,8 @@
 
 This guide covers the Milestone 80 historical observation/time-series query API foundation. It adds dashboard-ready historical reads, but it does not add a dashboard UI and it does not add MCP time-series tools yet.
 
+For the compact dashboard discovery endpoints added later, use [Dashboard Usage](DASHBOARD_USAGE.md).
+
 ## Scope
 
 - `GET /timeseries/query`
