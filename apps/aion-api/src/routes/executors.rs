@@ -1,12 +1,15 @@
 use crate::{
     auth::{is_admin_all, principal_tenant_id, require_any_scope, require_scope, AuthContext},
-    claim_command_for_executor, enrich_executor_result_metadata, ensure_executor_can_run_command,
+    command_support::{
+        claim_command_for_executor, enrich_executor_result_metadata,
+        ensure_executor_can_run_command, executor_can_run_command,
+        get_command_for_executor_mutation, mark_active_lease_completed, mark_active_lease_failed,
+        mutate_command_raw, record_command_event,
+    },
     ensure_executor_exists,
     error::ApiError,
-    get_command_for_executor_mutation, get_executor_agent, mark_active_lease_completed,
-    mark_active_lease_failed, record_command_event, record_executor_event,
-    require_same_tenant_for_target_entity, require_same_tenant_for_target_executor,
-    state_for_tenant, AppState, AuthMode,
+    get_executor_agent, record_executor_event, require_same_tenant_for_target_entity,
+    require_same_tenant_for_target_executor, state_for_tenant, AppState, AuthMode,
 };
 use aion_action::{
     Action, ActionResult, Command, CommandStatus, ExecutorAgent, ExecutorAgentStatus,
@@ -435,7 +438,7 @@ async fn complete_executor_command(
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let action_result = state.storage.store_action_result(action_result)?;
-    let command = crate::mutate_command_raw(&state, command_id, |command, now| {
+    let command = mutate_command_raw(&state, command_id, |command, now| {
         command.mark_executed(now)
     })?;
     mark_active_lease_completed(&state, command_id, executor_id)?;
@@ -506,7 +509,7 @@ async fn fail_executor_command(
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let action_result = state.storage.store_action_result(action_result)?;
-    let command = crate::mutate_command_raw(&state, command_id, |command, now| {
+    let command = mutate_command_raw(&state, command_id, |command, now| {
         command.mark_failed(request.failure_reason, now)
     })?;
     mark_active_lease_failed(&state, command_id, executor_id)?;
@@ -571,5 +574,5 @@ fn load_executor_for_read(
 }
 
 fn executor_can_run_command_route(state: &AppState, executor_id: Uuid, command: &Command) -> bool {
-    crate::executor_can_run_command(state, executor_id, command).unwrap_or(false)
+    executor_can_run_command(state, executor_id, command).unwrap_or(false)
 }

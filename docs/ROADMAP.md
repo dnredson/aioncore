@@ -27,12 +27,13 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 63 route modularization foundation: `apps/aion-api/src/lib.rs` now extracts the Edge Adapter route group into `src/routes/adapters.rs`, preserving endpoint paths, auth semantics, entity projection, and event behavior while establishing the first dedicated route module.
 - Milestone 64 route modularization: `apps/aion-api/src/lib.rs` now extracts the auth/token HTTP surface into `src/routes/auth.rs`, preserving auth mode behavior, token issuance/validation semantics, audit events, endpoint paths, and JSON response shapes while continuing the staged route split.
 - Milestone 65 route modularization: `apps/aion-api/src/lib.rs` now extracts the executor HTTP surface into `src/routes/executors.rs`, preserving endpoint paths, executor auth scopes, tenant/resource ownership behavior, polling/claim/complete/fail semantics, command lease behavior, and executor event metadata while continuing the staged route split.
+- Milestone 66 helper modularization: `apps/aion-api/src/lib.rs` now extracts shared command/action/lease support logic into `src/command_support.rs`, preserving command lifecycle behavior, lease semantics, executor compatibility checks, SmartSentinel bridge behavior, event metadata, and JSON shapes while reducing risk before command route extraction.
 
 ## Next
 
-1. Milestone 66: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
-2. Milestone 67: review whether remaining open write surfaces should split into narrower operator and machine scopes.
-3. Milestone 68: continue `aion-api` route-level modularization by splitting additional cohesive handler groups and DTOs into domain route modules without changing endpoint behavior.
+1. Milestone 67: extract the generic command and command-lease HTTP route group into a dedicated `aion-api` route module without changing endpoint behavior.
+2. Milestone 68: review whether remaining open write surfaces should split into narrower operator and machine scopes.
+3. Milestone 69: add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
 
 ## Future
 
@@ -46,4 +47,4 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 
 - The roadmap is intentionally concise. Canonical details live in the individual model docs and ADRs.
 - Security hardening remains staged after the current selected write-surface rollout to avoid overreaching beyond verified behavior in one milestone.
-- `aion-api` modularization is intentionally incremental; Milestones 61 through 65 establish safe extraction patterns for later route-level splits.
+- `aion-api` modularization is intentionally incremental; Milestones 61 through 66 establish safe extraction patterns for later route-level splits.
