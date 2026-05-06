@@ -1,4 +1,4 @@
-use crate::{
+use crate::routes::smartsentinel::{
     SmartSentinelSkippedItem, SmartSentinelValidationIssue, SmartSentinelValidationReport,
 };
 use aion_storage::StorageError;

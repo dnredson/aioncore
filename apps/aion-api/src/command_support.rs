@@ -1,7 +1,8 @@
 use crate::error::ApiError;
 use crate::{
-    insert_optional_string, record_event, AppState, EventDraft, EventFilter,
-    SmartSentinelCommandEnvelope, SmartSentinelCommandReportRequest, DEFAULT_COMMAND_LEASE_SECONDS,
+    insert_optional_string, record_event,
+    routes::smartsentinel::{SmartSentinelCommandEnvelope, SmartSentinelCommandReportRequest},
+    AppState, EventDraft, EventFilter, DEFAULT_COMMAND_LEASE_SECONDS,
 };
 use aion_action::{Command, CommandLease, ExecutorAgent, ExecutorScope};
 use aion_event::{Event, EventSeverity};
