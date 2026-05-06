@@ -5,6 +5,7 @@ use ::postgres::{Client, Config as PgConfig, NoTls, Row};
 use aion_action::{ApprovalStatus, ExecutorAgentStatus};
 use aion_action::{EdgeAdapter, EdgeAdapterStatus, EdgeAdapterStatusReport, EdgeAdapterType};
 use aion_event::EventSeverity;
+use aion_flow::Flow;
 use aion_observation::ObservationValue;
 use aion_raw_message::{NormalizationStatus, RawMessageSource};
 use aion_rule::RuleTriggerType;
@@ -751,6 +752,31 @@ fn row_to_rule(row: Row) -> StorageResult<Rule> {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
+}
+
+fn row_to_flow(row: Row) -> StorageResult<Flow> {
+    let Json(nodes) = row.get::<_, Json<Value>>("nodes");
+    let Json(edges) = row.get::<_, Json<Value>>("edges");
+    let flow = Flow {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        flow_key: row.get("flow_key"),
+        name: row.get("name"),
+        description: row.get("description"),
+        enabled: row.get("enabled"),
+        nodes: serde_json::from_value(nodes)
+            .map_err(|err| StorageError::Backend(format!("invalid flow nodes: {err}")))?,
+        edges: serde_json::from_value(edges)
+            .map_err(|err| StorageError::Backend(format!("invalid flow edges: {err}")))?,
+        metadata: row
+            .get::<_, Option<Json<Value>>>("metadata")
+            .map(|Json(value)| value),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    };
+    flow.validate()
+        .map_err(|err| StorageError::Backend(format!("invalid flow graph: {err}")))?;
+    Ok(flow)
 }
 
 fn row_to_raw_message(row: Row) -> StorageResult<RawMessage> {
@@ -2606,6 +2632,179 @@ impl RuleStore for PostgresStorage {
             rows.into_iter()
                 .map(row_to_rule)
                 .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+}
+
+impl FlowStore for PostgresStorage {
+    fn create_flow(&self, flow: Flow) -> StorageResult<Flow> {
+        flow.validate()
+            .map_err(|err| StorageError::InvalidInput(err.to_string()))?;
+
+        self.with_client(|client| {
+            let nodes = json_serializable(&flow.nodes)?;
+            let edges = json_serializable(&flow.edges)?;
+            let metadata = json_option_column(flow.metadata.as_ref());
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO flows (
+                        id,
+                        tenant_id,
+                        flow_key,
+                        name,
+                        description,
+                        enabled,
+                        nodes,
+                        edges,
+                        metadata,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    RETURNING id, tenant_id, flow_key, name, description, enabled, nodes, edges, metadata, created_at, updated_at
+                    ",
+                    &[
+                        &flow.id,
+                        &flow.tenant_id,
+                        &flow.flow_key,
+                        &flow.name,
+                        &flow.description,
+                        &flow.enabled,
+                        &nodes,
+                        &edges,
+                        &metadata,
+                        &flow.created_at,
+                        &flow.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row_to_flow(row)
+        })
+    }
+
+    fn update_flow(&self, flow: Flow) -> StorageResult<Flow> {
+        flow.validate()
+            .map_err(|err| StorageError::InvalidInput(err.to_string()))?;
+
+        self.with_client(|client| {
+            let nodes = json_serializable(&flow.nodes)?;
+            let edges = json_serializable(&flow.edges)?;
+            let metadata = json_option_column(flow.metadata.as_ref());
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE flows
+                    SET flow_key = $3,
+                        name = $4,
+                        description = $5,
+                        enabled = $6,
+                        nodes = $7,
+                        edges = $8,
+                        metadata = $9,
+                        created_at = $10,
+                        updated_at = $11
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING id, tenant_id, flow_key, name, description, enabled, nodes, edges, metadata, created_at, updated_at
+                    ",
+                    &[
+                        &flow.tenant_id,
+                        &flow.id,
+                        &flow.flow_key,
+                        &flow.name,
+                        &flow.description,
+                        &flow.enabled,
+                        &nodes,
+                        &edges,
+                        &metadata,
+                        &flow.created_at,
+                        &flow.updated_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?
+                .ok_or(StorageError::NotFound)?;
+            row_to_flow(row)
+        })
+    }
+
+    fn get_flow(&self, tenant_id: Uuid, flow_id: Uuid) -> StorageResult<Option<Flow>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, flow_key, name, description, enabled, nodes, edges, metadata, created_at, updated_at
+                    FROM flows
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &flow_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_flow).transpose()
+        })
+    }
+
+    fn get_flow_any_tenant(&self, flow_id: Uuid) -> StorageResult<Option<Flow>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, flow_key, name, description, enabled, nodes, edges, metadata, created_at, updated_at
+                    FROM flows
+                    WHERE id = $1
+                    ",
+                    &[&flow_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_flow).transpose()
+        })
+    }
+
+    fn list_flows(&self, tenant_id: Uuid) -> StorageResult<Vec<Flow>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, flow_key, name, description, enabled, nodes, edges, metadata, created_at, updated_at
+                    FROM flows
+                    WHERE tenant_id = $1
+                    ORDER BY created_at ASC
+                    ",
+                    &[&tenant_id],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter().map(row_to_flow).collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn list_all_flows(&self) -> StorageResult<Vec<Flow>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, flow_key, name, description, enabled, nodes, edges, metadata, created_at, updated_at
+                    FROM flows
+                    ORDER BY created_at ASC
+                    ",
+                    &[],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter().map(row_to_flow).collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn delete_flow(&self, tenant_id: Uuid, flow_id: Uuid) -> StorageResult<()> {
+        self.with_client(|client| {
+            let deleted = client
+                .execute(
+                    "DELETE FROM flows WHERE tenant_id = $1 AND id = $2",
+                    &[&tenant_id, &flow_id],
+                )
+                .map_err(map_postgres_error)?;
+            if deleted == 0 {
+                Err(StorageError::NotFound)
+            } else {
+                Ok(())
+            }
         })
     }
 }

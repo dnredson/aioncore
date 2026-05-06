@@ -15,6 +15,7 @@ The current MVP direction focuses on:
 - Read-oriented MCP and AI context surfaces.
 - Pluggable storage, with in-memory behavior as the reference path and PostgreSQL/TimescaleDB as the first durable backend direction.
 - Read-only dashboard API foundations for future operational and time-series exploration views.
+- Flow and pipeline model foundations for future Node-RED-like operational configuration.
 
 Out of scope for the current MVP:
 
@@ -57,6 +58,7 @@ Detailed runtime validation and PostgreSQL testing notes live in [Runtime Valida
 - Authentication and authorization are still incremental.
 - Connector, TTN, SmartSentinel, MCP, and command/executor flows have usage examples in focused guides under `docs/`.
 - A read-only dashboard API foundation exists for future UI work, but no frontend dashboard is implemented yet.
+- A storage-only flow API foundation exists for future dashboard and execution work, but no visual editor or flow runtime is implemented yet.
 
 ## Authentication Warning
 
@@ -84,6 +86,7 @@ Core architecture and models:
 - [Action Model](docs/ACTION_MODEL.md)
 - [Security Model](docs/SECURITY_MODEL.md)
 - [Dashboard Model](docs/DASHBOARD_MODEL.md)
+- [Flow Model](docs/FLOW_MODEL.md)
 - [Aion Edge Adapter Model](docs/EDGE_ADAPTER_MODEL.md)
 - [SmartSentinel Integration Model](docs/SMARTSENTINEL_INTEGRATION.md)
 
@@ -93,6 +96,7 @@ Operational usage guides:
 - [Ingestion Usage](docs/INGESTION_USAGE.md)
 - [Time-Series Usage](docs/TIMESERIES_USAGE.md)
 - [Dashboard Usage](docs/DASHBOARD_USAGE.md)
+- [Flow Usage](docs/FLOW_USAGE.md)
 - [TTN Usage](docs/TTN_USAGE.md)
 - [SmartSentinel Usage](docs/SMARTSENTINEL_USAGE.md)
 - [MCP Usage](docs/MCP_USAGE.md)

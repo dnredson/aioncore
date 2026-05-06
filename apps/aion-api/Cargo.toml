@@ -9,6 +9,7 @@ repository.workspace = true
 aion-action.workspace = true
 aion-entity.workspace = true
 aion-event.workspace = true
+aion-flow.workspace = true
 aion-mcp.workspace = true
 aion-observation.workspace = true
 aion-payload.workspace = true

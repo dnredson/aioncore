@@ -15,6 +15,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [Action Model](ACTION_MODEL.md)
 - [Security Model](SECURITY_MODEL.md)
 - [Dashboard Model](DASHBOARD_MODEL.md)
+- [Flow Model](FLOW_MODEL.md)
 
 ## Usage Guides
 
@@ -22,6 +23,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [Ingestion Usage](INGESTION_USAGE.md)
 - [Time-Series Usage](TIMESERIES_USAGE.md)
 - [Dashboard Usage](DASHBOARD_USAGE.md)
+- [Flow Usage](FLOW_USAGE.md)
 - [TTN Usage](TTN_USAGE.md)
 - [SmartSentinel Usage](SMARTSENTINEL_USAGE.md)
 - [MCP Usage](MCP_USAGE.md)

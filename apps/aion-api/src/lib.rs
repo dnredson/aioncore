@@ -1,6 +1,7 @@
 use aion_action::{Action, ApprovalStatus, Command, ExecutorAgent, Policy};
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
+use aion_flow::Flow;
 use aion_observation::{Observation, ObservationValue};
 use aion_payload::{
     CanonicalJsonDecoder, DecodeInput, DecodedMeasurement, PayloadDecoder, PayloadFormat,
@@ -503,6 +504,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .merge(routes::commands::router())
         .merge(routes::connectors::router())
         .merge(routes::dashboard::router())
+        .merge(routes::flows::router())
         .merge(routes::smartsentinel::router())
         .merge(routes::mcp::router())
         .merge(routes::ai::router())
@@ -998,6 +1000,39 @@ fn require_same_tenant_for_target_rule(
         None => {
             if state.storage.get_rule_any_tenant(rule_id)?.is_some() {
                 Err(deny_cross_tenant_write(state, auth, endpoint, "rule"))
+            } else {
+                Err(ApiError::not_found())
+            }
+        }
+    }
+}
+
+pub(crate) fn require_same_tenant_for_target_flow(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    flow_id: Uuid,
+) -> Result<Flow, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return state
+            .storage
+            .get_flow(state.tenant_id, flow_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    if is_admin_all(auth) {
+        return state
+            .storage
+            .get_flow_any_tenant(flow_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    let tenant_id = principal_tenant_or_default(state, auth)?;
+    match state.storage.get_flow(tenant_id, flow_id)? {
+        Some(flow) => Ok(flow),
+        None => {
+            if state.storage.get_flow_any_tenant(flow_id)?.is_some() {
+                Err(deny_cross_tenant_write(state, auth, endpoint, "flow"))
             } else {
                 Err(ApiError::not_found())
             }
@@ -2293,6 +2328,7 @@ mod tests {
                 "observations",
                 "timeseries",
                 "dashboard",
+                "flows",
                 "commands",
                 "actions",
                 "rules",
@@ -12834,6 +12870,366 @@ mod tests {
             .contains("invalid SenML JSON payload"));
     }
 
+    #[tokio::test]
+    async fn flow_routes_support_crud_validation_and_lifecycle_events_in_dev_mode() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+
+        let created = create_test_flow(&app, "flow-dev-01", "Dev Flow").await;
+        let flow_id = created["id"].as_str().unwrap();
+        assert_eq!(created["flow_key"], "flow-dev-01");
+        assert_eq!(created["enabled"], false);
+
+        let list = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/flows")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        let detail = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/flows/{flow_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(detail["id"], created["id"]);
+
+        let duplicate_node_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/flows",
+                sample_flow_body_with_nodes(
+                    "flow-invalid-dup",
+                    "Duplicate Nodes",
+                    json!([
+                        {"node_id": "dup", "node_type": "source", "config": {"kind": "mqtt_subscribe"}},
+                        {"node_id": "dup", "node_type": "sink", "config": {"kind": "internal_observation_store"}}
+                    ]),
+                    json!([]),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(duplicate_node_response.status(), StatusCode::BAD_REQUEST);
+
+        let unknown_edge_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/flows",
+                sample_flow_body_with_nodes(
+                    "flow-invalid-edge",
+                    "Unknown Edge",
+                    json!([
+                        {"node_id": "source-1", "node_type": "source", "config": {"kind": "mqtt_subscribe"}}
+                    ]),
+                    json!([
+                        {"edge_id": "edge-1", "source_node_id": "source-1", "target_node_id": "missing-1"}
+                    ]),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown_edge_response.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_type_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/flows",
+                sample_flow_body_with_nodes(
+                    "flow-invalid-type",
+                    "Invalid Type",
+                    json!([
+                        {"node_id": "source-1", "node_type": "banana", "config": {"kind": "mqtt_subscribe"}}
+                    ]),
+                    json!([]),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_type_response.status(), StatusCode::BAD_REQUEST);
+
+        let updated = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "PATCH",
+                    &format!("/flows/{flow_id}"),
+                    json!({
+                        "name": "Updated Dev Flow",
+                        "description": "updated",
+                        "metadata": {"updated": true}
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(updated["name"], "Updated Dev Flow");
+        assert_eq!(updated["metadata"]["updated"], true);
+
+        let enabled = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/flows/{flow_id}/enable"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(enabled["enabled"], true);
+
+        let disabled = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/flows/{flow_id}/disable"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(disabled["enabled"], false);
+
+        let overview = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/dashboard/overview")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(overview["flows_count"], 1);
+        assert_eq!(overview["enabled_flows_count"], 0);
+
+        let flow_events = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/events?event_type=aion:FlowCreated")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!flow_events.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_flow_reads_and_writes_with_scopes() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        create_test_flow(&dev_app, "flow-token-01", "Token Flow").await;
+
+        let no_token = token_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/flows")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_scope_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("flow-wrong-scope"),
+            &["entities:read"],
+        );
+        let wrong_scope = token_app
+            .clone()
+            .oneshot(auth_request("GET", "/flows", &wrong_scope_token))
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+        let read_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("flow-reader"),
+            &["flows:read", "dashboard:read"],
+        );
+        let read_list = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_request("GET", "/flows", &read_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(read_list.as_array().unwrap().len(), 1);
+
+        let write_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("flow-writer"),
+            &["flows:write"],
+        );
+        let created = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/flows",
+                sample_flow_body("flow-token-write", "Token Write Flow"),
+                &write_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn token_mode_filters_flows_by_tenant_and_denies_cross_tenant_writes() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let token_app = token_mode_app_with_storage(storage.clone());
+
+        let flow_a = create_test_flow(&tenant_a_app, "tenant-a-flow", "Tenant A Flow").await;
+        let flow_b = create_test_flow(&tenant_b_app, "tenant-b-flow", "Tenant B Flow").await;
+        let flow_b_id = flow_b["id"].as_str().unwrap();
+
+        let tenant_a_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-flow-user"),
+            &["flows:read", "flows:write", "dashboard:read"],
+        );
+        let tenant_b_token = store_api_token_for_tenant(
+            &storage,
+            tenant_b,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-b-flow-user"),
+            &["flows:read", "flows:write", "dashboard:read"],
+        );
+
+        let tenant_a_list = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_request("GET", "/flows", &tenant_a_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(tenant_a_list.as_array().unwrap().len(), 1);
+        assert_eq!(tenant_a_list[0]["id"], flow_a["id"]);
+
+        let cross_tenant_get = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/flows/{flow_b_id}"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_get.status(), StatusCode::FORBIDDEN);
+
+        let cross_tenant_update = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "PATCH",
+                &format!("/flows/{flow_b_id}"),
+                json!({"name": "hijack"}),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_update.status(), StatusCode::FORBIDDEN);
+
+        let tenant_b_overview = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_request("GET", "/dashboard/overview", &tenant_b_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(tenant_b_overview["flows_count"], 1);
+        assert_eq!(tenant_b_overview["enabled_flows_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn admin_all_can_read_and_manage_flows_across_tenants() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let flow_b = create_test_flow(&tenant_b_app, "tenant-b-admin-flow", "Tenant B Flow").await;
+        let flow_b_id = flow_b["id"].as_str().unwrap();
+
+        let admin_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Admin,
+            Some("flow-admin"),
+            &["admin:all"],
+        );
+
+        let list = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_request("GET", "/flows", &admin_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        let enabled = to_json(
+            token_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/flows/{flow_b_id}/enable"))
+                        .header("authorization", format!("Bearer {admin_token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(enabled["enabled"], true);
+    }
+
     async fn create_test_entity(app: &Router, key: &str, entity_type: &str) -> String {
         let response = app
             .clone()
@@ -13938,6 +14334,87 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CREATED);
         to_json(response).await
+    }
+
+    async fn create_test_flow(app: &Router, flow_key: &str, name: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/flows",
+                sample_flow_body(flow_key, name),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    fn sample_flow_body(flow_key: &str, name: &str) -> Value {
+        sample_flow_body_with_nodes(
+            flow_key,
+            name,
+            json!([
+                {
+                    "node_id": "source-1",
+                    "node_type": "source",
+                    "name": "MQTT Source",
+                    "config": {
+                        "kind": "mqtt_subscribe",
+                        "connector_id": "connector-01",
+                        "topic_filter": "devices/+/up"
+                    },
+                    "position": { "x": 10.0, "y": 20.0 }
+                },
+                {
+                    "node_id": "decoder-1",
+                    "node_type": "decoder",
+                    "name": "SenML Decoder",
+                    "config": { "kind": "senml_decode" },
+                    "position": { "x": 120.0, "y": 20.0 }
+                },
+                {
+                    "node_id": "sink-1",
+                    "node_type": "sink",
+                    "name": "Store",
+                    "config": { "kind": "internal_observation_store" },
+                    "position": { "x": 240.0, "y": 20.0 }
+                }
+            ]),
+            json!([
+                {
+                    "edge_id": "edge-1",
+                    "source_node_id": "source-1",
+                    "target_node_id": "decoder-1"
+                },
+                {
+                    "edge_id": "edge-2",
+                    "source_node_id": "decoder-1",
+                    "target_node_id": "sink-1"
+                }
+            ]),
+        )
+    }
+
+    fn sample_flow_body_with_nodes(
+        flow_key: &str,
+        name: &str,
+        nodes: Value,
+        edges: Value,
+    ) -> Value {
+        json!({
+            "flow_key": flow_key,
+            "name": name,
+            "description": "flow test",
+            "enabled": false,
+            "nodes": nodes,
+            "edges": edges,
+            "metadata": {
+                "source_convention": "mqtt_subscribe",
+                "sink_convention": "internal_observation_store"
+            }
+        })
     }
 
     async fn create_ttn_connector(

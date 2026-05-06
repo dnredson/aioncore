@@ -19,6 +19,7 @@ dependencies = [
  "aion-action",
  "aion-entity",
  "aion-event",
+ "aion-flow",
  "aion-mcp",
  "aion-observation",
  "aion-payload",
@@ -51,6 +52,16 @@ dependencies = [
 
 [[package]]
 name = "aion-event"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "aion-flow"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -126,6 +137,7 @@ dependencies = [
  "aion-action",
  "aion-entity",
  "aion-event",
+ "aion-flow",
  "aion-observation",
  "aion-raw-message",
  "aion-relationship",

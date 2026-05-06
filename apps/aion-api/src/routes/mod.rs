@@ -7,6 +7,7 @@ pub(crate) mod dashboard;
 pub(crate) mod entities;
 pub(crate) mod events;
 pub(crate) mod executors;
+pub(crate) mod flows;
 pub(crate) mod ingestion;
 pub(crate) mod mcp;
 pub(crate) mod observations;

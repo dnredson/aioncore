@@ -13,7 +13,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 const BOOTSTRAP_ADMIN_TOKEN_MIN_LENGTH: usize = 24;
-const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 36] = [
+const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 37] = [
     "auth_tokens",
     "connector_secrets",
     "adapters",
@@ -35,6 +35,7 @@ const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 36] = [
     "observations",
     "timeseries",
     "dashboard",
+    "flows",
     "commands",
     "actions",
     "rules",

@@ -41,6 +41,8 @@ pub(crate) struct DashboardOverviewResponse {
     pub observations_count: usize,
     pub raw_messages_count: usize,
     pub events_count: usize,
+    pub flows_count: usize,
+    pub enabled_flows_count: usize,
     pub connectors_count: usize,
     pub enabled_connectors_count: usize,
     pub workers_running_count: usize,
@@ -111,6 +113,7 @@ async fn get_dashboard_overview(
     let observations_count = scoped_observations(&state, &auth)?.len();
     let raw_messages_count = scoped_raw_messages_count(&state, &auth)?;
     let events_count = scoped_events_count(&state, &auth)?;
+    let flows = scoped_flows(&state, &auth)?;
     let connectors = scoped_connectors(&state, &auth)?;
     let connector_items = build_connector_overview_items(&state, connectors)?;
 
@@ -119,6 +122,8 @@ async fn get_dashboard_overview(
         observations_count,
         raw_messages_count,
         events_count,
+        flows_count: flows.len(),
+        enabled_flows_count: flows.iter().filter(|flow| flow.enabled).count(),
         connectors_count: connector_items.len(),
         enabled_connectors_count: connector_items.iter().filter(|item| item.enabled).count(),
         workers_running_count: connector_items.iter().filter(|item| item.running).count(),
@@ -318,6 +323,16 @@ fn scoped_connectors(
         Ok(state
             .storage
             .list_ingestion_connectors(principal_tenant_id(auth)?)?)
+    }
+}
+
+fn scoped_flows(state: &AppState, auth: &AuthContext) -> Result<Vec<aion_flow::Flow>, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        Ok(state.storage.list_flows(state.tenant_id)?)
+    } else if is_admin_all(auth) {
+        Ok(state.storage.list_all_flows()?)
+    } else {
+        Ok(state.storage.list_flows(principal_tenant_id(auth)?)?)
     }
 }
 

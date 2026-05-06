@@ -24,6 +24,8 @@ Example response:
   "observations_count": 482,
   "raw_messages_count": 241,
   "events_count": 38,
+  "flows_count": 4,
+  "enabled_flows_count": 2,
   "connectors_count": 3,
   "enabled_connectors_count": 2,
   "workers_running_count": 1,
@@ -117,3 +119,5 @@ Token-mode behavior:
 - valid token without `dashboard:read`: `403`
 - `admin:all`: allowed
 - non-admin principals: limited to dashboard data owned by the principal tenant
+
+The overview response now also includes flow inventory counts. It still does not render or execute flows.

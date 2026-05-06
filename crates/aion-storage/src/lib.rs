@@ -4,6 +4,7 @@ use aion_action::{
 };
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
+use aion_flow::Flow;
 use aion_observation::Observation;
 use aion_raw_message::RawMessage;
 use aion_relationship::Relationship;
@@ -46,6 +47,8 @@ pub const MIGRATION_0011_CREATE_EDGE_ADAPTERS: &str =
     include_str!("../../../migrations/0011_create_edge_adapters.sql");
 pub const MIGRATION_0012_CREATE_API_TOKENS: &str =
     include_str!("../../../migrations/0012_create_api_tokens.sql");
+pub const MIGRATION_0013_CREATE_FLOWS: &str =
+    include_str!("../../../migrations/0013_create_flows.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -90,6 +93,7 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
         "0012_create_api_tokens.sql",
         MIGRATION_0012_CREATE_API_TOKENS,
     ),
+    ("0013_create_flows.sql", MIGRATION_0013_CREATE_FLOWS),
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -930,6 +934,16 @@ pub trait RuleStore {
     fn list_all_rules(&self) -> StorageResult<Vec<Rule>>;
 }
 
+pub trait FlowStore {
+    fn create_flow(&self, flow: Flow) -> StorageResult<Flow>;
+    fn update_flow(&self, flow: Flow) -> StorageResult<Flow>;
+    fn get_flow(&self, tenant_id: Uuid, flow_id: Uuid) -> StorageResult<Option<Flow>>;
+    fn get_flow_any_tenant(&self, flow_id: Uuid) -> StorageResult<Option<Flow>>;
+    fn list_flows(&self, tenant_id: Uuid) -> StorageResult<Vec<Flow>>;
+    fn list_all_flows(&self) -> StorageResult<Vec<Flow>>;
+    fn delete_flow(&self, tenant_id: Uuid, flow_id: Uuid) -> StorageResult<()>;
+}
+
 pub trait ControlPlaneStore:
     TenantStore
     + EntityStore
@@ -947,6 +961,7 @@ pub trait ControlPlaneStore:
     + ActionStore
     + ActionResultStore
     + RuleStore
+    + FlowStore
     + ExecutorStore
 {
 }
@@ -968,6 +983,7 @@ impl<T> ControlPlaneStore for T where
         + ActionStore
         + ActionResultStore
         + RuleStore
+        + FlowStore
         + ExecutorStore
 {
 }
@@ -1027,6 +1043,8 @@ struct InMemoryState {
     payload_profiles: HashMap<(Uuid, Uuid), PayloadProfile>,
     ingestion_connectors: HashMap<Uuid, IngestionConnector>,
     ingestion_connector_key_index: HashMap<(Uuid, String), Uuid>,
+    flows: HashMap<Uuid, Flow>,
+    flow_key_index: HashMap<(Uuid, String), Uuid>,
     connector_secrets: HashMap<Uuid, ConnectorSecret>,
     connector_secret_key_index: HashMap<(Uuid, String), Uuid>,
     api_tokens: HashMap<Uuid, ApiToken>,
@@ -2689,14 +2707,126 @@ impl RuleStore for InMemoryStorage {
     }
 }
 
+impl FlowStore for InMemoryStorage {
+    fn create_flow(&self, flow: Flow) -> StorageResult<Flow> {
+        flow.validate()
+            .map_err(|err| StorageError::InvalidInput(err.to_string()))?;
+
+        let mut state = self.write_state()?;
+        if state.flows.contains_key(&flow.id)
+            || state
+                .flow_key_index
+                .contains_key(&(flow.tenant_id, flow.flow_key.clone()))
+        {
+            return Err(StorageError::Conflict);
+        }
+
+        state
+            .flow_key_index
+            .insert((flow.tenant_id, flow.flow_key.clone()), flow.id);
+        state.flows.insert(flow.id, flow.clone());
+        Ok(flow)
+    }
+
+    fn update_flow(&self, flow: Flow) -> StorageResult<Flow> {
+        flow.validate()
+            .map_err(|err| StorageError::InvalidInput(err.to_string()))?;
+
+        let mut state = self.write_state()?;
+        let previous = state
+            .flows
+            .get(&flow.id)
+            .filter(|stored| stored.tenant_id == flow.tenant_id)
+            .cloned()
+            .ok_or(StorageError::NotFound)?;
+
+        if previous.flow_key != flow.flow_key {
+            let key = (flow.tenant_id, flow.flow_key.clone());
+            if state.flow_key_index.contains_key(&key) {
+                return Err(StorageError::Conflict);
+            }
+            state
+                .flow_key_index
+                .remove(&(previous.tenant_id, previous.flow_key.clone()));
+            state.flow_key_index.insert(key, flow.id);
+        }
+
+        state.flows.insert(flow.id, flow.clone());
+        Ok(flow)
+    }
+
+    fn get_flow(&self, tenant_id: Uuid, flow_id: Uuid) -> StorageResult<Option<Flow>> {
+        Ok(self
+            .read_state()?
+            .flows
+            .get(&flow_id)
+            .filter(|flow| flow.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn get_flow_any_tenant(&self, flow_id: Uuid) -> StorageResult<Option<Flow>> {
+        Ok(self.read_state()?.flows.get(&flow_id).cloned())
+    }
+
+    fn list_flows(&self, tenant_id: Uuid) -> StorageResult<Vec<Flow>> {
+        let mut flows = self
+            .read_state()?
+            .flows
+            .values()
+            .filter(|flow| flow.tenant_id == tenant_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        flows.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(flows)
+    }
+
+    fn list_all_flows(&self) -> StorageResult<Vec<Flow>> {
+        let mut flows = self
+            .read_state()?
+            .flows
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        flows.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(flows)
+    }
+
+    fn delete_flow(&self, tenant_id: Uuid, flow_id: Uuid) -> StorageResult<()> {
+        let mut state = self.write_state()?;
+        let flow = state
+            .flows
+            .get(&flow_id)
+            .filter(|flow| flow.tenant_id == tenant_id)
+            .cloned()
+            .ok_or(StorageError::NotFound)?;
+
+        state.flows.remove(&flow_id);
+        state
+            .flow_key_index
+            .remove(&(flow.tenant_id, flow.flow_key.clone()));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_flow::{Flow, FlowEdge, FlowNode, FlowNodeType};
     use chrono::TimeZone;
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 12);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 13);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
@@ -2718,6 +2848,7 @@ mod tests {
         );
         assert_eq!(ORDERED_MIGRATIONS[10].0, "0011_create_edge_adapters.sql");
         assert_eq!(ORDERED_MIGRATIONS[11].0, "0012_create_api_tokens.sql");
+        assert_eq!(ORDERED_MIGRATIONS[12].0, "0013_create_flows.sql");
     }
 
     #[test]
@@ -3480,6 +3611,65 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_storage_creates_updates_lists_and_deletes_flows() {
+        use serde_json::json;
+
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let now = Utc::now();
+        let flow = Flow::new(
+            tenant_id,
+            "mqtt-normalize-store",
+            "MQTT Normalize Store",
+            Some("test flow".to_string()),
+            false,
+            vec![
+                FlowNode {
+                    node_id: "source-1".to_string(),
+                    node_type: FlowNodeType::Source,
+                    name: Some("MQTT Source".to_string()),
+                    config: json!({"kind": "mqtt_subscribe", "connector_id": "abc"}),
+                    position: None,
+                },
+                FlowNode {
+                    node_id: "sink-1".to_string(),
+                    node_type: FlowNodeType::Sink,
+                    name: Some("Store".to_string()),
+                    config: json!({"kind": "internal_observation_store"}),
+                    position: None,
+                },
+            ],
+            vec![FlowEdge {
+                edge_id: "edge-1".to_string(),
+                source_node_id: "source-1".to_string(),
+                target_node_id: "sink-1".to_string(),
+                label: None,
+                metadata: None,
+            }],
+            Some(json!({"suite": "storage"})),
+            now,
+        )
+        .unwrap();
+
+        let stored = storage.create_flow(flow.clone()).unwrap();
+        assert_eq!(
+            storage.get_flow(tenant_id, stored.id).unwrap().unwrap(),
+            stored
+        );
+        assert_eq!(storage.list_flows(tenant_id).unwrap(), vec![stored.clone()]);
+
+        let mut updated = stored.clone();
+        updated.name = "Updated Flow".to_string();
+        updated.set_enabled(true, Utc::now());
+        let updated = storage.update_flow(updated).unwrap();
+        assert!(updated.enabled);
+        assert_eq!(updated.name, "Updated Flow");
+
+        storage.delete_flow(tenant_id, updated.id).unwrap();
+        assert!(storage.get_flow(tenant_id, updated.id).unwrap().is_none());
+    }
+
+    #[test]
     fn ingestion_connector_migration_defines_required_indexes() {
         let migration = MIGRATION_0007_CREATE_INGESTION_CONNECTORS;
         for index in [
@@ -3507,6 +3697,26 @@ mod tests {
             "idx_ingestion_connectors_secret_ref",
         ] {
             assert!(migration.contains(required), "missing migration item: {required}");
+        }
+    }
+
+    #[test]
+    fn flow_migration_defines_required_columns_and_indexes() {
+        let migration = MIGRATION_0013_CREATE_FLOWS;
+        for required in [
+            "CREATE TABLE IF NOT EXISTS flows",
+            "flow_key TEXT NOT NULL",
+            "nodes JSONB NOT NULL DEFAULT '[]'::jsonb",
+            "edges JSONB NOT NULL DEFAULT '[]'::jsonb",
+            "CONSTRAINT flows_tenant_key_unique UNIQUE (tenant_id, flow_key)",
+            "idx_flows_tenant_created_at",
+            "idx_flows_flow_key",
+            "idx_flows_enabled",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing migration item: {required}"
+            );
         }
     }
 

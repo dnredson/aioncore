@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a read-only backend foundation. Milestone 81 adds dashboard-oriented API summaries so a future UI can explore entities, observed properties, connector operations, and worker health without changing ingestion, connector runtime, or time-series query behavior.
+The AionCore dashboard is currently a read-only backend foundation. Milestones 81 and 82 add dashboard-oriented API summaries plus initial flow inventory counts so a future UI can explore entities, observed properties, connector operations, worker health, and pipeline inventory without changing ingestion, connector runtime, or time-series query behavior.
 
 ## Current Intent
 
@@ -15,6 +15,7 @@ The AionCore dashboard is currently a read-only backend foundation. Milestone 81
 - `GET /dashboard/overview`
 - `GET /dashboard/timeseries/entities`
 - `GET /dashboard/connectors/overview`
+- flow counts from `GET /dashboard/overview`
 
 These endpoints are designed for compact dashboard landing pages and navigation panels rather than full raw-data export.
 
@@ -27,6 +28,7 @@ The future AionCore dashboard is intended to emphasize:
 - connector and broker inspection
 - worker/runtime health
 - later pipeline and flow visibility
+- later flow list, detail, and graph rendering
 
 This is intentionally different from a generic chart-only experience. Grafana can still complement AionCore for richer chart composition later.
 
@@ -41,4 +43,4 @@ The following are explicitly out of scope for this milestone:
 - Grafana provisioning
 - automated pipeline/rule authoring from the dashboard
 
-Node-RED-like flow editing remains future work. The current milestone only establishes read APIs that a future dashboard can safely build on.
+Node-RED-like flow editing remains future work. The current milestones only establish safe backend summaries and the flow storage model that a future dashboard can build on.
