@@ -50,19 +50,20 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 86 batch and backfill reliable ingestion API foundation: `aion-api` now adds `POST /ingest/batch`; sequential independent processing of multiple reliable ingestion items; tenant-scoped per-item idempotency and duplicate reporting; batch-level provenance inheritance for SmartSentinel, Aion Edge Adapter, NiFi, and MiNiFi reconnect/backfill flows; `continue_on_error` stop/continue behavior; `aion:ReliableBatchIngested` audit events; `batches:write` token-mode protection; and focused documentation for disconnected and store-and-forward deployments, while intentionally deferring replay execution, automatic DLQ routing, flow execution, connector-aware reliable batching, and persistent batch session tables.
 - Milestone 87 flow validation and dry-run API foundation: `aion-api` now adds `POST /flows/validate`, `GET /flows/{flow_id}/validation`, `POST /flows/dry-run`, and `POST /flows/{flow_id}/dry-run`; structured graph-validation issues; simple cycle and isolation checks; connector-reference inspection when safely verifiable; recursive secret-like config redaction; tenant-aware token-mode validation and dry-run protection on `flows:read`; and planning-oriented responses that report conceptual path and sink behavior while intentionally deferring any flow execution, broker subscription, MQTT/HTTP dispatch, observation creation, command/event creation, and DLQ writes.
 - Milestone 88 dashboard flow inventory and detail API: `aion-api` now adds `GET /dashboard/flows` and `GET /dashboard/flows/{flow_id}` as dashboard-friendly read-only flow inventory and detail views; graph-type counts; validation status, error, and warning summaries; redacted node config detail; planned-path, connector-reference, and planned-sink inspection; tenant-aware token-mode protection on `dashboard:read`; and low-risk dashboard overview additions for invalid-flow and warning counts, while intentionally deferring any frontend UI, flow execution, broker subscription, MQTT/HTTP dispatch, observation/event/command/DLQ creation, and changes to existing `/flows`, validation, or dry-run behavior.
+- Milestone 89 dashboard frontend skeleton: AionCore now adds `apps/aion-dashboard/` as a no-build static frontend using plain HTML, CSS, and JavaScript; operator-configurable API base URL plus optional local-development bearer token storage; read-only overview, time-series entity, connector overview, flow inventory, and flow detail panels backed by the existing `/dashboard/*` APIs; and focused documentation for local serving and future migration, while intentionally deferring charting libraries, flow editing, flow execution, connector mutation, broker subscription changes, and any frontend build toolchain.
 
 ## Next
 
-1. Dashboard frontend skeleton.
-2. Connector and broker management UI.
-3. Flow builder UI foundation.
-4. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
-5. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+1. Connector and broker management UI.
+2. Flow builder UI foundation.
+3. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
+4. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+5. Add lightweight charting for time-series property exploration without weakening the current no-build stance unless the UI surface justifies a dedicated frontend stack.
 
 ## Future
 
 - Cassandra telemetry adapter.
-- Dashboard exploration UI.
+- richer dashboard exploration UI.
 - Node-RED-like flow editor and flow execution model.
 - deeper flow simulation and typed node-kind validation.
 - MCP time-series query tools.

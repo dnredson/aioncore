@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a read-only backend foundation. Milestones 81, 82, 84, 87, and 88 add dashboard-oriented API summaries plus flow and DLQ inventory counts so a future UI can explore entities, observed properties, connector operations, worker health, pipeline inventory, flow validation readiness, and basic reliability backlog without changing ingestion, connector runtime, or time-series query behavior.
+The AionCore dashboard is currently a read-only operational surface. Milestones 81, 82, 84, 87, 88, and 89 add dashboard-oriented API summaries, flow and DLQ inventory counts, and a lightweight static frontend skeleton so operators can explore entities, observed properties, connector operations, worker health, pipeline inventory, flow validation readiness, and basic reliability backlog without changing ingestion, connector runtime, or time-series query behavior.
 
 ## Current Intent
 
@@ -8,6 +8,7 @@ The AionCore dashboard is currently a read-only backend foundation. Milestones 8
 - Reuse existing canonical observations and raw operational records.
 - Support a future exploration flow of `entity -> observed property -> historical chart`.
 - Support future operational views for connectors, brokers, and workers.
+- Provide a low-risk first UI that can be served as static files during backend iteration.
 - Preserve Grafana as a valid future option for advanced charting and long-range analytics.
 
 ## Current Read Surface
@@ -22,9 +23,11 @@ The AionCore dashboard is currently a read-only backend foundation. Milestones 8
 
 These endpoints are designed for compact dashboard landing pages and navigation panels rather than full raw-data export.
 
+Milestone 89 adds a static frontend skeleton under `apps/aion-dashboard/` that consumes these routes directly from browser JavaScript with an operator-configurable API base URL and optional bearer token.
+
 ## Operational Focus
 
-The future AionCore dashboard is intended to emphasize:
+The current and future AionCore dashboard is intended to emphasize:
 
 - entity and property exploration
 - historical time-series discovery
@@ -39,16 +42,18 @@ This is intentionally different from a generic chart-only experience. Grafana ca
 
 ## Deferred Work
 
-The following are explicitly out of scope for this milestone:
+The following are explicitly out of scope for the current dashboard phase:
 
-- frontend UI assets
-- dashboard SPA pages
+- heavy frontend build tooling
+- dashboard write actions
+- drag-and-drop graph canvas
+- in-browser charting libraries
 - drag-and-drop flow editor
 - Node-RED-like flow execution
 - Grafana provisioning
 - automated pipeline/rule authoring from the dashboard
 
-Node-RED-like flow editing remains future work. The current milestones only establish safe backend summaries and the flow storage model that a future dashboard can build on.
+Node-RED-like flow editing remains future work. The current milestones establish safe backend summaries plus a small static UI shell that later dashboard work can replace or migrate without changing the read-only API contracts.
 
 ## Flow Inventory And Detail
 
@@ -81,3 +86,28 @@ For reliable external runtimes, future dashboard work should be able to show:
 - future DLQ and batch session summaries
 
 See [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md).
+
+## Frontend Skeleton
+
+Milestone 89 adds a first lightweight frontend dashboard skeleton:
+
+- `apps/aion-dashboard/index.html`
+- `apps/aion-dashboard/styles.css`
+- `apps/aion-dashboard/dashboard.js`
+
+The first frontend intentionally avoids React, Vite, Next, `node_modules`, external CDNs, and charting libraries.
+
+It currently provides:
+
+- Overview cards from `GET /dashboard/overview`
+- Time-series entity discovery table from `GET /dashboard/timeseries/entities`
+- Connector overview table from `GET /dashboard/connectors/overview`
+- Flow inventory table from `GET /dashboard/flows`
+- Flow detail inspection panel from `GET /dashboard/flows/{flow_id}`
+
+The UI stores only operator-provided local development settings:
+
+- API base URL, defaulting to `http://127.0.0.1:8080`
+- optional bearer token stored in browser `localStorage`
+
+It does not create or mutate any platform state.

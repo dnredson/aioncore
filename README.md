@@ -15,12 +15,12 @@ The current MVP direction focuses on:
 - Read-oriented MCP and AI context surfaces.
 - Pluggable storage, with in-memory behavior as the reference path and PostgreSQL/TimescaleDB as the first durable backend direction.
 - Read-only dashboard API foundations for future operational and time-series exploration views.
+- A lightweight static dashboard skeleton for read-only operator inspection.
 - Flow and pipeline model foundations for future Node-RED-like operational configuration.
 - DLQ model and API foundations for future reliable ingestion, replay, and quarantine workflows.
 
 Out of scope for the current MVP:
 
-- dashboard UI
 - complex rule engine
 - paid cloud dependencies
 - direct LLM control of critical actions by default
@@ -58,7 +58,7 @@ Detailed runtime validation and PostgreSQL testing notes live in [Runtime Valida
 - SQL migrations and PostgreSQL/TimescaleDB persistence foundations exist, but in-memory remains the reference development behavior.
 - Authentication and authorization are still incremental.
 - Connector, TTN, SmartSentinel, MCP, and command/executor flows have usage examples in focused guides under `docs/`.
-- A read-only dashboard API foundation exists for future UI work, but no frontend dashboard is implemented yet.
+- A lightweight static dashboard skeleton now exists under [apps/aion-dashboard](apps/aion-dashboard/README.md) for read-only overview, connector, time-series, and flow inspection.
 - A storage-only flow API foundation exists for future dashboard and execution work, but no visual editor or flow runtime is implemented yet.
 - A storage-only DLQ API foundation exists for future replay, quarantine, and reliable-ingestion workflows, but no automatic routing or replay runtime is implemented yet.
 
@@ -100,6 +100,7 @@ Operational usage guides:
 - [Ingestion Usage](docs/INGESTION_USAGE.md)
 - [Time-Series Usage](docs/TIMESERIES_USAGE.md)
 - [Dashboard Usage](docs/DASHBOARD_USAGE.md)
+- [Dashboard Frontend Skeleton](apps/aion-dashboard/README.md)
 - [DLQ Usage](docs/DLQ_USAGE.md)
 - [Flow Usage](docs/FLOW_USAGE.md)
 - [TTN Usage](docs/TTN_USAGE.md)

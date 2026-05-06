@@ -1,6 +1,6 @@
 # Dashboard Usage
 
-This guide covers the read-only dashboard API foundation through Milestone 88.
+This guide covers the read-only dashboard API surface and the Milestone 89 static frontend skeleton.
 
 ## Scope
 
@@ -11,6 +11,8 @@ This guide covers the read-only dashboard API foundation through Milestone 88.
 - `GET /dashboard/connectors/overview`
 
 These endpoints do not replace `/timeseries/query`. They provide compact summaries that a future dashboard UI can use for discovery and navigation.
+
+Milestone 89 now also adds a lightweight static dashboard app under `apps/aion-dashboard/`.
 
 ## Overview
 
@@ -196,3 +198,62 @@ Future dashboard and flow-builder work should use the dedicated flow read-only p
 - `POST /flows/{flow_id}/dry-run`
 
 Those endpoints are additive and do not execute flows. The dashboard flow endpoints complement them with inventory/detail shapes optimized for future UI rendering.
+
+## Static Dashboard Skeleton
+
+The first dashboard frontend is a no-build static app:
+
+- `apps/aion-dashboard/index.html`
+- `apps/aion-dashboard/styles.css`
+- `apps/aion-dashboard/dashboard.js`
+
+Why static for the first milestone:
+
+- no heavy frontend toolchain yet
+- no `node_modules`
+- low-risk operator UI while dashboard contracts are still stabilizing
+- easy local serving from any simple static server
+
+Run it locally from the repository root:
+
+```powershell
+python -m http.server 5173 --directory apps/aion-dashboard
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5173
+```
+
+The app defaults to:
+
+```text
+http://127.0.0.1:8080
+```
+
+The UI supports:
+
+- local API base URL override
+- optional bearer token input for local development
+- `Authorization: Bearer <token>` only when a token is present
+- read-only refresh and section switching
+
+The app currently consumes:
+
+- `GET /dashboard/overview`
+- `GET /dashboard/timeseries/entities`
+- `GET /dashboard/connectors/overview`
+- `GET /dashboard/flows`
+- `GET /dashboard/flows/{flow_id}`
+
+The app intentionally does not implement:
+
+- flow execution
+- flow editing
+- drag-and-drop flow building
+- connector mutation
+- broker subscription changes
+- MQTT publish
+- HTTP forwarding
+- charting libraries

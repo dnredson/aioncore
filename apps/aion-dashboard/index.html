@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AionCore Dashboard</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Primary">
+      <div class="brand">
+        <p class="eyebrow">Milestone 89</p>
+        <h1>AionCore Dashboard</h1>
+        <p class="lede">Read-only operational and flow inspection UI backed by the existing dashboard APIs.</p>
+      </div>
+
+      <nav class="nav-tabs" aria-label="Dashboard sections">
+        <button class="nav-tab active" type="button" data-section="overview">Overview</button>
+        <button class="nav-tab" type="button" data-section="timeseries">Time-Series Entities</button>
+        <button class="nav-tab" type="button" data-section="connectors">Connectors</button>
+        <button class="nav-tab" type="button" data-section="flows">Flows</button>
+      </nav>
+
+      <section class="config-panel" aria-labelledby="config-title">
+        <div class="panel-heading">
+          <h2 id="config-title">API Access</h2>
+        </div>
+        <form id="config-form" class="config-form">
+          <label>
+            <span>API base URL</span>
+            <input id="api-base-url" name="apiBaseUrl" type="url" inputmode="url" spellcheck="false" placeholder="http://127.0.0.1:8080">
+          </label>
+          <label>
+            <span>Bearer token</span>
+            <input id="bearer-token" name="bearerToken" type="password" autocomplete="off" spellcheck="false" placeholder="Optional for local dev">
+          </label>
+          <div class="button-row">
+            <button class="button primary" type="submit">Save</button>
+            <button class="button subtle" id="clear-token" type="button">Clear Token</button>
+          </div>
+        </form>
+        <p class="hint">Token is stored in local browser `localStorage` for development only and is never printed to the console.</p>
+      </section>
+    </aside>
+
+    <main class="main-content">
+      <header class="toolbar">
+        <div>
+          <p class="eyebrow">Read-only</p>
+          <h2 id="section-title">Overview</h2>
+        </div>
+        <div class="toolbar-actions">
+          <button class="button primary" id="refresh-button" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section class="status-strip" aria-live="polite">
+        <div id="global-status" class="status-message">Ready.</div>
+        <div class="status-meta">
+          <span>API:</span>
+          <code id="current-api-base">http://127.0.0.1:8080</code>
+        </div>
+      </section>
+
+      <section id="error-banner" class="error-banner hidden" aria-live="assertive"></section>
+
+      <section id="overview-section" class="content-section active" aria-labelledby="section-title">
+        <div class="section-header">
+          <div>
+            <h3>Platform Overview</h3>
+            <p>Inventory and health counts from <code>GET /dashboard/overview</code>.</p>
+          </div>
+        </div>
+        <div id="overview-cards" class="card-grid"></div>
+      </section>
+
+      <section id="timeseries-section" class="content-section" aria-labelledby="section-title">
+        <div class="section-header">
+          <div>
+            <h3>Entity Discovery</h3>
+            <p>Compact time-series inventory from <code>GET /dashboard/timeseries/entities</code>.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Entity Key</th>
+                <th>Type</th>
+                <th>Display Name</th>
+                <th>Observed Properties</th>
+                <th>Observations</th>
+                <th>Last Observed</th>
+              </tr>
+            </thead>
+            <tbody id="timeseries-table-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="connectors-section" class="content-section" aria-labelledby="section-title">
+        <div class="section-header">
+          <div>
+            <h3>Connector Overview</h3>
+            <p>Read-only connector runtime summaries from <code>GET /dashboard/connectors/overview</code>.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Connector</th>
+                <th>Type</th>
+                <th>Profile</th>
+                <th>Enabled</th>
+                <th>Status</th>
+                <th>Broker URL</th>
+                <th>Topic Filter</th>
+                <th>Payload</th>
+                <th>Worker</th>
+                <th>Last Error</th>
+                <th>Secret</th>
+              </tr>
+            </thead>
+            <tbody id="connectors-table-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="flows-section" class="content-section" aria-labelledby="section-title">
+        <div class="section-header">
+          <div>
+            <h3>Flow Inventory</h3>
+            <p>Inventory and detail views from <code>GET /dashboard/flows</code> and <code>GET /dashboard/flows/{flow_id}</code>.</p>
+          </div>
+        </div>
+
+        <div class="flows-layout">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Flow</th>
+                  <th>Enabled</th>
+                  <th>Nodes</th>
+                  <th>Edges</th>
+                  <th>Sources</th>
+                  <th>Sinks</th>
+                  <th>DLQ</th>
+                  <th>Validation</th>
+                  <th>Errors</th>
+                  <th>Warnings</th>
+                </tr>
+              </thead>
+              <tbody id="flows-table-body"></tbody>
+            </table>
+          </div>
+
+          <article class="detail-panel" aria-live="polite">
+            <div class="panel-heading">
+              <h3>Flow Detail</h3>
+              <p id="flow-detail-title" class="detail-title">Select a flow to inspect metadata, validation, graph summary, nodes, and edges.</p>
+            </div>
+
+            <div id="flow-detail-empty" class="empty-state">No flow selected.</div>
+
+            <div id="flow-detail-content" class="hidden">
+              <div id="flow-detail-metadata" class="detail-grid"></div>
+
+              <div class="mini-panels">
+                <section class="mini-panel">
+                  <h4>Validation Summary</h4>
+                  <div id="flow-validation-summary"></div>
+                </section>
+                <section class="mini-panel">
+                  <h4>Execution Status</h4>
+                  <div id="flow-execution-summary"></div>
+                </section>
+              </div>
+
+              <div class="mini-panels">
+                <section class="mini-panel">
+                  <h4>Planned Path</h4>
+                  <ul id="flow-planned-path" class="token-list"></ul>
+                </section>
+                <section class="mini-panel">
+                  <h4>Referenced Connectors</h4>
+                  <ul id="flow-referenced-connectors" class="token-list"></ul>
+                </section>
+                <section class="mini-panel">
+                  <h4>Planned Sinks</h4>
+                  <ul id="flow-planned-sinks" class="token-list"></ul>
+                </section>
+              </div>
+
+              <div class="mini-panels stacked">
+                <section class="mini-panel">
+                  <h4>Nodes</h4>
+                  <div class="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Node ID</th>
+                          <th>Type</th>
+                          <th>Name</th>
+                          <th>Position</th>
+                          <th>Config</th>
+                        </tr>
+                      </thead>
+                      <tbody id="flow-nodes-table-body"></tbody>
+                    </table>
+                  </div>
+                </section>
+                <section class="mini-panel">
+                  <h4>Edges</h4>
+                  <div class="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Edge ID</th>
+                          <th>Source</th>
+                          <th>Target</th>
+                          <th>Label</th>
+                        </tr>
+                      </thead>
+                      <tbody id="flow-edges-table-body"></tbody>
+                    </table>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="./dashboard.js"></script>
+</body>
+</html>
