@@ -2,7 +2,8 @@ use crate::{
     auth::{require_scope, AuthContext},
     ensure_entity_exists,
     error::ApiError,
-    get_connector, record_connector_worker_event, record_ttn_device_mapping_event, AppState,
+    get_connector, is_plausible_ttn_topic_filter, record_connector_worker_event,
+    record_ttn_device_mapping_event, AppState,
 };
 use aion_event::{Event, EventSeverity};
 use aion_storage::{
@@ -1629,13 +1630,6 @@ fn push_unique_step(steps: &mut Vec<String>, step: &'static str) {
     if !steps.iter().any(|existing| existing == step) {
         steps.push(step.to_string());
     }
-}
-
-fn is_plausible_ttn_topic_filter(topic_filter: &str) -> bool {
-    let normalized = topic_filter.trim().to_ascii_lowercase();
-    normalized.contains("v3/")
-        && normalized.contains("/devices/")
-        && (normalized.ends_with("/up") || normalized.contains("/up/"))
 }
 
 fn is_public_ttn_broker_url(broker_url: &str) -> bool {
