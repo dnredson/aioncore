@@ -25,7 +25,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [Ingestion Usage](INGESTION_USAGE.md)
 - [Time-Series Usage](TIMESERIES_USAGE.md)
 - [Dashboard Usage](DASHBOARD_USAGE.md)
-- [Dashboard Frontend Skeleton](../apps/aion-dashboard/README.md)
+- [Dashboard Frontend](../apps/aion-dashboard/README.md)
 - [DLQ Usage](DLQ_USAGE.md)
 - [Reliable Ingestion Usage](RELIABLE_INGESTION_USAGE.md)
 - [Batch Ingestion Usage](BATCH_INGESTION_USAGE.md)
@@ -45,6 +45,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 
 Recent dashboard and flow ADRs:
 
+- [ADR 0085: Connector and broker management UI](ADR/0085-connector-broker-management-ui.md)
 - [ADR 0084: Dashboard frontend skeleton](ADR/0084-dashboard-frontend-skeleton.md)
 - [ADR 0083: Dashboard flow inventory and detail API](ADR/0083-dashboard-flow-inventory-detail-api.md)
 - [ADR 0082: Flow validation and dry-run API](ADR/0082-flow-validation-dry-run-api.md)

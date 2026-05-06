@@ -35,6 +35,8 @@ body {
 
 button,
 input,
+select,
+textarea,
 table {
   font: inherit;
 }
@@ -93,7 +95,9 @@ pre {
 .status-message,
 .status-meta,
 th,
-td {
+td,
+label span,
+.form-note {
   color: var(--ink-muted);
 }
 
@@ -138,26 +142,60 @@ td {
   border-color: var(--accent);
 }
 
-.config-form {
+.button[disabled],
+.nav-tab[disabled] {
+  cursor: not-allowed;
+  opacity: 0.6;
+  transform: none;
+}
+
+.config-form,
+.form-grid {
   display: grid;
   gap: 14px;
 }
 
-.config-form label {
+.config-form label,
+.form-grid label {
   display: grid;
   gap: 6px;
 }
 
-.config-form input {
+.config-form input,
+.form-grid input,
+.form-grid select,
+.form-grid textarea {
   width: 100%;
   padding: 10px 12px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--surface-muted);
+  color: var(--ink);
+}
+
+.form-grid textarea {
+  resize: vertical;
+  min-height: 110px;
+}
+
+.checkbox-field {
+  display: flex !important;
+  align-items: center;
+  gap: 10px;
+  padding-top: 28px;
+}
+
+.checkbox-field input {
+  width: auto;
+}
+
+.full-span {
+  grid-column: 1 / -1;
 }
 
 .button-row,
-.toolbar-actions {
+.toolbar-actions,
+.form-actions {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
@@ -194,6 +232,10 @@ td {
   justify-content: space-between;
   gap: 16px;
   align-items: start;
+}
+
+.panel-heading.compact {
+  margin-bottom: 10px;
 }
 
 .status-strip {
@@ -274,6 +316,21 @@ tbody tr:hover {
   background: rgba(142, 75, 38, 0.04);
 }
 
+.interactive-row {
+  cursor: pointer;
+}
+
+.interactive-row.selected {
+  background: rgba(142, 75, 38, 0.11);
+}
+
+.table-select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 120px;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -300,9 +357,15 @@ tbody tr:hover {
   color: var(--danger);
 }
 
+.badge.info {
+  background: rgba(50, 91, 122, 0.12);
+  color: #325b7a;
+}
+
+.panel-grid,
 .flows-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1.3fr) minmax(340px, 1fr);
+  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 1fr);
   gap: 16px;
 }
 
@@ -369,6 +432,14 @@ tbody tr:hover {
   display: none !important;
 }
 
+@media (max-width: 1280px) {
+  .panel-grid,
+  .flows-layout,
+  .mini-panels {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 1120px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -377,11 +448,6 @@ tbody tr:hover {
   .sidebar {
     border-right: 0;
     border-bottom: 1px solid rgba(216, 200, 180, 0.75);
-  }
-
-  .flows-layout,
-  .mini-panels {
-    grid-template-columns: 1fr;
   }
 }
 
@@ -398,7 +464,17 @@ tbody tr:hover {
     flex-direction: column;
   }
 
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
   table {
     min-width: 640px;
+  }
+}
+
+@media (min-width: 721px) {
+  .form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

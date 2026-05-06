@@ -10,9 +10,9 @@
   <div class="app-shell">
     <aside class="sidebar" aria-label="Primary">
       <div class="brand">
-        <p class="eyebrow">Milestone 89</p>
+        <p class="eyebrow">Milestone 90</p>
         <h1>AionCore Dashboard</h1>
-        <p class="lede">Read-only operational and flow inspection UI backed by the existing dashboard APIs.</p>
+        <p class="lede">Static operator UI for dashboard overview, connector operations, worker inspection, and flow visibility.</p>
       </div>
 
       <nav class="nav-tabs" aria-label="Dashboard sections">
@@ -40,14 +40,14 @@
             <button class="button subtle" id="clear-token" type="button">Clear Token</button>
           </div>
         </form>
-        <p class="hint">Token is stored in local browser `localStorage` for development only and is never printed to the console.</p>
+        <p class="hint">Token is stored in local browser <code>localStorage</code> for development only. Secret values are never stored or displayed by this UI.</p>
       </section>
     </aside>
 
     <main class="main-content">
       <header class="toolbar">
         <div>
-          <p class="eyebrow">Read-only</p>
+          <p id="section-mode" class="eyebrow">Read-only</p>
           <h2 id="section-title">Overview</h2>
         </div>
         <div class="toolbar-actions">
@@ -102,30 +102,290 @@
       <section id="connectors-section" class="content-section" aria-labelledby="section-title">
         <div class="section-header">
           <div>
-            <h3>Connector Overview</h3>
-            <p>Read-only connector runtime summaries from <code>GET /dashboard/connectors/overview</code>.</p>
+            <h3>Connector and Broker Management</h3>
+            <p>Read from <code>/dashboard/connectors/overview</code>, <code>/ingestion/connectors</code>, and <code>/ingestion/workers/*</code>. Admin actions remain explicit and manual.</p>
+          </div>
+          <div class="button-row">
+            <button class="button subtle" id="refresh-connectors-button" type="button">Refresh Connectors</button>
+            <button class="button subtle" id="refresh-workers-button" type="button">Refresh Workers</button>
+            <button class="button primary" id="reconcile-workers-button" type="button">Reconcile Workers</button>
           </div>
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Connector</th>
-                <th>Type</th>
-                <th>Profile</th>
-                <th>Enabled</th>
-                <th>Status</th>
-                <th>Broker URL</th>
-                <th>Topic Filter</th>
-                <th>Payload</th>
-                <th>Worker</th>
-                <th>Last Error</th>
-                <th>Secret</th>
-              </tr>
-            </thead>
-            <tbody id="connectors-table-body"></tbody>
-          </table>
+
+        <div class="panel-grid">
+          <article class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Read-only overview</p>
+                <h3>Connector Overview</h3>
+              </div>
+              <div class="status-meta">Source: <code>GET /dashboard/connectors/overview</code></div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Connector</th>
+                    <th>Type</th>
+                    <th>Profile</th>
+                    <th>Enabled</th>
+                    <th>Status</th>
+                    <th>Broker URL</th>
+                    <th>Topic Filter</th>
+                    <th>Payload</th>
+                    <th>Worker</th>
+                    <th>Last Error</th>
+                    <th>Secret</th>
+                  </tr>
+                </thead>
+                <tbody id="connectors-table-body"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="detail-panel" aria-live="polite">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Read and operate</p>
+                <h3>Connector Detail</h3>
+                <p id="connector-detail-title" class="detail-title">Select a connector to inspect details, runtime status, validation, and safe update actions.</p>
+              </div>
+              <div class="button-row">
+                <button class="button subtle" id="connector-refresh-detail" type="button" disabled>Refresh Detail</button>
+                <button class="button subtle" id="connector-refresh-status" type="button" disabled>Refresh Status</button>
+                <button class="button subtle" id="connector-enable-button" type="button" disabled>Enable</button>
+                <button class="button subtle" id="connector-disable-button" type="button" disabled>Disable</button>
+              </div>
+            </div>
+
+            <div id="connector-detail-empty" class="empty-state">No connector selected.</div>
+
+            <div id="connector-detail-content" class="hidden">
+              <div id="connector-detail-metadata" class="detail-grid"></div>
+
+              <div class="mini-panels">
+                <section class="mini-panel">
+                  <h4>Connector Status</h4>
+                  <div id="connector-status-summary"></div>
+                </section>
+                <section class="mini-panel">
+                  <h4>Worker Plan</h4>
+                  <div id="connector-worker-plan-summary"></div>
+                </section>
+                <section class="mini-panel">
+                  <h4>Worker Runtime</h4>
+                  <div id="connector-worker-runtime-summary"></div>
+                </section>
+              </div>
+
+              <div class="mini-panels">
+                <section class="mini-panel">
+                  <div class="panel-heading compact">
+                    <h4>Validation</h4>
+                    <button class="button subtle" id="connector-validate-button" type="button" disabled>Load Validation</button>
+                  </div>
+                  <div id="connector-validation-summary">TTN validation is manual and loaded only when requested.</div>
+                </section>
+                <section class="mini-panel">
+                  <div class="panel-heading compact">
+                    <h4>TTN Live Readiness Plan</h4>
+                    <button class="button subtle" id="connector-live-plan-button" type="button" disabled>Load Dry Run</button>
+                  </div>
+                  <div id="connector-live-plan-summary">Dry-run readiness planning is manual. No live validation is triggered automatically.</div>
+                </section>
+              </div>
+
+              <section class="mini-panel">
+                <h4>Safe JSON Preview</h4>
+                <pre id="connector-json-preview" class="mono-block"></pre>
+              </section>
+            </div>
+          </article>
         </div>
+
+        <div class="panel-grid">
+          <article class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Admin area</p>
+                <h3>Create Connector</h3>
+              </div>
+              <div class="status-meta">Source: <code>POST /ingestion/connectors</code></div>
+            </div>
+            <form id="connector-create-form" class="form-grid">
+              <label>
+                <span>Connector Key</span>
+                <input name="connector_key" type="text" required placeholder="field-mqtt-01">
+              </label>
+              <label>
+                <span>Name / Display Name</span>
+                <input name="display_name" type="text" placeholder="Field MQTT 01">
+              </label>
+              <label>
+                <span>Connector Type</span>
+                <select name="connector_type" id="create-connector-type"></select>
+              </label>
+              <label>
+                <span>Connector Profile</span>
+                <select name="connector_profile" id="create-connector-profile"></select>
+              </label>
+              <label class="checkbox-field">
+                <input name="enabled" type="checkbox" checked>
+                <span>Enabled</span>
+              </label>
+              <label>
+                <span>Protocol</span>
+                <input name="protocol" type="text" placeholder="mqtt or http">
+              </label>
+              <label>
+                <span>Broker URL</span>
+                <input name="broker_url" type="text" placeholder="mqtt://127.0.0.1:1883">
+              </label>
+              <label>
+                <span>Client ID</span>
+                <input name="client_id" type="text" placeholder="aioncore-field-mqtt-01">
+              </label>
+              <label>
+                <span>Topic Filter</span>
+                <input name="topic_filter" type="text" placeholder="aioncore/+/+/data">
+              </label>
+              <label>
+                <span>HTTP Path</span>
+                <input name="http_path" type="text" placeholder="/ingestion/connectors/{connector_id}/ingest">
+              </label>
+              <label>
+                <span>Endpoint</span>
+                <input name="endpoint" type="text" placeholder="/ingestion/connectors/{connector_id}/ingest">
+              </label>
+              <label>
+                <span>Payload Format</span>
+                <input name="payload_format" type="text" placeholder="senml-json">
+              </label>
+              <label>
+                <span>Content Type</span>
+                <input name="content_type" type="text" placeholder="application/json">
+              </label>
+              <label>
+                <span>Default Producer Entity ID</span>
+                <input name="default_producer_entity_id" type="text" placeholder="Optional UUID">
+              </label>
+              <label>
+                <span>Default Feature Of Interest ID</span>
+                <input name="default_feature_of_interest_id" type="text" placeholder="Optional UUID">
+              </label>
+              <label>
+                <span>Secret Ref ID</span>
+                <input name="secret_ref_id" type="text" placeholder="Optional existing UUID">
+              </label>
+              <label class="full-span">
+                <span>Metadata JSON</span>
+                <textarea name="metadata" rows="8" placeholder='{"unit_mapping":{"temperature":"Cel"}}'></textarea>
+              </label>
+              <div class="form-actions full-span">
+                <button class="button primary" type="submit">Create Connector</button>
+                <button class="button subtle" type="reset">Reset</button>
+              </div>
+            </form>
+          </article>
+
+          <article class="detail-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Admin area</p>
+                <h3>Update Selected Connector</h3>
+              </div>
+              <div class="status-meta">Source: <code>PATCH /ingestion/connectors/{connector_id}</code></div>
+            </div>
+            <form id="connector-update-form" class="form-grid">
+              <label>
+                <span>Name / Display Name</span>
+                <input name="display_name" type="text" placeholder="Field MQTT 01" disabled>
+              </label>
+              <label>
+                <span>Broker URL</span>
+                <input name="broker_url" type="text" placeholder="mqtt://127.0.0.1:1883" disabled>
+              </label>
+              <label>
+                <span>Client ID</span>
+                <input name="client_id" type="text" placeholder="aioncore-field-mqtt-01" disabled>
+              </label>
+              <label>
+                <span>Topic Filter</span>
+                <input name="topic_filter" type="text" placeholder="aioncore/+/+/data" disabled>
+              </label>
+              <label>
+                <span>HTTP Path</span>
+                <input name="http_path" type="text" placeholder="/ingestion/connectors/{connector_id}/ingest" disabled>
+              </label>
+              <label>
+                <span>Endpoint</span>
+                <input name="endpoint" type="text" placeholder="/ingestion/connectors/{connector_id}/ingest" disabled>
+              </label>
+              <label>
+                <span>Payload Format</span>
+                <input name="payload_format" type="text" placeholder="senml-json" disabled>
+              </label>
+              <label>
+                <span>Content Type</span>
+                <input name="content_type" type="text" placeholder="application/json" disabled>
+              </label>
+              <label>
+                <span>Default Producer Entity ID</span>
+                <input name="default_producer_entity_id" type="text" placeholder="Optional UUID" disabled>
+              </label>
+              <label>
+                <span>Default Feature Of Interest ID</span>
+                <input name="default_feature_of_interest_id" type="text" placeholder="Optional UUID" disabled>
+              </label>
+              <label>
+                <span>Secret Ref ID</span>
+                <input name="secret_ref_id" type="text" placeholder="Optional existing UUID" disabled>
+              </label>
+              <label class="full-span">
+                <span>Metadata JSON</span>
+                <textarea name="metadata" rows="8" placeholder='{"note":"safe operational metadata only"}' disabled></textarea>
+              </label>
+              <div class="form-actions full-span">
+                <button class="button primary" type="submit" disabled>Patch Connector</button>
+                <button class="button subtle" id="connector-update-reset" type="button" disabled>Reload Selection</button>
+              </div>
+            </form>
+          </article>
+        </div>
+
+        <article class="detail-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Worker runtime</p>
+              <h3>Worker Plan and Status</h3>
+              <p class="detail-title">Combined view of <code>GET /ingestion/workers/plan</code> and <code>GET /ingestion/workers/status</code>.</p>
+            </div>
+          </div>
+
+          <div id="worker-summary-cards" class="card-grid"></div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Connector</th>
+                  <th>Worker Kind</th>
+                  <th>Planned Status</th>
+                  <th>Runtime Status</th>
+                  <th>Enabled</th>
+                  <th>Connected</th>
+                  <th>Subscribed</th>
+                  <th>Reconnects</th>
+                  <th>Started</th>
+                  <th>Stopped</th>
+                  <th>Last Reconciled</th>
+                  <th>Last Error</th>
+                </tr>
+              </thead>
+              <tbody id="workers-table-body"></tbody>
+            </table>
+          </div>
+        </article>
       </section>
 
       <section id="flows-section" class="content-section" aria-labelledby="section-title">

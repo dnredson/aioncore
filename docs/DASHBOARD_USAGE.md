@@ -1,8 +1,10 @@
 # Dashboard Usage
 
-This guide covers the read-only dashboard API surface and the Milestone 89 static frontend skeleton.
+This guide covers the dashboard API surface and the static frontend under `apps/aion-dashboard/`.
 
 ## Scope
+
+Dashboard-oriented reads:
 
 - `GET /dashboard/overview`
 - `GET /dashboard/flows`
@@ -10,9 +12,25 @@ This guide covers the read-only dashboard API surface and the Milestone 89 stati
 - `GET /dashboard/timeseries/entities`
 - `GET /dashboard/connectors/overview`
 
-These endpoints do not replace `/timeseries/query`. They provide compact summaries that a future dashboard UI can use for discovery and navigation.
+Connector and worker operational reads used by the dashboard:
 
-Milestone 89 now also adds a lightweight static dashboard app under `apps/aion-dashboard/`.
+- `GET /ingestion/connectors`
+- `GET /ingestion/connectors/{connector_id}`
+- `GET /ingestion/connectors/{connector_id}/status`
+- `GET /ingestion/connectors/{connector_id}/validate`
+- `GET /ingestion/connectors/{connector_id}/ttn-live-readiness-plan`
+- `GET /ingestion/workers/plan`
+- `GET /ingestion/workers/status`
+
+Connector and worker admin actions used by the dashboard:
+
+- `POST /ingestion/connectors`
+- `PATCH /ingestion/connectors/{connector_id}`
+- `PUT /ingestion/connectors/{connector_id}/enable`
+- `PUT /ingestion/connectors/{connector_id}/disable`
+- `POST /ingestion/workers/reconcile`
+
+These endpoints do not replace `/timeseries/query`. They provide compact summaries and operator workflows that the static dashboard can use directly.
 
 ## Overview
 
@@ -39,100 +57,6 @@ Example response:
   "workers_running_count": 1,
   "workers_degraded_count": 1,
   "generated_at": "2026-05-06T12:00:00Z"
-}
-```
-
-## Flow Inventory
-
-```powershell
-Invoke-RestMethod -Method Get -Uri "http://localhost:8080/dashboard/flows"
-```
-
-Example response:
-
-```json
-{
-  "generated_at": "2026-05-06T12:00:00Z",
-  "flows": [
-    {
-      "flow_id": "117f40ca-c1ab-4d3b-9300-96049602ef07",
-      "flow_key": "mqtt-normalize-store",
-      "name": "MQTT Normalize Store",
-      "description": "Store normalized telemetry",
-      "enabled": true,
-      "node_count": 3,
-      "edge_count": 2,
-      "source_count": 1,
-      "decoder_count": 1,
-      "transform_count": 0,
-      "filter_count": 0,
-      "rule_count": 0,
-      "sink_count": 1,
-      "dlq_count": 0,
-      "validation_status": "valid",
-      "validation_error_count": 0,
-      "validation_warning_count": 0,
-      "created_at": "2026-05-06T11:58:00Z",
-      "updated_at": "2026-05-06T11:59:00Z"
-    }
-  ]
-}
-```
-
-The inventory is intentionally compact. It does not include full node configs.
-
-## Flow Detail
-
-```powershell
-Invoke-RestMethod -Method Get -Uri "http://localhost:8080/dashboard/flows/<flow-id>"
-```
-
-Example detail fields include:
-
-- `flow`
-- `nodes`
-- `edges`
-- `graph_summary`
-- `validation_summary`
-- `planned_path`
-- `referenced_connectors`
-- `planned_sinks`
-- `execution_supported = false`
-- `execution_status = "not_implemented"`
-- `side_effects_performed = false`
-
-Node configs are redacted with the same secret-like key behavior used by the flow validation and dry-run APIs.
-
-## Time-Series Entity Discovery
-
-```powershell
-Invoke-RestMethod -Method Get -Uri "http://localhost:8080/dashboard/timeseries/entities"
-```
-
-Example response:
-
-```json
-{
-  "generated_at": "2026-05-06T12:00:00Z",
-  "entities": [
-    {
-      "entity_id": "7d3df2c8-d59c-4b78-9686-f81cfc313ca5",
-      "entity_key": "plot-north-01",
-      "entity_type": "aion:Plot",
-      "display_name": "North Plot",
-      "observed_property_count": 2,
-      "observation_count": 42,
-      "last_observed_at": "2026-05-05T12:42:00Z",
-      "properties": [
-        {
-          "observed_property": "soil.moisture",
-          "observation_count": 21,
-          "last_observed_at": "2026-05-05T12:42:00Z",
-          "units": ["%"]
-        }
-      ]
-    }
-  ]
 }
 ```
 
@@ -173,46 +97,153 @@ Example response:
 
 Secret values are never returned. `broker_url` is intended for safe display and redacts embedded credentials.
 
-## Token Mode
+## Connector Detail And Status
 
-Dashboard endpoints require `dashboard:read` in `AIONCORE_AUTH_MODE=token`.
+Connector inventory:
 
 ```powershell
-$headers = @{ Authorization = "Bearer <token-with-dashboard-read>" }
-Invoke-RestMethod -Method Get -Headers $headers -Uri "http://localhost:8080/dashboard/overview"
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/connectors"
 ```
 
-Token-mode behavior:
+Connector detail:
 
-- missing or invalid bearer token: `401`
-- valid token without `dashboard:read`: `403`
-- `admin:all`: allowed
-- non-admin principals: limited to dashboard data owned by the principal tenant
-- cross-tenant dashboard flow detail: `403`
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/connectors/<connector-id>"
+```
 
-The overview response now also includes flow and DLQ inventory counts plus flow validation summary counts. The dashboard API still does not render or execute flows and does not provide a dashboard UI yet.
+Connector runtime status:
 
-Future dashboard and flow-builder work should use the dedicated flow read-only planning endpoints rather than trying to infer usability from `/flows` alone:
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/connectors/<connector-id>/status"
+```
 
-- `GET /flows/{flow_id}/validation`
-- `POST /flows/{flow_id}/dry-run`
+The static dashboard uses the dashboard overview table for selection and the connector detail/status routes for the operator side panel.
 
-Those endpoints are additive and do not execute flows. The dashboard flow endpoints complement them with inventory/detail shapes optimized for future UI rendering.
+## Worker Plan And Runtime
 
-## Static Dashboard Skeleton
+Planner:
 
-The first dashboard frontend is a no-build static app:
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/workers/plan"
+```
+
+Runtime status:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/workers/status"
+```
+
+The dashboard combines these responses to show:
+
+- whether connector workers are enabled
+- planned, skipped, invalid, and unsupported worker counts
+- connector-specific worker kind and planned status
+- running, reconnecting, degraded, stopped, and error runtime state
+- `last_error`
+- `reconnect_attempts`
+- `started_at`
+- `stopped_at`
+- `last_reconciled_at`
+
+Manual reconcile:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/ingestion/workers/reconcile"
+```
+
+## Connector Create And Safe Patch
+
+Create connector:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8080/ingestion/connectors" `
+  -ContentType "application/json" `
+  -Body (@{
+    connector_key = "field-mqtt-01"
+    connector_type = "mqtt"
+    connector_profile = "generic-mqtt"
+    enabled = $true
+    display_name = "Field MQTT 01"
+    broker_url = "mqtt://127.0.0.1:1883"
+    client_id = "aioncore-field-mqtt-01"
+    topic_filter = "aioncore/+/+/data"
+    payload_format = "senml-json"
+    secret_ref_id = "00000000-0000-0000-0000-000000000000"
+    metadata = @{
+      purpose = "local dashboard demo"
+    }
+  } | ConvertTo-Json -Depth 8)
+```
+
+Safe patch example:
+
+```powershell
+Invoke-RestMethod `
+  -Method Patch `
+  -Uri "http://localhost:8080/ingestion/connectors/<connector-id>" `
+  -ContentType "application/json" `
+  -Body (@{
+    display_name = "Field MQTT 01 Updated"
+    broker_url = "mqtt://127.0.0.1:1883"
+    topic_filter = "aioncore/soil/+/data"
+    payload_format = "senml-json"
+    secret_ref_id = "00000000-0000-0000-0000-000000000000"
+    metadata = @{
+      updated_by = "dashboard"
+    }
+  } | ConvertTo-Json -Depth 8)
+```
+
+The dashboard labels display name as "Name / Display Name" for operator usability, but it uses the existing backend field name `display_name`.
+
+## TTN Validation And Dry-Run Readiness
+
+Load deterministic connector validation:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/connectors/<connector-id>/validate"
+```
+
+Load TTN live-readiness dry run:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ingestion/connectors/<connector-id>/ttn-live-readiness-plan"
+```
+
+The dashboard does not call live validation automatically. It does not call `POST /ingestion/connectors/{connector_id}/ttn-live-validate` in this milestone.
+
+## Token Mode
+
+In `AIONCORE_AUTH_MODE=token`, the dashboard UI requires:
+
+- `dashboard:read` for `GET /dashboard/overview`, `GET /dashboard/timeseries/entities`, `GET /dashboard/connectors/overview`, `GET /dashboard/flows`, and `GET /dashboard/flows/{flow_id}`
+- `connectors:read` for `GET /ingestion/connectors`, connector detail/status, TTN validation reads, and worker plan/status
+- `connectors:admin` for connector create, patch, enable, disable, and worker reconcile
+
+Example:
+
+```powershell
+$headers = @{ Authorization = "Bearer <token>" }
+Invoke-RestMethod -Method Get -Headers $headers -Uri "http://localhost:8080/dashboard/overview"
+Invoke-RestMethod -Method Get -Headers $headers -Uri "http://localhost:8080/ingestion/workers/status"
+```
+
+Token-mode behavior surfaced by the UI:
+
+- missing or invalid bearer token: `401`, shown as `Missing or invalid token`
+- valid token without the required scope: `403`, shown as `Token lacks required scope`
+
+The UI never logs token values.
+
+## Static Dashboard App
+
+The current dashboard frontend remains a no-build static app:
 
 - `apps/aion-dashboard/index.html`
 - `apps/aion-dashboard/styles.css`
 - `apps/aion-dashboard/dashboard.js`
-
-Why static for the first milestone:
-
-- no heavy frontend toolchain yet
-- no `node_modules`
-- low-risk operator UI while dashboard contracts are still stabilizing
-- easy local serving from any simple static server
 
 Run it locally from the repository root:
 
@@ -237,23 +268,20 @@ The UI supports:
 - local API base URL override
 - optional bearer token input for local development
 - `Authorization: Bearer <token>` only when a token is present
-- read-only refresh and section switching
+- refresh and section switching
+- connector overview and detail inspection
+- connector create and safe patch actions
+- enable, disable, and reconcile controls
+- worker plan and runtime inspection
+- manual TTN validation and dry-run readiness reads
 
-The app currently consumes:
-
-- `GET /dashboard/overview`
-- `GET /dashboard/timeseries/entities`
-- `GET /dashboard/connectors/overview`
-- `GET /dashboard/flows`
-- `GET /dashboard/flows/{flow_id}`
-
-The app intentionally does not implement:
+The app intentionally still does not implement:
 
 - flow execution
 - flow editing
 - drag-and-drop flow building
-- connector mutation
-- broker subscription changes
+- secret creation
+- live TTN validation triggers
 - MQTT publish
 - HTTP forwarding
 - charting libraries
