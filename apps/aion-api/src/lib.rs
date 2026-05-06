@@ -504,6 +504,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .merge(routes::commands::router())
         .merge(routes::connectors::router())
         .merge(routes::dashboard::router())
+        .merge(routes::dlq::router())
         .merge(routes::flows::router())
         .merge(routes::smartsentinel::router())
         .merge(routes::mcp::router())
@@ -2328,6 +2329,7 @@ mod tests {
                 "observations",
                 "timeseries",
                 "dashboard",
+                "dlq",
                 "flows",
                 "commands",
                 "actions",
@@ -14182,6 +14184,343 @@ mod tests {
         to_json(response).await
     }
 
+    #[tokio::test]
+    async fn dev_mode_dlq_create_list_get_update_and_dashboard_counts() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_id = Uuid::new_v4();
+        let app = dev_mode_app_with_storage_for_tenant(storage, tenant_id);
+
+        let first = create_test_dlq_record(
+            &app,
+            sample_dlq_body("decode-01", "pending", "decoding", "minifi"),
+        )
+        .await;
+        let second = create_test_dlq_record(
+            &app,
+            sample_dlq_body("validation-01", "resolved", "validation", "nifi"),
+        )
+        .await;
+
+        let listed = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/dlq/records")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+
+        for (uri, expected_id) in [
+            ("/dlq/records?status=pending", first["id"].as_str().unwrap()),
+            (
+                "/dlq/records?failure_stage=decoding",
+                first["id"].as_str().unwrap(),
+            ),
+            (
+                "/dlq/records?source_system=minifi",
+                first["id"].as_str().unwrap(),
+            ),
+            (
+                "/dlq/records?idempotency_key=tenant-a:decode-01",
+                first["id"].as_str().unwrap(),
+            ),
+            (
+                "/dlq/records?external_flowfile_uuid=flowfile-decode-01",
+                first["id"].as_str().unwrap(),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_json(response).await;
+            assert_eq!(body.as_array().unwrap().len(), 1, "filter uri {uri}");
+            assert_eq!(body[0]["id"], expected_id, "filter uri {uri}");
+        }
+
+        let detail = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/dlq/records/{}", first["id"].as_str().unwrap()))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(detail["dlq_key"], "decode-01");
+
+        let replay_requested = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "PATCH",
+                    &format!("/dlq/records/{}/status", first["id"].as_str().unwrap()),
+                    json!({"status": "replay_requested"}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(replay_requested["status"], "replay_requested");
+
+        let ignored = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "PATCH",
+                    &format!("/dlq/records/{}/status", first["id"].as_str().unwrap()),
+                    json!({"status": "ignored"}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(ignored["status"], "ignored");
+        assert!(ignored["resolved_at"].is_string());
+
+        let overview = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/dashboard/overview")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(overview["dlq_pending_count"], 0);
+        assert_eq!(overview["dlq_total_count"], 2);
+        assert_eq!(second["status"], "resolved");
+
+        let events = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/events")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let event_types = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["event_type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"aion:DlqRecordCreated"));
+        assert!(event_types.contains(&"aion:DlqReplayRequested"));
+        assert!(event_types.contains(&"aion:DlqRecordIgnored"));
+    }
+
+    #[tokio::test]
+    async fn token_mode_dlq_read_requires_auth_and_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = token_mode_app_with_storage(storage.clone());
+        let wrong_scope = store_api_token_for_tenant(
+            &storage,
+            Uuid::new_v4(),
+            ApiTokenPrincipalType::Service,
+            Some("svc-no-dlq"),
+            &["dashboard:read"],
+        );
+        let read_scope = store_api_token_for_tenant(
+            &storage,
+            Uuid::new_v4(),
+            ApiTokenPrincipalType::Service,
+            Some("svc-dlq-read"),
+            &["dlq:read"],
+        );
+
+        let no_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dlq/records")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_scope_response = app
+            .clone()
+            .oneshot(auth_request("GET", "/dlq/records", &wrong_scope))
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope_response.status(), StatusCode::FORBIDDEN);
+
+        let read_scope_response = app
+            .clone()
+            .oneshot(auth_request("GET", "/dlq/records", &read_scope))
+            .await
+            .unwrap();
+        assert_eq!(read_scope_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_dlq_write_scope_can_create_record() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_id = Uuid::new_v4();
+        let app = token_mode_app_with_storage(storage.clone());
+        let token = store_api_token_for_tenant(
+            &storage,
+            tenant_id,
+            ApiTokenPrincipalType::Service,
+            Some("svc-dlq-write"),
+            &["dlq:write"],
+        );
+
+        let response = app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/dlq/records",
+                sample_dlq_body("token-create-01", "pending", "decoding", "minifi"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_json(response).await;
+        assert_eq!(body["tenant_id"], tenant_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn token_mode_dlq_tenant_filtering_and_cross_tenant_update_denial() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let token_app = token_mode_app_with_storage(storage.clone());
+
+        let record_a = create_test_dlq_record(
+            &tenant_a_app,
+            sample_dlq_body("tenant-a-record", "pending", "decoding", "minifi"),
+        )
+        .await;
+        let record_b = create_test_dlq_record(
+            &tenant_b_app,
+            sample_dlq_body("tenant-b-record", "pending", "validation", "nifi"),
+        )
+        .await;
+        let read_token_a = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-read"),
+            &["dlq:read"],
+        );
+        let write_token_a = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-write"),
+            &["dlq:write"],
+        );
+
+        let list = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_request("GET", "/dlq/records", &read_token_a))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["id"], record_a["id"]);
+
+        let cross_tenant_get = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/dlq/records/{}", record_b["id"].as_str().unwrap()),
+                &read_token_a,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_get.status(), StatusCode::FORBIDDEN);
+
+        let cross_tenant_patch = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "PATCH",
+                &format!("/dlq/records/{}/status", record_b["id"].as_str().unwrap()),
+                json!({"status": "resolved"}),
+                &write_token_a,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_patch.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_admin_can_read_and_manage_dlq_across_tenants() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let token_app = token_mode_app_with_storage(storage.clone());
+
+        create_test_dlq_record(
+            &tenant_a_app,
+            sample_dlq_body("tenant-a-admin", "pending", "decoding", "minifi"),
+        )
+        .await;
+        let record_b = create_test_dlq_record(
+            &tenant_b_app,
+            sample_dlq_body("tenant-b-admin", "pending", "validation", "nifi"),
+        )
+        .await;
+        let admin_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Admin,
+            Some("admin-all"),
+            &["admin:all"],
+        );
+
+        let list = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_request("GET", "/dlq/records", &admin_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list.as_array().unwrap().len(), 2);
+
+        let updated = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_json_request(
+                    "PATCH",
+                    &format!("/dlq/records/{}/status", record_b["id"].as_str().unwrap()),
+                    json!({"status": "resolved"}),
+                    &admin_token,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(updated["status"], "resolved");
+    }
+
     fn entity_id_by_key(entities: &Value, entity_key: &str) -> String {
         entity_by_key(entities, entity_key)["id"]
             .as_str()
@@ -14349,6 +14688,51 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CREATED);
         to_json(response).await
+    }
+
+    async fn create_test_dlq_record(app: &Router, body: Value) -> Value {
+        let response = app
+            .clone()
+            .oneshot(json_request("POST", "/dlq/records", body))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        to_json(response).await
+    }
+
+    fn sample_dlq_body(
+        dlq_key: &str,
+        status: &str,
+        failure_stage: &str,
+        source_system: &str,
+    ) -> Value {
+        json!({
+            "dlq_key": dlq_key,
+            "source_system": source_system,
+            "source_id": format!("{source_system}-source"),
+            "idempotency_key": format!("tenant-a:{dlq_key}"),
+            "external_flow_id": "flow-edge-sync",
+            "external_flow_name": "Edge Sync",
+            "external_flowfile_uuid": format!("flowfile-{dlq_key}"),
+            "external_process_group_id": "pg-01",
+            "external_processor_id": "proc-01",
+            "external_provenance_uri": "nifi://provenance/events/123",
+            "sync_session_id": format!("sync-{dlq_key}"),
+            "payload_format": "senml-json",
+            "payload": [{"n": "temperature", "v": 21.4}],
+            "payload_hash": "sha256:test",
+            "failure_stage": failure_stage,
+            "failure_reason": "decoder rejected payload",
+            "failure_detail": "invalid field shape",
+            "retry_count": 2,
+            "replay_count": 1,
+            "status": status,
+            "metadata": {
+                "external.source_system": source_system,
+                "note": "test"
+            }
+        })
     }
 
     fn sample_flow_body(flow_key: &str, name: &str) -> Value {

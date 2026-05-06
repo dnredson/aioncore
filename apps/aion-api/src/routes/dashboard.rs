@@ -8,7 +8,7 @@ use crate::{
 };
 use aion_entity::Entity;
 use aion_observation::Observation;
-use aion_storage::{EventFilter, IngestionConnector, IngestionConnectorType};
+use aion_storage::{DlqRecordFilter, EventFilter, IngestionConnector, IngestionConnectorType};
 use axum::{
     extract::{Extension, State},
     routing::get,
@@ -43,6 +43,8 @@ pub(crate) struct DashboardOverviewResponse {
     pub events_count: usize,
     pub flows_count: usize,
     pub enabled_flows_count: usize,
+    pub dlq_pending_count: usize,
+    pub dlq_total_count: usize,
     pub connectors_count: usize,
     pub enabled_connectors_count: usize,
     pub workers_running_count: usize,
@@ -114,6 +116,9 @@ async fn get_dashboard_overview(
     let raw_messages_count = scoped_raw_messages_count(&state, &auth)?;
     let events_count = scoped_events_count(&state, &auth)?;
     let flows = scoped_flows(&state, &auth)?;
+    let dlq_total_count = scoped_dlq_records_count(&state, &auth, None)?;
+    let dlq_pending_count =
+        scoped_dlq_records_count(&state, &auth, Some(aion_dlq::DlqStatus::Pending))?;
     let connectors = scoped_connectors(&state, &auth)?;
     let connector_items = build_connector_overview_items(&state, connectors)?;
 
@@ -124,6 +129,8 @@ async fn get_dashboard_overview(
         events_count,
         flows_count: flows.len(),
         enabled_flows_count: flows.iter().filter(|flow| flow.enabled).count(),
+        dlq_pending_count,
+        dlq_total_count,
         connectors_count: connector_items.len(),
         enabled_connectors_count: connector_items.iter().filter(|item| item.enabled).count(),
         workers_running_count: connector_items.iter().filter(|item| item.running).count(),
@@ -333,6 +340,32 @@ fn scoped_flows(state: &AppState, auth: &AuthContext) -> Result<Vec<aion_flow::F
         Ok(state.storage.list_all_flows()?)
     } else {
         Ok(state.storage.list_flows(principal_tenant_id(auth)?)?)
+    }
+}
+
+fn scoped_dlq_records_count(
+    state: &AppState,
+    auth: &AuthContext,
+    status: Option<aion_dlq::DlqStatus>,
+) -> Result<usize, ApiError> {
+    let filter = DlqRecordFilter {
+        status,
+        limit: UNBOUNDED_QUERY_LIMIT,
+        ..DlqRecordFilter::default()
+    };
+
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        Ok(state
+            .storage
+            .list_dlq_records(state.tenant_id, filter)?
+            .len())
+    } else if is_admin_all(auth) {
+        Ok(state.storage.list_all_dlq_records(filter)?.len())
+    } else {
+        Ok(state
+            .storage
+            .list_dlq_records(principal_tenant_id(auth)?, filter)?
+            .len())
     }
 }
 

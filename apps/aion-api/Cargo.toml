@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 aion-action.workspace = true
+aion-dlq.workspace = true
 aion-entity.workspace = true
 aion-event.workspace = true
 aion-flow.workspace = true

@@ -1,21 +1,44 @@
 {
-  "dlq_record_id": "dlq-demo-0001",
-  "adapter_id": "edge-adapter-demo-01",
-  "source_protocol": "csv",
-  "source_ref": "dropbox/site-01/weather.csv",
-  "parser_name": "csv-weather-v1",
-  "payload_format_hint": "csv",
-  "failure_class": "parse_error",
-  "failure_reason": "missing required column observed_at",
-  "attempt_count": 3,
-  "first_seen_at": "2026-04-30T12:00:00Z",
-  "last_attempted_at": "2026-04-30T12:05:00Z",
-  "next_retry_at": null,
-  "replay_eligible": false,
-  "raw_payload_ref": "local-dlq://edge-adapter-demo-01/dlq-demo-0001",
+  "id": "0f6ad8fd-a4f1-40a7-bbc7-3f79aa1a9b76",
+  "tenant_id": "11111111-1111-1111-1111-111111111111",
+  "dlq_key": "edge-decode-failure-01",
+  "source_system": "minifi",
+  "source_id": "site-01-edge-01",
+  "connector_id": null,
+  "flow_id": null,
+  "raw_message_id": null,
+  "event_id": null,
+  "command_id": null,
+  "idempotency_key": "tenant-a:site-01:pump-07:2026-05-06T12:00:00Z:41",
+  "external_flow_id": "flow-edge-sync",
+  "external_flow_name": "Edge Telemetry Sync",
+  "external_flowfile_uuid": "2f8d0c30-7cf6-4d58-b9ac-4e53c9ad3a72",
+  "external_process_group_id": "pg-site-01",
+  "external_processor_id": "proc-http-post",
+  "external_provenance_uri": "nifi://provenance/events/123456",
+  "sync_session_id": "sync-2026-05-06-outage-recovery-01",
+  "payload_format": "senml-json",
+  "payload": [
+    {
+      "bn": "pump-07",
+      "n": "temperature",
+      "u": "Cel",
+      "v": "bad"
+    }
+  ],
+  "payload_hash": "sha256:5ce3b778...",
+  "failure_stage": "decoding",
+  "failure_reason": "decoder rejected payload",
+  "failure_detail": "temperature must be numeric",
+  "retry_count": 3,
+  "replay_count": 1,
+  "status": "pending",
   "metadata": {
-    "site_id": "site-01",
-    "dlq_replayed": false,
-    "secret_exposed": false
-  }
+    "external.source_system": "minifi",
+    "external.route": "edge-http->cloud-sync->aioncore",
+    "connectivity_state": "replayed_after_outage"
+  },
+  "created_at": "2026-05-06T12:10:11Z",
+  "updated_at": "2026-05-06T12:10:11Z",
+  "resolved_at": null
 }

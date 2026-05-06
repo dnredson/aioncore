@@ -325,6 +325,8 @@ Future DLQ records:
 
 - should reuse the same `external.*` keys so replay paths stay explainable
 
+Milestone 84 now adds a typed DLQ record foundation that preserves these fields directly, but it still does not add automatic routing from ingestion into DLQ records.
+
 Future batch or backfill session records:
 
 - should use `external.sync_session_id`, `external.idempotency_key`, and replay counters consistently
@@ -339,8 +341,8 @@ Future batch or backfill session records:
 
 ## Runtime Status
 
-This milestone is documentation-only for NiFi/MiNiFi integration.
+Milestones 83 and 84 together now provide the contract plus the first DLQ storage/API foundation for provenance-rich failures and replay planning.
 
-The existing generic `RawMessage.headers`, `Event.metadata`, `Observation.metadata`, and `Flow.metadata` surfaces are already flexible enough to carry the documented conventions later without changing current runtime behavior.
+The existing generic `RawMessage.headers`, `Event.metadata`, `Observation.metadata`, `Flow.metadata`, and now `DlqRecord` fields are flexible enough to carry the documented conventions without changing current ingestion runtime behavior.
 
 Future milestones may add typed envelope or provenance structs once runtime adoption begins.

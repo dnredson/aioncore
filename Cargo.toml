@@ -2,6 +2,7 @@
 members = [
     "apps/aion-api",
     "crates/aion-action",
+    "crates/aion-dlq",
     "crates/aion-entity",
     "crates/aion-event",
     "crates/aion-flow",
@@ -31,6 +32,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 aion-entity = { path = "crates/aion-entity" }
 aion-action = { path = "crates/aion-action" }
+aion-dlq = { path = "crates/aion-dlq" }
 aion-event = { path = "crates/aion-event" }
 aion-flow = { path = "crates/aion-flow" }
 aion-mcp = { path = "crates/aion-mcp" }

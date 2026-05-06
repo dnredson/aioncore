@@ -17,6 +17,7 @@ name = "aion-api"
 version = "0.1.0"
 dependencies = [
  "aion-action",
+ "aion-dlq",
  "aion-entity",
  "aion-event",
  "aion-flow",
@@ -37,6 +38,16 @@ dependencies = [
  "subtle",
  "tokio",
  "tower",
+ "uuid",
+]
+
+[[package]]
+name = "aion-dlq"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -135,6 +146,7 @@ name = "aion-storage"
 version = "0.1.0"
 dependencies = [
  "aion-action",
+ "aion-dlq",
  "aion-entity",
  "aion-event",
  "aion-flow",

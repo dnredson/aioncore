@@ -128,6 +128,7 @@ Examples:
 - `Rule`, `Command`, and `Event` remain the existing policy and control-plane primitives.
 - `RawMessage` remains the required pre-normalization persistence layer.
 - future `dlq` flow nodes are intended to model operational error paths, but no DLQ runtime is introduced in this milestone.
+- the Milestone 84 DLQ API foundation now provides a typed destination model for later DLQ-oriented flow execution, but flows still do not route to it automatically
 
 Flows may also reference external operational flow engines through metadata only. For example, a Flow can document that its real transport or replay path is implemented in NiFi or MiNiFi while AionCore continues to own the semantic destination model. See [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md).
 

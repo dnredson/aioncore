@@ -26,6 +26,8 @@ Example response:
   "events_count": 38,
   "flows_count": 4,
   "enabled_flows_count": 2,
+  "dlq_pending_count": 3,
+  "dlq_total_count": 7,
   "connectors_count": 3,
   "enabled_connectors_count": 2,
   "workers_running_count": 1,
@@ -120,4 +122,4 @@ Token-mode behavior:
 - `admin:all`: allowed
 - non-admin principals: limited to dashboard data owned by the principal tenant
 
-The overview response now also includes flow inventory counts. It still does not render or execute flows.
+The overview response now also includes flow and DLQ inventory counts. It still does not render or execute flows and does not provide a dashboard UI yet.

@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a read-only backend foundation. Milestones 81 and 82 add dashboard-oriented API summaries plus initial flow inventory counts so a future UI can explore entities, observed properties, connector operations, worker health, and pipeline inventory without changing ingestion, connector runtime, or time-series query behavior.
+The AionCore dashboard is currently a read-only backend foundation. Milestones 81, 82, and 84 add dashboard-oriented API summaries plus flow and DLQ inventory counts so a future UI can explore entities, observed properties, connector operations, worker health, pipeline inventory, and basic reliability backlog without changing ingestion, connector runtime, or time-series query behavior.
 
 ## Current Intent
 
@@ -16,6 +16,7 @@ The AionCore dashboard is currently a read-only backend foundation. Milestones 8
 - `GET /dashboard/timeseries/entities`
 - `GET /dashboard/connectors/overview`
 - flow counts from `GET /dashboard/overview`
+- DLQ counts from `GET /dashboard/overview`
 
 These endpoints are designed for compact dashboard landing pages and navigation panels rather than full raw-data export.
 

@@ -349,6 +349,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `capabilities:write`
 - `mcp:tools`
 - `smartsentinel:ingest`
+- `dlq:read`
 - `dlq:write`
 - `batches:write`
 - `adapters:register`
@@ -376,6 +377,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `connectors:read` covers selected connector and worker operational reads without granting mutation.
 - `connectors:admin` covers connector lifecycle mutation, TTN device-mapping administration, worker reconciliation, TTN live validation preflight, validation-related operator actions, enable/disable, and configuration updates.
 - `dashboard:read` covers read-only dashboard aggregation routes that summarize entities, time-series discovery, connectors, brokers, and worker health.
+- `dlq:read` covers DLQ list and detail inspection.
 - `flows:read` covers flow list and detail inspection.
 - `flows:write` covers flow creation, update, enable, disable, and deletion.
 - `provenance:read` covers provenance-oriented aggregate search and future provenance-heavy operational APIs.
@@ -398,7 +400,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `executors:write` and `executors:admin` cover selected executor capability and scope configuration writes.
 - SmartSentinel executor bridge scopes are intentionally separate from generic executor scopes so bridge tokens can stay narrow.
 - `mcp:tools` should authorize local or production MCP tool invocation, not generic write access.
-- `dlq:write` is reserved for future machine writers that submit DLQ records or acknowledgements.
+- `dlq:write` covers DLQ record creation and status updates by trusted machine clients or operators.
 - `batches:write` is reserved for future machine writers that create batch or backfill session records.
 - `auth:tokens:admin` covers token issuance, listing, inspection, and revocation.
 - `admin:all` is a reserved break-glass scope and satisfies any route scope check.
@@ -420,7 +422,7 @@ User and admin APIs should eventually support API tokens first, with JWT or OAut
 
 Devices, adapters, executors, connectors, and bridges should use dedicated machine credentials rather than user tokens reused across automation.
 
-External reliable flow engines such as NiFi or MiNiFi should also authenticate as dedicated machine principals. The likely minimum future scope for runtime delivery is `ingestion:write`. Read-only operational integrations may also need `flows:read` or `dashboard:read`. Future reliable-ingestion extensions may use dedicated `dlq:write` and `batches:write` scopes.
+External reliable flow engines such as NiFi or MiNiFi should also authenticate as dedicated machine principals. The likely minimum future scope for runtime delivery is `ingestion:write`. Read-only operational integrations may also need `flows:read`, `dashboard:read`, or `dlq:read`. Reliable-ingestion integrations can now use dedicated `dlq:write` and `dlq:read` scopes, while `batches:write` remains future work.
 
 ### Secret Storage For API Credentials
 
@@ -531,6 +533,7 @@ The table below describes the intended future protection model. It does not chan
 | `/relationships` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `relationships:write`; future `relationships:read` if standalone read routes are added | Selected write authorization now applies in Milestone 60. |
 | `/observations` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` for GET, `observations:write` for POST | Direct write path should remain limited; most machine writers should prefer ingestion endpoints. |
 | `/dashboard/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `dashboard:read` | Implemented in Milestone 81 for read-only dashboard aggregation and discovery routes. Non-admin principals remain tenant-filtered. |
+| `/dlq/records*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal`, NiFi or MiNiFi-style machine principals | `dlq:read` for GET and `dlq:write` for POST and PATCH | Implemented in Milestone 84 as DLQ storage and API foundation only. Non-admin principals remain tenant-filtered. No replay execution exists yet. |
 | `/flows*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `flows:read` for GET, `flows:write` for create, update, enable, disable, and delete | Implemented in Milestone 82 as storage and API foundation only. No visual editor or runtime execution exists yet. |
 | `/raw-messages` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `raw-messages:read` | Implemented in Milestone 55 for list and detail reads. Sensitive because raw payloads and headers may include operational metadata. |
 | `/ingest/http` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Primary generic ingestion write surface. |
@@ -614,6 +617,7 @@ The table below describes the intended future protection model. It does not chan
   - `observations`
   - `timeseries`
   - `dashboard`
+  - `dlq`
   - `flows`
   - `commands`
   - `actions`

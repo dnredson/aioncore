@@ -7,6 +7,7 @@ This guide shows how to use the Milestone 83 NiFi/MiNiFi integration contract wi
 - a documented boundary between AionCore and NiFi/MiNiFi
 - a recommended envelope shape for reliable upstream producers
 - consistent provenance metadata keys for future replay, DLQ, and backfill work
+- a DLQ API foundation for trusted integrations to preserve failed or quarantined records explicitly
 - explicit deployment guidance for edge, fog, and cloud flow topologies
 
 This milestone does not add:
@@ -131,7 +132,8 @@ Useful present or planned scopes:
 - `ingestion:write`
 - `flows:read`
 - `dashboard:read`
-- `dlq:write` in a future milestone
+- `dlq:write`
+- `dlq:read`
 - `batches:write` in a future milestone
 
 Do not use broad operator credentials for automated upstream flow engines.
@@ -152,7 +154,7 @@ This makes future backfill and replay features easier to explain and audit.
 
 - AionCore does not yet interpret the envelope automatically.
 - AionCore does not yet implement idempotency-key enforcement.
-- AionCore does not yet implement DLQ records for external reliable ingestion.
+- AionCore now provides explicit DLQ record APIs, but it does not route records into DLQ automatically and does not execute replay.
 - AionCore does not yet implement backfill session APIs.
 - AionCore does not yet distinguish late data in rule execution behavior.
 

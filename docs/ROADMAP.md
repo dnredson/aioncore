@@ -45,18 +45,18 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 81 dashboard read API foundation: `aion-api` now adds `GET /dashboard/overview`, `GET /dashboard/timeseries/entities`, and `GET /dashboard/connectors/overview` as read-only dashboard-friendly summaries, preserving existing `/timeseries` and connector behavior, adding `dashboard:read` token-mode scope protection, reusing tenant-aware read filtering, redacting connector credential material, and intentionally deferring any frontend UI, flow editor, flow execution, and Grafana provisioning work.
 - Milestone 82 flow and pipeline model foundation: `aion-api` now adds a first-class `Flow` graph model plus `POST /flows`, `GET /flows`, `GET /flows/{flow_id}`, `PATCH /flows/{flow_id}`, `PUT /flows/{flow_id}/enable`, `PUT /flows/{flow_id}/disable`, and `DELETE /flows/{flow_id}`; in-memory and PostgreSQL persistence; `flows:read` and `flows:write` token-mode protection; tenant-aware list and detail filtering; lifecycle audit events; and optional dashboard overview flow counts, while intentionally deferring any visual editor, execution engine, runtime forwarding, or ingestion behavior changes.
 - Milestone 83 NiFi/MiNiFi integration contract and provenance model: AionCore now documents an explicit optional boundary for NiFi and MiNiFi as external reliable flow runtimes; recommended deployment patterns; a reliable-ingestion envelope convention; shared `external.*` provenance metadata keys for RawMessage, Event, Observation, Flow, and future DLQ/backfill work; and the security and roadmap implications, while intentionally deferring runtime ingestion changes, DLQ runtime, idempotency enforcement, and batch/backfill execution.
+- Milestone 84 DLQ model and API foundation: AionCore now adds a first-class tenant-scoped `DlqRecord` model; in-memory and PostgreSQL persistence; `POST /dlq/records`, `GET /dlq/records`, `GET /dlq/records/{record_id}`, and `PATCH /dlq/records/{record_id}/status`; `dlq:read` and `dlq:write` token-mode protection; tenant-aware filtering and cross-tenant denial behavior; lifecycle audit events; and dashboard overview DLQ counts, while intentionally deferring automatic routing, replay execution, and batch/backfill runtime behavior.
 
 ## Next
 
-1. DLQ model and API foundation.
-2. Reliable ingestion envelope and tenant-scoped idempotency-key foundation.
-3. Batch and backfill ingestion API foundation.
-4. Flow validation and dry-run API.
-5. Dashboard frontend skeleton.
-6. Connector and broker management UI.
-7. Flow builder UI foundation.
-8. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
-9. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+1. Reliable ingestion envelope and tenant-scoped idempotency-key foundation.
+2. Batch and backfill ingestion API foundation.
+3. Flow validation and dry-run API.
+4. Dashboard frontend skeleton.
+5. Connector and broker management UI.
+6. Flow builder UI foundation.
+7. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
+8. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
 
 ## Future
 

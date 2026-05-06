@@ -779,6 +779,102 @@ fn row_to_flow(row: Row) -> StorageResult<Flow> {
     Ok(flow)
 }
 
+fn dlq_failure_stage_to_db(stage: &DlqFailureStage) -> &'static str {
+    match stage {
+        DlqFailureStage::Ingestion => "ingestion",
+        DlqFailureStage::Decoding => "decoding",
+        DlqFailureStage::Validation => "validation",
+        DlqFailureStage::Mapping => "mapping",
+        DlqFailureStage::RuleEvaluation => "rule_evaluation",
+        DlqFailureStage::FlowProcessing => "flow_processing",
+        DlqFailureStage::SinkDelivery => "sink_delivery",
+        DlqFailureStage::CommandCreation => "command_creation",
+        DlqFailureStage::Unknown => "unknown",
+    }
+}
+
+fn dlq_failure_stage_from_db(value: String) -> StorageResult<DlqFailureStage> {
+    match value.as_str() {
+        "ingestion" => Ok(DlqFailureStage::Ingestion),
+        "decoding" => Ok(DlqFailureStage::Decoding),
+        "validation" => Ok(DlqFailureStage::Validation),
+        "mapping" => Ok(DlqFailureStage::Mapping),
+        "rule_evaluation" => Ok(DlqFailureStage::RuleEvaluation),
+        "flow_processing" => Ok(DlqFailureStage::FlowProcessing),
+        "sink_delivery" => Ok(DlqFailureStage::SinkDelivery),
+        "command_creation" => Ok(DlqFailureStage::CommandCreation),
+        "unknown" => Ok(DlqFailureStage::Unknown),
+        other => Err(StorageError::Backend(format!(
+            "unknown dlq failure stage in database: {other}"
+        ))),
+    }
+}
+
+fn dlq_status_to_db(status: &DlqStatus) -> &'static str {
+    match status {
+        DlqStatus::Pending => "pending",
+        DlqStatus::Inspecting => "inspecting",
+        DlqStatus::Resolved => "resolved",
+        DlqStatus::Ignored => "ignored",
+        DlqStatus::ReplayRequested => "replay_requested",
+        DlqStatus::FailedReplay => "failed_replay",
+    }
+}
+
+fn dlq_status_from_db(value: String) -> StorageResult<DlqStatus> {
+    match value.as_str() {
+        "pending" => Ok(DlqStatus::Pending),
+        "inspecting" => Ok(DlqStatus::Inspecting),
+        "resolved" => Ok(DlqStatus::Resolved),
+        "ignored" => Ok(DlqStatus::Ignored),
+        "replay_requested" => Ok(DlqStatus::ReplayRequested),
+        "failed_replay" => Ok(DlqStatus::FailedReplay),
+        other => Err(StorageError::Backend(format!(
+            "unknown dlq status in database: {other}"
+        ))),
+    }
+}
+
+fn row_to_dlq_record(row: Row) -> StorageResult<DlqRecord> {
+    let payload = row
+        .get::<_, Option<Json<Value>>>("payload")
+        .map(|Json(value)| value);
+    let Json(metadata) = row.get::<_, Json<Value>>("metadata");
+    Ok(DlqRecord {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        dlq_key: row.get("dlq_key"),
+        source_system: row.get("source_system"),
+        source_id: row.get("source_id"),
+        connector_id: row.get("connector_id"),
+        flow_id: row.get("flow_id"),
+        raw_message_id: row.get("raw_message_id"),
+        event_id: row.get("event_id"),
+        command_id: row.get("command_id"),
+        idempotency_key: row.get("idempotency_key"),
+        external_flow_id: row.get("external_flow_id"),
+        external_flow_name: row.get("external_flow_name"),
+        external_flowfile_uuid: row.get("external_flowfile_uuid"),
+        external_process_group_id: row.get("external_process_group_id"),
+        external_processor_id: row.get("external_processor_id"),
+        external_provenance_uri: row.get("external_provenance_uri"),
+        sync_session_id: row.get("sync_session_id"),
+        payload_format: row.get("payload_format"),
+        payload,
+        payload_hash: row.get("payload_hash"),
+        failure_stage: dlq_failure_stage_from_db(row.get::<_, String>("failure_stage"))?,
+        failure_reason: row.get("failure_reason"),
+        failure_detail: row.get("failure_detail"),
+        retry_count: row.get::<_, i32>("retry_count") as u32,
+        replay_count: row.get::<_, i32>("replay_count") as u32,
+        status: dlq_status_from_db(row.get::<_, String>("status"))?,
+        metadata,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        resolved_at: row.get("resolved_at"),
+    })
+}
+
 fn row_to_raw_message(row: Row) -> StorageResult<RawMessage> {
     let Json(headers) = row.get::<_, Json<Value>>("headers");
     Ok(RawMessage {
@@ -2809,6 +2905,286 @@ impl FlowStore for PostgresStorage {
     }
 }
 
+impl DlqStore for PostgresStorage {
+    fn create_dlq_record(&self, record: DlqRecord) -> StorageResult<DlqRecord> {
+        self.with_client(|client| {
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO dlq_records (
+                        id,
+                        tenant_id,
+                        dlq_key,
+                        source_system,
+                        source_id,
+                        connector_id,
+                        flow_id,
+                        raw_message_id,
+                        event_id,
+                        command_id,
+                        idempotency_key,
+                        external_flow_id,
+                        external_flow_name,
+                        external_flowfile_uuid,
+                        external_process_group_id,
+                        external_processor_id,
+                        external_provenance_uri,
+                        sync_session_id,
+                        payload_format,
+                        payload,
+                        payload_hash,
+                        failure_stage,
+                        failure_reason,
+                        failure_detail,
+                        retry_count,
+                        replay_count,
+                        status,
+                        metadata,
+                        created_at,
+                        updated_at,
+                        resolved_at
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
+                    )
+                    RETURNING
+                        id, tenant_id, dlq_key, source_system, source_id, connector_id, flow_id,
+                        raw_message_id, event_id, command_id, idempotency_key, external_flow_id,
+                        external_flow_name, external_flowfile_uuid, external_process_group_id,
+                        external_processor_id, external_provenance_uri, sync_session_id,
+                        payload_format, payload, payload_hash, failure_stage, failure_reason,
+                        failure_detail, retry_count, replay_count, status, metadata, created_at,
+                        updated_at, resolved_at
+                    ",
+                    &[
+                        &record.id,
+                        &record.tenant_id,
+                        &record.dlq_key,
+                        &record.source_system,
+                        &record.source_id,
+                        &record.connector_id,
+                        &record.flow_id,
+                        &record.raw_message_id,
+                        &record.event_id,
+                        &record.command_id,
+                        &record.idempotency_key,
+                        &record.external_flow_id,
+                        &record.external_flow_name,
+                        &record.external_flowfile_uuid,
+                        &record.external_process_group_id,
+                        &record.external_processor_id,
+                        &record.external_provenance_uri,
+                        &record.sync_session_id,
+                        &record.payload_format,
+                        &json_option_column(record.payload.as_ref()),
+                        &record.payload_hash,
+                        &dlq_failure_stage_to_db(&record.failure_stage),
+                        &record.failure_reason,
+                        &record.failure_detail,
+                        &(record.retry_count as i32),
+                        &(record.replay_count as i32),
+                        &dlq_status_to_db(&record.status),
+                        &json_column(&record.metadata),
+                        &record.created_at,
+                        &record.updated_at,
+                        &record.resolved_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            row_to_dlq_record(row)
+        })
+    }
+
+    fn list_dlq_records(
+        &self,
+        tenant_id: Uuid,
+        filter: DlqRecordFilter,
+    ) -> StorageResult<Vec<DlqRecord>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT
+                        id, tenant_id, dlq_key, source_system, source_id, connector_id, flow_id,
+                        raw_message_id, event_id, command_id, idempotency_key, external_flow_id,
+                        external_flow_name, external_flowfile_uuid, external_process_group_id,
+                        external_processor_id, external_provenance_uri, sync_session_id,
+                        payload_format, payload, payload_hash, failure_stage, failure_reason,
+                        failure_detail, retry_count, replay_count, status, metadata, created_at,
+                        updated_at, resolved_at
+                    FROM dlq_records
+                    WHERE tenant_id = $1
+                        AND ($2::TEXT IS NULL OR status = $2)
+                        AND ($3::TEXT IS NULL OR failure_stage = $3)
+                        AND ($4::TEXT IS NULL OR source_system = $4)
+                        AND ($5::UUID IS NULL OR connector_id = $5)
+                        AND ($6::UUID IS NULL OR flow_id = $6)
+                        AND ($7::UUID IS NULL OR raw_message_id = $7)
+                        AND ($8::TEXT IS NULL OR idempotency_key = $8)
+                        AND ($9::TEXT IS NULL OR external_flowfile_uuid = $9)
+                        AND ($10::TEXT IS NULL OR sync_session_id = $10)
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT $11
+                    ",
+                    &[
+                        &tenant_id,
+                        &filter.status.as_ref().map(dlq_status_to_db),
+                        &filter.failure_stage.as_ref().map(dlq_failure_stage_to_db),
+                        &filter.source_system,
+                        &filter.connector_id,
+                        &filter.flow_id,
+                        &filter.raw_message_id,
+                        &filter.idempotency_key,
+                        &filter.external_flowfile_uuid,
+                        &filter.sync_session_id,
+                        &(filter.limit as i64),
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_dlq_record)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn list_all_dlq_records(&self, filter: DlqRecordFilter) -> StorageResult<Vec<DlqRecord>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT
+                        id, tenant_id, dlq_key, source_system, source_id, connector_id, flow_id,
+                        raw_message_id, event_id, command_id, idempotency_key, external_flow_id,
+                        external_flow_name, external_flowfile_uuid, external_process_group_id,
+                        external_processor_id, external_provenance_uri, sync_session_id,
+                        payload_format, payload, payload_hash, failure_stage, failure_reason,
+                        failure_detail, retry_count, replay_count, status, metadata, created_at,
+                        updated_at, resolved_at
+                    FROM dlq_records
+                    WHERE ($1::TEXT IS NULL OR status = $1)
+                        AND ($2::TEXT IS NULL OR failure_stage = $2)
+                        AND ($3::TEXT IS NULL OR source_system = $3)
+                        AND ($4::UUID IS NULL OR connector_id = $4)
+                        AND ($5::UUID IS NULL OR flow_id = $5)
+                        AND ($6::UUID IS NULL OR raw_message_id = $6)
+                        AND ($7::TEXT IS NULL OR idempotency_key = $7)
+                        AND ($8::TEXT IS NULL OR external_flowfile_uuid = $8)
+                        AND ($9::TEXT IS NULL OR sync_session_id = $9)
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT $10
+                    ",
+                    &[
+                        &filter.status.as_ref().map(dlq_status_to_db),
+                        &filter.failure_stage.as_ref().map(dlq_failure_stage_to_db),
+                        &filter.source_system,
+                        &filter.connector_id,
+                        &filter.flow_id,
+                        &filter.raw_message_id,
+                        &filter.idempotency_key,
+                        &filter.external_flowfile_uuid,
+                        &filter.sync_session_id,
+                        &(filter.limit as i64),
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_dlq_record)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn get_dlq_record(&self, tenant_id: Uuid, record_id: Uuid) -> StorageResult<Option<DlqRecord>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT
+                        id, tenant_id, dlq_key, source_system, source_id, connector_id, flow_id,
+                        raw_message_id, event_id, command_id, idempotency_key, external_flow_id,
+                        external_flow_name, external_flowfile_uuid, external_process_group_id,
+                        external_processor_id, external_provenance_uri, sync_session_id,
+                        payload_format, payload, payload_hash, failure_stage, failure_reason,
+                        failure_detail, retry_count, replay_count, status, metadata, created_at,
+                        updated_at, resolved_at
+                    FROM dlq_records
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &record_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_dlq_record).transpose()
+        })
+    }
+
+    fn get_dlq_record_any_tenant(&self, record_id: Uuid) -> StorageResult<Option<DlqRecord>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT
+                        id, tenant_id, dlq_key, source_system, source_id, connector_id, flow_id,
+                        raw_message_id, event_id, command_id, idempotency_key, external_flow_id,
+                        external_flow_name, external_flowfile_uuid, external_process_group_id,
+                        external_processor_id, external_provenance_uri, sync_session_id,
+                        payload_format, payload, payload_hash, failure_stage, failure_reason,
+                        failure_detail, retry_count, replay_count, status, metadata, created_at,
+                        updated_at, resolved_at
+                    FROM dlq_records
+                    WHERE id = $1
+                    ",
+                    &[&record_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_dlq_record).transpose()
+        })
+    }
+
+    fn update_dlq_record_status(
+        &self,
+        tenant_id: Uuid,
+        record_id: Uuid,
+        status: DlqStatus,
+        now: DateTime<Utc>,
+    ) -> StorageResult<DlqRecord> {
+        self.with_client(|client| {
+            let resolved_at = if matches!(status, DlqStatus::Resolved | DlqStatus::Ignored) {
+                Some(now)
+            } else {
+                None
+            };
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE dlq_records
+                    SET status = $3,
+                        updated_at = $4,
+                        resolved_at = $5
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING
+                        id, tenant_id, dlq_key, source_system, source_id, connector_id, flow_id,
+                        raw_message_id, event_id, command_id, idempotency_key, external_flow_id,
+                        external_flow_name, external_flowfile_uuid, external_process_group_id,
+                        external_processor_id, external_provenance_uri, sync_session_id,
+                        payload_format, payload, payload_hash, failure_stage, failure_reason,
+                        failure_detail, retry_count, replay_count, status, metadata, created_at,
+                        updated_at, resolved_at
+                    ",
+                    &[
+                        &tenant_id,
+                        &record_id,
+                        &dlq_status_to_db(&status),
+                        &now,
+                        &resolved_at,
+                    ],
+                )
+                .map_err(map_postgres_error)?
+                .ok_or(StorageError::NotFound)?;
+            row_to_dlq_record(row)
+        })
+    }
+}
+
 impl PayloadProfileStore for PostgresStorage {
     fn put_payload_profile(
         &self,
@@ -4302,6 +4678,7 @@ impl EdgeAdapterStore for PostgresStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_dlq::{DlqFailureStage, DlqRecord, DlqStatus};
     use chrono::TimeZone;
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
@@ -6226,6 +6603,130 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .enabled
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_parity_dlq_records() {
+        let Some(pg) = postgres_test_storage() else {
+            return;
+        };
+        let in_memory = InMemoryStorage::new();
+        let suffix = unique_suffix();
+        let tenant = build_tenant(&suffix);
+
+        for store in [&in_memory as &dyn TenantStore, &pg as &dyn TenantStore] {
+            store.create_tenant(tenant.clone()).expect("create tenant");
+        }
+
+        let created_at = Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap();
+        let first = DlqRecord::new(
+            tenant.id,
+            Some(format!("{suffix}-decode")),
+            Some("minifi".to_string()),
+            Some("edge-01".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(format!("tenant:{}:1", tenant.id)),
+            Some("flow-edge-sync".to_string()),
+            Some("Edge Sync".to_string()),
+            Some(format!("{suffix}-flowfile-1")),
+            Some("pg-01".to_string()),
+            Some("proc-01".to_string()),
+            Some("nifi://provenance/1".to_string()),
+            Some(format!("{suffix}-sync-1")),
+            Some("senml-json".to_string()),
+            Some(json!([{"n": "temperature", "v": 21.4}])),
+            Some("sha256:abc".to_string()),
+            DlqFailureStage::Decoding,
+            "decoder rejected payload",
+            Some("missing unit".to_string()),
+            2,
+            1,
+            DlqStatus::Pending,
+            Some(json!({"suite": "postgres"})),
+            created_at,
+        )
+        .expect("valid dlq record");
+        let second = DlqRecord::new(
+            tenant.id,
+            Some(format!("{suffix}-validation")),
+            Some("nifi".to_string()),
+            Some("cloud-01".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(format!("tenant:{}:2", tenant.id)),
+            Some("cloud-route".to_string()),
+            Some("Cloud Route".to_string()),
+            Some(format!("{suffix}-flowfile-2")),
+            None,
+            None,
+            None,
+            Some(format!("{suffix}-sync-2")),
+            Some("canonical-json".to_string()),
+            Some(json!({"payload": true})),
+            Some("sha256:def".to_string()),
+            DlqFailureStage::Validation,
+            "schema mismatch",
+            None,
+            0,
+            0,
+            DlqStatus::Inspecting,
+            Some(json!({"suite": "postgres"})),
+            created_at + chrono::Duration::seconds(1),
+        )
+        .expect("valid dlq record");
+
+        for store in [&in_memory as &dyn DlqStore, &pg as &dyn DlqStore] {
+            assert_eq!(store.create_dlq_record(first.clone()).unwrap(), first);
+            assert_eq!(store.create_dlq_record(second.clone()).unwrap(), second);
+            assert_eq!(
+                store.get_dlq_record(tenant.id, first.id).unwrap().unwrap(),
+                first
+            );
+            assert_eq!(
+                store
+                    .list_dlq_records(
+                        tenant.id,
+                        DlqRecordFilter {
+                            status: Some(DlqStatus::Pending),
+                            failure_stage: Some(DlqFailureStage::Decoding),
+                            source_system: Some("minifi".to_string()),
+                            idempotency_key: Some(format!("tenant:{}:1", tenant.id)),
+                            external_flowfile_uuid: Some(format!("{suffix}-flowfile-1")),
+                            sync_session_id: Some(format!("{suffix}-sync-1")),
+                            limit: 10,
+                            ..DlqRecordFilter::default()
+                        },
+                    )
+                    .unwrap(),
+                vec![first.clone()]
+            );
+
+            let updated = store
+                .update_dlq_record_status(
+                    tenant.id,
+                    first.id,
+                    DlqStatus::Resolved,
+                    created_at + chrono::Duration::seconds(10),
+                )
+                .unwrap();
+            assert_eq!(updated.status, DlqStatus::Resolved);
+            assert!(updated.resolved_at.is_some());
+            assert_eq!(
+                store
+                    .get_dlq_record(tenant.id, first.id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                DlqStatus::Resolved
             );
         }
     }

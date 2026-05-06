@@ -2,6 +2,7 @@ use aion_action::{
     Action, ActionResult, Capability, Command, CommandLease, CommandLeaseStatus, CommandStatus,
     EdgeAdapter, EdgeAdapterStatusReport, ExecutorAgent, ExecutorCapability, ExecutorScope, Policy,
 };
+use aion_dlq::{DlqFailureStage, DlqRecord, DlqStatus};
 use aion_entity::Entity;
 use aion_event::{Event, EventSeverity};
 use aion_flow::Flow;
@@ -49,6 +50,8 @@ pub const MIGRATION_0012_CREATE_API_TOKENS: &str =
     include_str!("../../../migrations/0012_create_api_tokens.sql");
 pub const MIGRATION_0013_CREATE_FLOWS: &str =
     include_str!("../../../migrations/0013_create_flows.sql");
+pub const MIGRATION_0014_CREATE_DLQ_RECORDS: &str =
+    include_str!("../../../migrations/0014_create_dlq_records.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -94,6 +97,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
         MIGRATION_0012_CREATE_API_TOKENS,
     ),
     ("0013_create_flows.sql", MIGRATION_0013_CREATE_FLOWS),
+    (
+        "0014_create_dlq_records.sql",
+        MIGRATION_0014_CREATE_DLQ_RECORDS,
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -944,6 +951,39 @@ pub trait FlowStore {
     fn delete_flow(&self, tenant_id: Uuid, flow_id: Uuid) -> StorageResult<()>;
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DlqRecordFilter {
+    pub status: Option<DlqStatus>,
+    pub failure_stage: Option<DlqFailureStage>,
+    pub source_system: Option<String>,
+    pub connector_id: Option<Uuid>,
+    pub flow_id: Option<Uuid>,
+    pub raw_message_id: Option<Uuid>,
+    pub idempotency_key: Option<String>,
+    pub external_flowfile_uuid: Option<String>,
+    pub sync_session_id: Option<String>,
+    pub limit: u32,
+}
+
+pub trait DlqStore {
+    fn create_dlq_record(&self, record: DlqRecord) -> StorageResult<DlqRecord>;
+    fn list_dlq_records(
+        &self,
+        tenant_id: Uuid,
+        filter: DlqRecordFilter,
+    ) -> StorageResult<Vec<DlqRecord>>;
+    fn list_all_dlq_records(&self, filter: DlqRecordFilter) -> StorageResult<Vec<DlqRecord>>;
+    fn get_dlq_record(&self, tenant_id: Uuid, record_id: Uuid) -> StorageResult<Option<DlqRecord>>;
+    fn get_dlq_record_any_tenant(&self, record_id: Uuid) -> StorageResult<Option<DlqRecord>>;
+    fn update_dlq_record_status(
+        &self,
+        tenant_id: Uuid,
+        record_id: Uuid,
+        status: DlqStatus,
+        now: DateTime<Utc>,
+    ) -> StorageResult<DlqRecord>;
+}
+
 pub trait ControlPlaneStore:
     TenantStore
     + EntityStore
@@ -962,6 +1002,7 @@ pub trait ControlPlaneStore:
     + ActionResultStore
     + RuleStore
     + FlowStore
+    + DlqStore
     + ExecutorStore
 {
 }
@@ -984,6 +1025,7 @@ impl<T> ControlPlaneStore for T where
         + ActionResultStore
         + RuleStore
         + FlowStore
+        + DlqStore
         + ExecutorStore
 {
 }
@@ -1045,6 +1087,7 @@ struct InMemoryState {
     ingestion_connector_key_index: HashMap<(Uuid, String), Uuid>,
     flows: HashMap<Uuid, Flow>,
     flow_key_index: HashMap<(Uuid, String), Uuid>,
+    dlq_records: HashMap<Uuid, DlqRecord>,
     connector_secrets: HashMap<Uuid, ConnectorSecret>,
     connector_secret_key_index: HashMap<(Uuid, String), Uuid>,
     api_tokens: HashMap<Uuid, ApiToken>,
@@ -2818,15 +2861,144 @@ impl FlowStore for InMemoryStorage {
     }
 }
 
+impl DlqStore for InMemoryStorage {
+    fn create_dlq_record(&self, record: DlqRecord) -> StorageResult<DlqRecord> {
+        let mut state = self.write_state()?;
+        if state.dlq_records.contains_key(&record.id) {
+            return Err(StorageError::Conflict);
+        }
+
+        state.dlq_records.insert(record.id, record.clone());
+        Ok(record)
+    }
+
+    fn list_dlq_records(
+        &self,
+        tenant_id: Uuid,
+        filter: DlqRecordFilter,
+    ) -> StorageResult<Vec<DlqRecord>> {
+        let mut records = self
+            .read_state()?
+            .dlq_records
+            .values()
+            .filter(|record| record.tenant_id == tenant_id)
+            .filter(|record| dlq_record_matches_filter(record, &filter))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        sort_and_truncate_dlq_records(&mut records, filter.limit);
+        Ok(records)
+    }
+
+    fn list_all_dlq_records(&self, filter: DlqRecordFilter) -> StorageResult<Vec<DlqRecord>> {
+        let mut records = self
+            .read_state()?
+            .dlq_records
+            .values()
+            .filter(|record| dlq_record_matches_filter(record, &filter))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        sort_and_truncate_dlq_records(&mut records, filter.limit);
+        Ok(records)
+    }
+
+    fn get_dlq_record(&self, tenant_id: Uuid, record_id: Uuid) -> StorageResult<Option<DlqRecord>> {
+        Ok(self
+            .read_state()?
+            .dlq_records
+            .get(&record_id)
+            .filter(|record| record.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn get_dlq_record_any_tenant(&self, record_id: Uuid) -> StorageResult<Option<DlqRecord>> {
+        Ok(self.read_state()?.dlq_records.get(&record_id).cloned())
+    }
+
+    fn update_dlq_record_status(
+        &self,
+        tenant_id: Uuid,
+        record_id: Uuid,
+        status: DlqStatus,
+        now: DateTime<Utc>,
+    ) -> StorageResult<DlqRecord> {
+        let mut state = self.write_state()?;
+        let record = state
+            .dlq_records
+            .get_mut(&record_id)
+            .filter(|record| record.tenant_id == tenant_id)
+            .ok_or(StorageError::NotFound)?;
+        record.set_status(status, now);
+        Ok(record.clone())
+    }
+}
+
+fn dlq_record_matches_filter(record: &DlqRecord, filter: &DlqRecordFilter) -> bool {
+    filter
+        .status
+        .as_ref()
+        .map(|status| &record.status == status)
+        .unwrap_or(true)
+        && filter
+            .failure_stage
+            .as_ref()
+            .map(|stage| &record.failure_stage == stage)
+            .unwrap_or(true)
+        && filter
+            .source_system
+            .as_deref()
+            .map(|value| record.source_system.as_deref() == Some(value))
+            .unwrap_or(true)
+        && filter
+            .connector_id
+            .map(|value| record.connector_id == Some(value))
+            .unwrap_or(true)
+        && filter
+            .flow_id
+            .map(|value| record.flow_id == Some(value))
+            .unwrap_or(true)
+        && filter
+            .raw_message_id
+            .map(|value| record.raw_message_id == Some(value))
+            .unwrap_or(true)
+        && filter
+            .idempotency_key
+            .as_deref()
+            .map(|value| record.idempotency_key.as_deref() == Some(value))
+            .unwrap_or(true)
+        && filter
+            .external_flowfile_uuid
+            .as_deref()
+            .map(|value| record.external_flowfile_uuid.as_deref() == Some(value))
+            .unwrap_or(true)
+        && filter
+            .sync_session_id
+            .as_deref()
+            .map(|value| record.sync_session_id.as_deref() == Some(value))
+            .unwrap_or(true)
+}
+
+fn sort_and_truncate_dlq_records(records: &mut Vec<DlqRecord>, limit: u32) {
+    records.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    records.truncate(limit as usize);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aion_dlq::{DlqFailureStage, DlqRecord, DlqStatus};
     use aion_flow::{Flow, FlowEdge, FlowNode, FlowNodeType};
     use chrono::TimeZone;
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 13);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 14);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
@@ -2849,6 +3021,7 @@ mod tests {
         assert_eq!(ORDERED_MIGRATIONS[10].0, "0011_create_edge_adapters.sql");
         assert_eq!(ORDERED_MIGRATIONS[11].0, "0012_create_api_tokens.sql");
         assert_eq!(ORDERED_MIGRATIONS[12].0, "0013_create_flows.sql");
+        assert_eq!(ORDERED_MIGRATIONS[13].0, "0014_create_dlq_records.sql");
     }
 
     #[test]
@@ -2883,6 +3056,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS connector_secrets",
             "CREATE TABLE IF NOT EXISTS api_tokens",
             "CREATE TABLE IF NOT EXISTS ttn_device_mappings",
+            "CREATE TABLE IF NOT EXISTS dlq_records",
         ] {
             assert!(
                 combined.contains(table),
@@ -3670,6 +3844,124 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_storage_creates_filters_and_updates_dlq_records() {
+        use serde_json::json;
+
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let other_tenant_id = Uuid::new_v4();
+        let raw_message_id = Uuid::new_v4();
+        let connector_id = Uuid::new_v4();
+        let now = Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap();
+
+        let record = DlqRecord::new(
+            tenant_id,
+            Some("decode-01".to_string()),
+            Some("minifi".to_string()),
+            Some("edge-01".to_string()),
+            Some(connector_id),
+            None,
+            Some(raw_message_id),
+            None,
+            None,
+            Some("tenant-a:key-01".to_string()),
+            Some("flow-01".to_string()),
+            Some("Edge Sync".to_string()),
+            Some("flowfile-01".to_string()),
+            Some("pg-01".to_string()),
+            Some("proc-01".to_string()),
+            Some("nifi://provenance/1".to_string()),
+            Some("sync-01".to_string()),
+            Some("senml-json".to_string()),
+            Some(json!({"raw": true})),
+            Some("sha256:abc".to_string()),
+            DlqFailureStage::Decoding,
+            "decoder rejected payload",
+            Some("invalid measurement".to_string()),
+            2,
+            1,
+            DlqStatus::Pending,
+            Some(json!({"external.source_system": "minifi"})),
+            now,
+        )
+        .unwrap();
+        let other_record = DlqRecord::new(
+            other_tenant_id,
+            Some("validation-01".to_string()),
+            Some("nifi".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("flowfile-02".to_string()),
+            None,
+            None,
+            None,
+            None,
+            Some("canonical-json".to_string()),
+            Some(json!({"payload": 1})),
+            None,
+            DlqFailureStage::Validation,
+            "schema mismatch",
+            None,
+            0,
+            0,
+            DlqStatus::Inspecting,
+            None,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        let record = storage.create_dlq_record(record).unwrap();
+        storage.create_dlq_record(other_record).unwrap();
+
+        assert_eq!(
+            storage
+                .get_dlq_record(tenant_id, record.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            record.id
+        );
+        assert_eq!(
+            storage
+                .list_dlq_records(
+                    tenant_id,
+                    DlqRecordFilter {
+                        status: Some(DlqStatus::Pending),
+                        failure_stage: Some(DlqFailureStage::Decoding),
+                        source_system: Some("minifi".to_string()),
+                        connector_id: Some(connector_id),
+                        raw_message_id: Some(raw_message_id),
+                        idempotency_key: Some("tenant-a:key-01".to_string()),
+                        external_flowfile_uuid: Some("flowfile-01".to_string()),
+                        sync_session_id: Some("sync-01".to_string()),
+                        limit: 10,
+                        ..DlqRecordFilter::default()
+                    }
+                )
+                .unwrap(),
+            vec![record.clone()]
+        );
+
+        let updated = storage
+            .update_dlq_record_status(
+                tenant_id,
+                record.id,
+                DlqStatus::Resolved,
+                now + chrono::Duration::seconds(5),
+            )
+            .unwrap();
+        assert_eq!(updated.status, DlqStatus::Resolved);
+        assert!(updated.resolved_at.is_some());
+    }
+
+    #[test]
     fn ingestion_connector_migration_defines_required_indexes() {
         let migration = MIGRATION_0007_CREATE_INGESTION_CONNECTORS;
         for index in [
@@ -3712,6 +4004,37 @@ mod tests {
             "idx_flows_tenant_created_at",
             "idx_flows_flow_key",
             "idx_flows_enabled",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing migration item: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn dlq_migration_defines_required_columns_and_indexes() {
+        let migration = MIGRATION_0014_CREATE_DLQ_RECORDS;
+        for required in [
+            "CREATE TABLE IF NOT EXISTS dlq_records",
+            "dlq_key TEXT",
+            "source_system TEXT",
+            "external_flowfile_uuid TEXT",
+            "external_provenance_uri TEXT",
+            "payload JSONB",
+            "payload_hash TEXT",
+            "failure_stage TEXT NOT NULL CHECK",
+            "failure_reason TEXT NOT NULL",
+            "retry_count INTEGER NOT NULL DEFAULT 0",
+            "replay_count INTEGER NOT NULL DEFAULT 0",
+            "status TEXT NOT NULL CHECK",
+            "metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "idx_dlq_records_status",
+            "idx_dlq_records_failure_stage",
+            "idx_dlq_records_source_system",
+            "idx_dlq_records_idempotency_key",
+            "idx_dlq_records_external_flowfile_uuid",
+            "idx_dlq_records_sync_session_id",
         ] {
             assert!(
                 migration.contains(required),
