@@ -24,19 +24,20 @@ An external NiFi or MiNiFi flow should:
 
 1. preserve the original payload content
 2. generate a tenant-scoped `idempotency_key` when possible
-3. preserve external runtime identifiers such as `flowfile_uuid`
+3. preserve external runtime identifiers such as `external_flowfile_uuid`
 4. send timing fields that distinguish observation, buffering, and send time
-5. forward payloads to normal AionCore ingestion endpoints without requiring special runtime support
+5. forward payloads to `POST /ingest/reliable` when replay-safe deduplication is desired
 
 ## Suggested Ingestion Targets
 
 Depending on deployment shape, NiFi or MiNiFi can target:
 
 - `POST /ingest/http`
+- `POST /ingest/reliable`
 - `POST /ingestion/connectors/{connector_id}/ingest`
 - a broker path that AionCore MQTT ingestion already consumes
 
-The preferred path for provenance-rich reliable ingestion is usually connector-aware HTTP ingestion because connector identity and upstream metadata can be preserved together.
+The preferred current path for provenance-rich reliable ingestion is `POST /ingest/reliable`.
 
 ## Recommended Envelope
 
@@ -72,7 +73,7 @@ More complete reliable-ingestion example:
   "external_flow_name": "Cloud Route 01",
   "external_process_group_id": "pg-cloud-ingest",
   "external_processor_id": "proc-route-http",
-  "flowfile_uuid": "8fc2778d-66d3-4f0a-89b2-e497cb7e7387",
+  "external_flowfile_uuid": "8fc2778d-66d3-4f0a-89b2-e497cb7e7387",
   "idempotency_key": "tenant-a:well-03:2026-05-06T12:00:00Z:seq-1884",
   "source_id": "edge-site-03",
   "edge_sequence": 1884,
@@ -152,10 +153,11 @@ This makes future backfill and replay features easier to explain and audit.
 
 ## Current Limitations
 
-- AionCore does not yet interpret the envelope automatically.
-- AionCore does not yet implement idempotency-key enforcement.
+- AionCore now supports the generic reliable envelope at `POST /ingest/reliable`.
+- AionCore now enforces tenant-scoped idempotency-key deduplication for reliable HTTP ingestion when `idempotency_key` is present.
 - AionCore now provides explicit DLQ record APIs, but it does not route records into DLQ automatically and does not execute replay.
 - AionCore does not yet implement backfill session APIs.
 - AionCore does not yet distinguish late data in rule execution behavior.
+- Connector-aware reliable ingestion is not implemented yet.
 
 Use this guide as a contract for future-compatible producer design rather than a runtime feature checklist.

@@ -2,6 +2,12 @@
 
 This guide covers the Milestone 84 DLQ model and API foundation.
 
+Milestone 85 note:
+
+- `POST /ingest/reliable` now preserves upstream provenance and idempotency metadata in raw messages and failure events
+- future DLQ routing can reuse that preserved metadata
+- reliable-ingestion failures still do not create `DlqRecord` automatically in this milestone
+
 ## Scope
 
 - `POST /dlq/records`

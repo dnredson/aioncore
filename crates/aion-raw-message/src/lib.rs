@@ -38,6 +38,8 @@ impl std::error::Error for RawMessageError {}
 pub struct RawMessage {
     pub id: Uuid,
     pub tenant_id: Uuid,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     pub source_type: RawMessageSource,
     pub source_ref: Option<String>,
     pub device_key: Option<String>,
@@ -76,6 +78,7 @@ impl RawMessage {
         Ok(Self {
             id: Uuid::new_v4(),
             tenant_id,
+            idempotency_key: None,
             source_type,
             source_ref,
             device_key,

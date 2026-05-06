@@ -17,7 +17,7 @@ Milestone 60 adds selected tenant-aware write authorization on top of the Milest
   - `/ingestion/connectors` create/update/enable/disable plus `/ingestion/workers/reconcile` and `/ingestion/connectors/{connector_id}/ttn-live-validate` require `connectors:admin`
   - `/ingestion/connectors` selected reads, TTN device-mapping reads, plus `/ingestion/workers/plan` and `/ingestion/workers/status` require `connectors:read`
   - `/ingestion/connectors/{connector_id}/ttn-device-mappings` create/update/enable/disable/delete requires `connectors:admin`
-  - `/ingestion/connectors/{connector_id}/ingest` and `/ingest/http` require `ingestion:write`
+  - `/ingestion/connectors/{connector_id}/ingest`, `/ingest/http`, and `/ingest/reliable` require `ingestion:write`
   - `/integrations/smartsentinel/executors/*` register, poll, claim, and report require SmartSentinel executor scopes
   - `/integrations/smartsentinel/snapshots` requires `smartsentinel:ingest`
   - `/mcp`, `/mcp/tools`, and `/mcp/tools/{tool_name}` require `mcp:tools`
@@ -373,7 +373,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 
 - `entities:write` covers selected generic entity creation.
 - `relationships:write` covers selected generic relationship creation.
-- `ingestion:write` protects both generic `/ingest/http` and connector-aware machine writes at `/ingestion/connectors/{connector_id}/ingest`.
+- `ingestion:write` protects generic `/ingest/http`, `/ingest/reliable`, and connector-aware machine writes at `/ingestion/connectors/{connector_id}/ingest`.
 - `connectors:read` covers selected connector and worker operational reads without granting mutation.
 - `connectors:admin` covers connector lifecycle mutation, TTN device-mapping administration, worker reconciliation, TTN live validation preflight, validation-related operator actions, enable/disable, and configuration updates.
 - `dashboard:read` covers read-only dashboard aggregation routes that summarize entities, time-series discovery, connectors, brokers, and worker health.
@@ -537,10 +537,11 @@ The table below describes the intended future protection model. It does not chan
 | `/flows*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `flows:read` for GET, `flows:write` for create, update, enable, disable, and delete | Implemented in Milestone 82 as storage and API foundation only. No visual editor or runtime execution exists yet. |
 | `/raw-messages` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `raw-messages:read` | Implemented in Milestone 55 for list and detail reads. Sensitive because raw payloads and headers may include operational metadata. |
 | `/ingest/http` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Primary generic ingestion write surface. |
+| `/ingest/reliable` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Reliable generic ingestion write surface with tenant-scoped idempotency behavior and preserved upstream provenance metadata. |
 | `/ingestion/connectors` POST, PATCH, enable, disable, and `/ingestion/workers/reconcile` | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 51 for selected connector administration and worker reconciliation only. |
 | `/ingestion/connectors` selected GET routes, TTN device-mapping GET/list routes, and `/ingestion/workers/plan`, `/ingestion/workers/status` | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:read` | Implemented across Milestones 51 and 52 for selected connector and worker operational reads plus TTN mapping inspection. |
 | `/ingestion/connectors/{connector_id}/ttn-device-mappings` POST, PATCH, enable, disable, and DELETE | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 52 for TTN device-mapping administration. |
-| `/ingestion/connectors/{connector_id}/ingest` and `/ingest/http` | `ConnectorPrincipal`, `DevicePrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `ingestion:write` | Implemented across Milestones 51 and 52. |
+| `/ingestion/connectors/{connector_id}/ingest`, `/ingest/http`, and `/ingest/reliable` | `ConnectorPrincipal`, `DevicePrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `ingestion:write` | Reliable generic HTTP ingestion is now implemented in Milestone 85; connector-aware reliable ingestion remains future work. |
 | `/secrets/connectors/*` | `UserPrincipal`, `AdminPrincipal` | `secrets:admin` | Implemented in Milestone 50. Highest sensitivity operator surface. |
 | `/commands/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:create` for creation, `commands:approve` for approve/reject, `commands:write` for selected lifecycle writes, `commands:claim` for generic claim, `commands:lease` for selected lease writes | Selected generic write authorization now applies in Milestone 60. Executor-specific flows still use executor scopes. |
 | `/actions/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `actions:read` for GET, `actions:write` for selected POST routes | Selected generic write authorization now applies in Milestone 60. |
@@ -605,6 +606,7 @@ The table below describes the intended future protection model. It does not chan
   - `connector_workers`
   - `connector_aware_ingestion`
   - `generic_http_ingestion`
+  - `reliable_ingestion`
   - `ttn_device_mappings`
   - `ttn_live_validation`
   - `smartsentinel_snapshot_ingestion`

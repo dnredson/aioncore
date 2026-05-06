@@ -1,16 +1,17 @@
 use crate::{
-    auth::{require_scope, AuthContext},
+    auth::{principal_tenant_or_default, require_scope, AuthContext},
     connector_event_metadata, decoded_ingest_metadata, decoder_for_format, ensure_entity_exists,
     error::ApiError,
     evaluate_rules_for_observation, get_connector, is_ttn_uplink_payload_format, merge_json_object,
     metadata_with_connector, payload_format_requires_mapping, payload_to_bytes,
-    record_ingest_event, record_ingest_event_optional, record_ttn_device_mapping_event, AppState,
+    record_ingest_event, record_ingest_event_optional, record_ttn_device_mapping_event,
+    state_for_tenant, AppState,
 };
 use aion_event::EventSeverity;
 use aion_observation::Observation;
-use aion_payload::{DecodeInput, PayloadFormat};
+use aion_payload::{DecodeInput, PayloadFormat, ReliableIngestionEnvelope};
 use aion_raw_message::{RawMessage, RawMessageSource};
-use aion_storage::{ConnectorProfile, IngestionConnector, TtnDeviceMapping};
+use aion_storage::{ConnectorProfile, IngestionConnector, StorageError, TtnDeviceMapping};
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
@@ -26,6 +27,7 @@ use uuid::Uuid;
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/ingest/http", post(ingest_http))
+        .route("/ingest/reliable", post(ingest_reliable))
         .route(
             "/ingestion/connectors/:connector_id/ingest",
             post(ingest_http_for_connector),
@@ -60,6 +62,44 @@ pub(crate) struct ConnectorHttpIngestRequest {
 pub(crate) struct HttpIngestResponse {
     pub raw_message_id: Uuid,
     pub observations: Vec<Observation>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReliableHttpIngestRequest {
+    pub producer_entity_id: Uuid,
+    pub feature_of_interest_id: Uuid,
+    pub protocol: Option<String>,
+    pub content_type: Option<String>,
+    pub mapping: Option<Value>,
+    #[serde(flatten)]
+    pub envelope: ReliableIngestionEnvelope,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ReliableIngestResponse {
+    pub raw_message_id: Uuid,
+    pub duplicate: bool,
+    pub idempotency_key: Option<String>,
+    pub observations_created: usize,
+    pub event_id: Option<Uuid>,
+    pub payload_format: String,
+    pub source_system: Option<String>,
+    pub sync_session_id: Option<String>,
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct ReliableIngestionContext {
+    source_ref: String,
+    envelope: ReliableIngestionEnvelope,
+}
+
+#[derive(Debug)]
+struct IngestOutcome {
+    raw_message: RawMessage,
+    observations: Vec<Observation>,
+    event_id: Option<Uuid>,
+    duplicate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -197,7 +237,15 @@ async fn ingest_http_for_connector(
         mapping: request.mapping,
     };
 
-    ingest_http_resolved(&state, request, Some(connector), resolved_ttn_mapping).await
+    let outcome =
+        ingest_http_resolved(&state, request, Some(connector), resolved_ttn_mapping, None).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(HttpIngestResponse {
+            raw_message_id: outcome.raw_message.id,
+            observations: outcome.observations,
+        }),
+    ))
 }
 
 async fn ingest_http(
@@ -206,7 +254,95 @@ async fn ingest_http(
     Json(request): Json<HttpIngestRequest>,
 ) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
     require_scope(&state, &auth, "/ingest/http", "ingestion:write")?;
-    ingest_http_resolved(&state, request, None, None).await
+    let outcome = ingest_http_resolved(&state, request, None, None, None).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(HttpIngestResponse {
+            raw_message_id: outcome.raw_message.id,
+            observations: outcome.observations,
+        }),
+    ))
+}
+
+async fn ingest_reliable(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<ReliableHttpIngestRequest>,
+) -> Result<(StatusCode, Json<ReliableIngestResponse>), ApiError> {
+    require_scope(&state, &auth, "/ingest/reliable", "ingestion:write")?;
+    let tenant_id = principal_tenant_or_default(&state, &auth)?;
+    let scoped_state = state_for_tenant(&state, tenant_id);
+    let payload_format = request
+        .envelope
+        .payload_format
+        .clone()
+        .or_else(|| infer_payload_format(&request.envelope.payload))
+        .ok_or_else(|| ApiError::bad_request("payload_format is required or must be inferable"))?;
+    let source_system = request.envelope.source_system.clone();
+    let sync_session_id = request.envelope.sync_session_id.clone();
+    let idempotency_key = request.envelope.idempotency_key.clone();
+
+    if let Some(idempotency_key) = idempotency_key.as_deref() {
+        if let Some(existing) = scoped_state
+            .storage
+            .find_raw_message_by_idempotency_key(tenant_id, idempotency_key)?
+        {
+            return Ok((
+                StatusCode::OK,
+                Json(ReliableIngestResponse {
+                    raw_message_id: existing.id,
+                    duplicate: true,
+                    idempotency_key: Some(idempotency_key.to_string()),
+                    observations_created: 0,
+                    event_id: None,
+                    payload_format,
+                    source_system,
+                    sync_session_id,
+                    received_at: existing.received_at,
+                }),
+            ));
+        }
+    }
+
+    let outcome = ingest_http_resolved(
+        &scoped_state,
+        HttpIngestRequest {
+            producer_entity_id: request.producer_entity_id,
+            feature_of_interest_id: request.feature_of_interest_id,
+            payload_format: payload_format.clone(),
+            protocol: request.protocol.unwrap_or_else(|| "http".to_string()),
+            content_type: request.content_type,
+            observed_at: request.envelope.observed_at,
+            payload: request.envelope.payload.clone(),
+            mapping: request.mapping,
+        },
+        None,
+        None,
+        Some(ReliableIngestionContext {
+            source_ref: "/ingest/reliable".to_string(),
+            envelope: request.envelope,
+        }),
+    )
+    .await?;
+
+    Ok((
+        if outcome.duplicate {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        Json(ReliableIngestResponse {
+            raw_message_id: outcome.raw_message.id,
+            duplicate: outcome.duplicate,
+            idempotency_key,
+            observations_created: outcome.observations.len(),
+            event_id: outcome.event_id,
+            payload_format,
+            source_system,
+            sync_session_id,
+            received_at: outcome.raw_message.received_at,
+        }),
+    ))
 }
 
 async fn ingest_http_resolved(
@@ -214,7 +350,8 @@ async fn ingest_http_resolved(
     request: HttpIngestRequest,
     connector: Option<IngestionConnector>,
     resolved_ttn_mapping: Option<ResolvedTtnDeviceMapping>,
-) -> Result<(StatusCode, Json<HttpIngestResponse>), ApiError> {
+    reliable: Option<ReliableIngestionContext>,
+) -> Result<IngestOutcome, ApiError> {
     ensure_entity_exists(state, request.producer_entity_id)?;
     ensure_entity_exists(state, request.feature_of_interest_id)?;
 
@@ -235,9 +372,14 @@ async fn ingest_http_resolved(
         "none"
     };
     let connector_metadata = connector.as_ref().map(connector_event_metadata);
-    let source_ref = connector
+    let source_ref = reliable
         .as_ref()
-        .and_then(|connector| connector.http_path.clone())
+        .map(|reliable| reliable.source_ref.clone())
+        .or_else(|| {
+            connector
+                .as_ref()
+                .and_then(|connector| connector.http_path.clone())
+        })
         .unwrap_or_else(|| "/ingest/http".to_string());
     let mut headers = json!({
         "protocol": request.protocol,
@@ -266,6 +408,11 @@ async fn ingest_http_resolved(
             metadata["connector_profile"].clone(),
         );
     }
+    let reliable_metadata = reliable
+        .as_ref()
+        .map(|reliable| reliable_metadata(&reliable.envelope))
+        .unwrap_or_else(|| json!({}));
+    merge_json_object(&mut headers, reliable_metadata.clone());
 
     let mut raw_message = RawMessage::new(
         state.tenant_id,
@@ -282,8 +429,34 @@ async fn ingest_http_resolved(
         received_at,
     )
     .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    raw_message.idempotency_key = reliable
+        .as_ref()
+        .and_then(|reliable| reliable.envelope.idempotency_key.clone());
 
-    raw_message = state.storage.store_raw_message(raw_message)?;
+    raw_message = match state.storage.store_raw_message(raw_message) {
+        Ok(raw_message) => raw_message,
+        Err(StorageError::Conflict) => {
+            let Some(idempotency_key) = reliable
+                .as_ref()
+                .and_then(|reliable| reliable.envelope.idempotency_key.as_deref())
+            else {
+                return Err(StorageError::Conflict.into());
+            };
+            let Some(existing) = state
+                .storage
+                .find_raw_message_by_idempotency_key(state.tenant_id, idempotency_key)?
+            else {
+                return Err(StorageError::Conflict.into());
+            };
+            return Ok(IngestOutcome {
+                raw_message: existing,
+                observations: Vec::new(),
+                event_id: None,
+                duplicate: true,
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     let decoder_config = request
         .mapping
@@ -314,10 +487,13 @@ async fn ingest_http_resolved(
             raw_message.id,
             Some(message.clone()),
             metadata_with_connector(
-                json!({
-                    "payload_format": request.payload_format,
-                    "reason": "missing_mapping"
-                }),
+                merge_metadata(
+                    json!({
+                        "payload_format": request.payload_format,
+                        "reason": "missing_mapping"
+                    }),
+                    reliable_metadata.clone(),
+                ),
                 connector_metadata.clone(),
             ),
         )?;
@@ -339,10 +515,13 @@ async fn ingest_http_resolved(
                 raw_message.id,
                 Some(err.message.clone()),
                 metadata_with_connector(
-                    json!({
-                        "payload_format": request.payload_format,
-                        "reason": "unsupported_payload_format"
-                    }),
+                    merge_metadata(
+                        json!({
+                            "payload_format": request.payload_format,
+                            "reason": "unsupported_payload_format"
+                        }),
+                        reliable_metadata.clone(),
+                    ),
                     connector_metadata.clone(),
                 ),
             )?;
@@ -376,10 +555,13 @@ async fn ingest_http_resolved(
                 raw_message.id,
                 Some(err.message().to_string()),
                 metadata_with_connector(
-                    json!({
-                        "payload_format": request.payload_format,
-                        "reason": "decoder_error"
-                    }),
+                    merge_metadata(
+                        json!({
+                            "payload_format": request.payload_format,
+                            "reason": "decoder_error"
+                        }),
+                        reliable_metadata.clone(),
+                    ),
                     connector_metadata.clone(),
                 ),
             )?;
@@ -416,9 +598,11 @@ async fn ingest_http_resolved(
         .mark_raw_message_normalized(state.tenant_id, raw_message.id)?;
     let mut payload_event_metadata = json!({
         "payload_format": request.payload_format,
-        "observation_count": observations.len()
+        "observation_count": observations.len(),
+        "duplicate": false
     });
     merge_json_object(&mut payload_event_metadata, ingest_metadata);
+    merge_json_object(&mut payload_event_metadata, reliable_metadata);
     if let Some(mapping) = resolved_ttn_mapping {
         merge_json_object(
             &mut payload_event_metadata,
@@ -430,7 +614,7 @@ async fn ingest_http_resolved(
             }),
         );
     }
-    record_ingest_event(
+    let event = record_ingest_event(
         state,
         "aion:PayloadIngested",
         EventSeverity::Info,
@@ -440,14 +624,12 @@ async fn ingest_http_resolved(
         Some("Payload ingested and normalized".to_string()),
         metadata_with_connector(payload_event_metadata, connector_metadata),
     )?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(HttpIngestResponse {
-            raw_message_id: raw_message.id,
-            observations,
-        }),
-    ))
+    Ok(IngestOutcome {
+        raw_message,
+        observations,
+        event_id: Some(event.id),
+        duplicate: false,
+    })
 }
 
 fn extract_ttn_uplink_ids(payload: &Value) -> Result<TtnUplinkIds, ApiError> {
@@ -485,6 +667,141 @@ fn payload_as_json_value(payload: &Value) -> Result<Value, ApiError> {
     } else {
         Ok(payload.clone())
     }
+}
+
+fn merge_metadata(mut base: Value, extra: Value) -> Value {
+    merge_json_object(&mut base, extra);
+    base
+}
+
+fn reliable_metadata(envelope: &ReliableIngestionEnvelope) -> Value {
+    let mut metadata = json!({});
+    if let Some(object) = metadata.as_object_mut() {
+        insert_optional_value(
+            object,
+            "external.source_system",
+            envelope.source_system.clone(),
+        );
+        insert_optional_value(object, "external.source_id", envelope.source_id.clone());
+        insert_optional_value(
+            object,
+            "external.idempotency_key",
+            envelope.idempotency_key.clone(),
+        );
+        insert_optional_value(
+            object,
+            "external.flow_id",
+            envelope.external_flow_id.clone(),
+        );
+        insert_optional_value(
+            object,
+            "external.flow_name",
+            envelope.external_flow_name.clone(),
+        );
+        insert_optional_value(
+            object,
+            "external.flowfile_uuid",
+            envelope.external_flowfile_uuid.clone(),
+        );
+        insert_optional_value(
+            object,
+            "external.process_group_id",
+            envelope.external_process_group_id.clone(),
+        );
+        insert_optional_value(
+            object,
+            "external.processor_id",
+            envelope.external_processor_id.clone(),
+        );
+        insert_optional_value(
+            object,
+            "external.provenance_uri",
+            envelope.external_provenance_uri.clone(),
+        );
+        insert_optional_value(
+            object,
+            "external.sync_session_id",
+            envelope.sync_session_id.clone(),
+        );
+        insert_optional_value(
+            object,
+            "external.connectivity_state",
+            envelope.connectivity_state.clone(),
+        );
+        insert_optional_value(
+            object,
+            "external.payload_hash",
+            envelope.payload_hash.clone(),
+        );
+        if let Some(edge_sequence) = envelope.edge_sequence {
+            object.insert("external.edge_sequence".to_string(), json!(edge_sequence));
+        }
+        if let Some(observed_at) = envelope.observed_at {
+            object.insert("external.observed_at".to_string(), json!(observed_at));
+        }
+        if let Some(stored_at_edge) = envelope.stored_at_edge {
+            object.insert("external.stored_at_edge".to_string(), json!(stored_at_edge));
+        }
+        if let Some(sent_at) = envelope.sent_at {
+            object.insert("external.sent_at".to_string(), json!(sent_at));
+        }
+        if let Some(replay_count) = envelope.replay_count {
+            object.insert("external.replay_count".to_string(), json!(replay_count));
+        }
+        if let Some(retry_count) = envelope.retry_count {
+            object.insert("external.retry_count".to_string(), json!(retry_count));
+        }
+        if let Some(metadata_value) = envelope.metadata.clone() {
+            object.insert("external.metadata".to_string(), metadata_value);
+        }
+    }
+    metadata
+}
+
+fn insert_optional_value(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
+fn infer_payload_format(payload: &Value) -> Option<String> {
+    if let Some(payload) = payload.as_object() {
+        if payload.contains_key("end_device_ids") && payload.contains_key("uplink_message") {
+            return Some("ttn-uplink-json".to_string());
+        }
+        if payload.contains_key("observations")
+            || (payload.contains_key("observed_property") && payload.contains_key("value"))
+        {
+            return Some("canonical-json".to_string());
+        }
+    }
+
+    let Some(entries) = payload.as_array() else {
+        return payload
+            .as_str()
+            .filter(|value| value.contains('|'))
+            .map(|_| "ultralight".to_string());
+    };
+
+    entries
+        .iter()
+        .all(|entry| {
+            entry
+                .as_object()
+                .map(|entry| {
+                    entry.contains_key("n")
+                        && (entry.contains_key("v")
+                            || entry.contains_key("vs")
+                            || entry.contains_key("vb")
+                            || entry.contains_key("vd"))
+                })
+                .unwrap_or(false)
+        })
+        .then(|| "senml-json".to_string())
 }
 
 fn resolve_ttn_device_mapping(

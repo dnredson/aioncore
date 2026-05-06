@@ -20,11 +20,20 @@ Current HTTP endpoint:
 
 ```text
 POST /ingest/http
+POST /ingest/reliable
 ```
 
 HTTP ingestion accepts a producer entity, a feature of interest, a payload format, and the payload itself. The current runtime stores the raw message, selects the decoder, produces canonical observations, and then updates raw-message status.
 
 The legacy endpoint remains available and does not require a registered connector. This is the default ingestion mode for simple local deployments.
+
+Reliable HTTP ingestion is additive:
+
+- `POST /ingest/reliable` accepts the reliable envelope contract documented in [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md)
+- it preserves upstream provenance in `RawMessage.headers` and `Event.metadata`
+- it applies tenant-scoped idempotency-key lookup when `idempotency_key` is present
+- it returns `duplicate = true` with the existing `raw_message_id` instead of creating duplicate raw messages or observations
+- it does not change existing `POST /ingest/http` behavior
 
 HTTP payload formats supported by the local runtime:
 
@@ -45,6 +54,18 @@ Receive request
   -> write canonical observations
   -> update raw message status
   -> emit ingestion events
+```
+
+Reliable HTTP flow adds:
+
+```text
+Receive reliable envelope
+  -> resolve tenant-scoped idempotency key when present
+  -> if duplicate: return existing raw_message_id with duplicate=true
+  -> otherwise store raw message first
+  -> decode payload
+  -> write canonical observations
+  -> preserve external.* provenance metadata on raw message and event records
 ```
 
 ## Ingestion Connector Registry
@@ -590,7 +611,11 @@ TTN connector validation in this milestone is deliberately limited to local conf
 
 ## Limitations
 
-- NiFi and MiNiFi integration is documentation-only in this milestone; current ingestion handlers do not interpret a dedicated reliable-ingestion envelope automatically.
+- `POST /ingest/reliable` now implements the documented reliable-envelope and tenant-scoped idempotency foundation for generic HTTP ingestion.
+- Connector-aware reliable ingestion is not implemented yet.
+- Batch and backfill ingestion APIs are not implemented yet.
+- Replay execution is not implemented yet.
+- Automatic DLQ routing is not implemented yet.
 - Connector registry persistence is available for in-memory and PostgreSQL storage.
 - Dynamic MQTT workers are implemented for `generic-aion-mqtt`, `generic-mqtt`, and `ttn-v3` connector profiles and must be explicitly enabled.
 - TTN/The Things Stack live validation is limited to an explicit MQTT connection/subscription preflight. It does not validate account semantics beyond broker authentication/subscription behavior and does not ingest messages.

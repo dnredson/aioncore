@@ -2317,6 +2317,7 @@ mod tests {
                 "connector_workers",
                 "connector_aware_ingestion",
                 "generic_http_ingestion",
+                "reliable_ingestion",
                 "ttn_device_mappings",
                 "ttn_live_validation",
                 "smartsentinel_snapshot_ingestion",
@@ -3226,6 +3227,425 @@ mod tests {
                     &storage,
                     ApiTokenPrincipalType::Service,
                     Some("generic-ingest-writer"),
+                    &["ingestion:write"],
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn reliable_ingest_creates_raw_message_and_observations_with_provenance_metadata() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&app, "reliable-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "reliable-plot-01", "aion:Plot").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingest/reliable",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "protocol": "http",
+                    "payload_format": "senml-json",
+                    "source_system": "minifi",
+                    "source_id": "edge-01",
+                    "idempotency_key": "tenant-a:reliable-01",
+                    "external_flow_id": "flow-edge-sync",
+                    "external_flow_name": "Edge Sync",
+                    "external_flowfile_uuid": "flowfile-01",
+                    "external_process_group_id": "pg-01",
+                    "external_processor_id": "proc-01",
+                    "external_provenance_uri": "nifi://provenance/events/1",
+                    "sync_session_id": "sync-01",
+                    "edge_sequence": 41,
+                    "observed_at": "2026-05-06T12:00:00Z",
+                    "stored_at_edge": "2026-05-06T12:00:05Z",
+                    "sent_at": "2026-05-06T12:10:11Z",
+                    "replay_count": 1,
+                    "retry_count": 2,
+                    "connectivity_state": "replayed_after_outage",
+                    "payload_hash": "sha256:test",
+                    "metadata": {"route": "edge-http->cloud-sync->aioncore"},
+                    "payload": [
+                        {"n": "soil_moisture", "u": "%", "v": 18.5}
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_json(response).await;
+        assert_eq!(body["duplicate"], false);
+        assert_eq!(body["observations_created"], 1);
+        assert_eq!(body["payload_format"], "senml-json");
+        assert_eq!(body["source_system"], "minifi");
+        assert_eq!(body["sync_session_id"], "sync-01");
+        assert!(body["event_id"].as_str().is_some());
+
+        let raw_message_id = body["raw_message_id"].as_str().unwrap().parse().unwrap();
+        let raw_message =
+            aion_storage::RawMessageStore::get_raw_message(&*storage, Uuid::nil(), raw_message_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            raw_message.idempotency_key.as_deref(),
+            Some("tenant-a:reliable-01")
+        );
+        assert_eq!(raw_message.headers["external.source_system"], "minifi");
+        assert_eq!(raw_message.headers["external.flow_id"], "flow-edge-sync");
+        assert_eq!(raw_message.headers["external.flow_name"], "Edge Sync");
+        assert_eq!(raw_message.headers["external.flowfile_uuid"], "flowfile-01");
+        assert_eq!(raw_message.headers["external.process_group_id"], "pg-01");
+        assert_eq!(raw_message.headers["external.processor_id"], "proc-01");
+        assert_eq!(
+            raw_message.headers["external.provenance_uri"],
+            "nifi://provenance/events/1"
+        );
+        assert_eq!(
+            raw_message.headers["external.idempotency_key"],
+            "tenant-a:reliable-01"
+        );
+        assert_eq!(raw_message.headers["external.sync_session_id"], "sync-01");
+        assert_eq!(raw_message.headers["external.edge_sequence"], 41);
+        assert_eq!(
+            raw_message.headers["external.connectivity_state"],
+            "replayed_after_outage"
+        );
+
+        let events =
+            query_events_by_raw_message(&app, body["raw_message_id"].as_str().unwrap()).await;
+        let event = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "aion:PayloadIngested")
+            .unwrap();
+        assert_eq!(
+            event["metadata"]["external.idempotency_key"],
+            "tenant-a:reliable-01"
+        );
+        assert_eq!(event["metadata"]["external.source_system"], "minifi");
+        assert_eq!(event["metadata"]["external.sync_session_id"], "sync-01");
+        assert_eq!(event["metadata"]["duplicate"], false);
+    }
+
+    #[tokio::test]
+    async fn reliable_ingest_deduplicates_by_tenant_scoped_idempotency_key() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+        let sensor_id = create_test_entity(&app, "reliable-dedupe-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "reliable-dedupe-plot-01", "aion:Plot").await;
+        let body = json!({
+            "producer_entity_id": sensor_id,
+            "feature_of_interest_id": plot_id,
+            "protocol": "http",
+            "payload_format": "canonical-json",
+            "idempotency_key": "tenant-a:dedupe-01",
+            "source_system": "smartsentinel",
+            "sync_session_id": "sync-dedupe-01",
+            "payload": {
+                "observations": [{
+                    "observed_property": "aion:SoilMoisture",
+                    "value": {"type": "number", "value": 19.4},
+                    "unit": "%"
+                }]
+            }
+        });
+
+        let first = to_json(
+            app.clone()
+                .oneshot(json_request("POST", "/ingest/reliable", body.clone()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let second_response = app
+            .clone()
+            .oneshot(json_request("POST", "/ingest/reliable", body))
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second = to_json(second_response).await;
+
+        assert_eq!(first["duplicate"], false);
+        assert_eq!(second["duplicate"], true);
+        assert_eq!(second["observations_created"], 0);
+        assert_eq!(first["raw_message_id"], second["raw_message_id"]);
+
+        let observations = get_json(
+            &app,
+            &format!("/observations?feature_of_interest_id={plot_id}"),
+        )
+        .await;
+        assert_eq!(observations.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reliable_ingest_same_idempotency_key_different_tenants_does_not_collide() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let app = token_mode_app_with_storage(storage.clone());
+        let sensor_a =
+            create_test_entity(&tenant_a_app, "reliable-tenant-a-sensor", "aion:Sensor").await;
+        let plot_a = create_test_entity(&tenant_a_app, "reliable-tenant-a-plot", "aion:Plot").await;
+        let sensor_b =
+            create_test_entity(&tenant_b_app, "reliable-tenant-b-sensor", "aion:Sensor").await;
+        let plot_b = create_test_entity(&tenant_b_app, "reliable-tenant-b-plot", "aion:Plot").await;
+        let token_a = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-reliable"),
+            &["ingestion:write"],
+        );
+        let token_b = store_api_token_for_tenant(
+            &storage,
+            tenant_b,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-b-reliable"),
+            &["ingestion:write"],
+        );
+        let idempotency_key = "shared-key-01";
+
+        let created_a = to_json(
+            app.clone()
+                .oneshot(auth_json_request(
+                    "POST",
+                    "/ingest/reliable",
+                    json!({
+                        "producer_entity_id": sensor_a,
+                        "feature_of_interest_id": plot_a,
+                        "payload_format": "canonical-json",
+                        "idempotency_key": idempotency_key,
+                        "payload": {
+                            "observations": [{
+                                "observed_property": "aion:SoilMoisture",
+                                "value": {"type": "number", "value": 20.0}
+                            }]
+                        }
+                    }),
+                    &token_a,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let created_b = to_json(
+            app.clone()
+                .oneshot(auth_json_request(
+                    "POST",
+                    "/ingest/reliable",
+                    json!({
+                        "producer_entity_id": sensor_b,
+                        "feature_of_interest_id": plot_b,
+                        "payload_format": "canonical-json",
+                        "idempotency_key": idempotency_key,
+                        "payload": {
+                            "observations": [{
+                                "observed_property": "aion:SoilMoisture",
+                                "value": {"type": "number", "value": 30.0}
+                            }]
+                        }
+                    }),
+                    &token_b,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(created_a["duplicate"], false);
+        assert_eq!(created_b["duplicate"], false);
+        assert_ne!(created_a["raw_message_id"], created_b["raw_message_id"]);
+        assert_eq!(
+            aion_storage::ObservationStore::query_observations(
+                &*storage,
+                tenant_a,
+                Some(plot_a.parse().unwrap()),
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            aion_storage::ObservationStore::query_observations(
+                &*storage,
+                tenant_b,
+                Some(plot_b.parse().unwrap()),
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_ingest_without_idempotency_key_does_not_deduplicate() {
+        let app = app();
+        let sensor_id = create_test_entity(&app, "reliable-no-key-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "reliable-no-key-plot-01", "aion:Plot").await;
+        let body = json!({
+            "producer_entity_id": sensor_id,
+            "feature_of_interest_id": plot_id,
+            "payload_format": "canonical-json",
+            "payload": {
+                "observations": [{
+                    "observed_property": "aion:SoilTemperature",
+                    "value": {"type": "number", "value": 24.3},
+                    "unit": "Cel"
+                }]
+            }
+        });
+
+        let first = to_json(
+            app.clone()
+                .oneshot(json_request("POST", "/ingest/reliable", body.clone()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let second = to_json(
+            app.clone()
+                .oneshot(json_request("POST", "/ingest/reliable", body))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert_ne!(first["raw_message_id"], second["raw_message_id"]);
+        let observations = get_json(
+            &app,
+            &format!("/observations?feature_of_interest_id={plot_id}"),
+        )
+        .await;
+        assert_eq!(observations.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reliable_ingest_failure_event_preserves_idempotency_and_provenance_metadata() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage.clone());
+        let sensor_id = create_test_entity(&app, "reliable-fail-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&app, "reliable-fail-plot-01", "aion:Plot").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/ingest/reliable",
+                json!({
+                    "producer_entity_id": sensor_id,
+                    "feature_of_interest_id": plot_id,
+                    "payload_format": "senml-json",
+                    "source_system": "minifi",
+                    "idempotency_key": "tenant-a:fail-01",
+                    "sync_session_id": "sync-fail-01",
+                    "external_provenance_uri": "nifi://provenance/events/99",
+                    "payload": "not json"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let raw_message = aion_storage::RawMessageStore::list_raw_messages(&*storage, Uuid::nil())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let events = query_events_by_raw_message(&app, &raw_message.id.to_string()).await;
+        let failed = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "aion:PayloadIngestionFailed")
+            .unwrap();
+        assert_eq!(
+            failed["metadata"]["external.idempotency_key"],
+            "tenant-a:fail-01"
+        );
+        assert_eq!(failed["metadata"]["external.source_system"], "minifi");
+        assert_eq!(
+            failed["metadata"]["external.sync_session_id"],
+            "sync-fail-01"
+        );
+        assert_eq!(
+            failed["metadata"]["external.provenance_uri"],
+            "nifi://provenance/events/99"
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_ingest_auth_respects_token_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let sensor_id =
+            create_test_entity(&dev_app, "reliable-auth-sensor-01", "aion:Sensor").await;
+        let plot_id = create_test_entity(&dev_app, "reliable-auth-plot-01", "aion:Plot").await;
+        let body = json!({
+            "producer_entity_id": sensor_id,
+            "feature_of_interest_id": plot_id,
+            "payload_format": "canonical-json",
+            "idempotency_key": "tenant-a:auth-01",
+            "payload": {
+                "observations": [{
+                    "observed_property": "aion:SoilMoisture",
+                    "value": {"type": "number", "value": 11.2}
+                }]
+            }
+        });
+
+        let missing_token = token_app
+            .clone()
+            .oneshot(json_request("POST", "/ingest/reliable", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_scope = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/ingest/reliable",
+                body.clone(),
+                &store_api_token(
+                    &storage,
+                    ApiTokenPrincipalType::Service,
+                    Some("reliable-ingest-reader"),
+                    &["connectors:read"],
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+        let allowed = token_app
+            .oneshot(auth_json_request(
+                "POST",
+                "/ingest/reliable",
+                body,
+                &store_api_token(
+                    &storage,
+                    ApiTokenPrincipalType::Service,
+                    Some("reliable-ingest-writer"),
                     &["ingestion:write"],
                 ),
             ))

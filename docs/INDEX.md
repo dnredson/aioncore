@@ -26,6 +26,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [Time-Series Usage](TIMESERIES_USAGE.md)
 - [Dashboard Usage](DASHBOARD_USAGE.md)
 - [DLQ Usage](DLQ_USAGE.md)
+- [Reliable Ingestion Usage](RELIABLE_INGESTION_USAGE.md)
 - [Flow Usage](FLOW_USAGE.md)
 - [TTN Usage](TTN_USAGE.md)
 - [SmartSentinel Usage](SMARTSENTINEL_USAGE.md)

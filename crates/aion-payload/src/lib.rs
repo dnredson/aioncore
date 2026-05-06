@@ -17,6 +17,31 @@ pub enum PayloadFormat {
     Unknown(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReliableIngestionEnvelope {
+    pub source_system: Option<String>,
+    pub source_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub external_flow_id: Option<String>,
+    pub external_flow_name: Option<String>,
+    pub external_flowfile_uuid: Option<String>,
+    pub external_process_group_id: Option<String>,
+    pub external_processor_id: Option<String>,
+    pub external_provenance_uri: Option<String>,
+    pub sync_session_id: Option<String>,
+    pub edge_sequence: Option<u64>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub stored_at_edge: Option<DateTime<Utc>>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub replay_count: Option<u32>,
+    pub retry_count: Option<u32>,
+    pub connectivity_state: Option<String>,
+    pub payload_format: Option<String>,
+    pub payload: Value,
+    pub payload_hash: Option<String>,
+    pub metadata: Option<Value>,
+}
+
 impl fmt::Display for PayloadFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

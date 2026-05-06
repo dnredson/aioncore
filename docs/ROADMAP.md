@@ -46,17 +46,17 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 82 flow and pipeline model foundation: `aion-api` now adds a first-class `Flow` graph model plus `POST /flows`, `GET /flows`, `GET /flows/{flow_id}`, `PATCH /flows/{flow_id}`, `PUT /flows/{flow_id}/enable`, `PUT /flows/{flow_id}/disable`, and `DELETE /flows/{flow_id}`; in-memory and PostgreSQL persistence; `flows:read` and `flows:write` token-mode protection; tenant-aware list and detail filtering; lifecycle audit events; and optional dashboard overview flow counts, while intentionally deferring any visual editor, execution engine, runtime forwarding, or ingestion behavior changes.
 - Milestone 83 NiFi/MiNiFi integration contract and provenance model: AionCore now documents an explicit optional boundary for NiFi and MiNiFi as external reliable flow runtimes; recommended deployment patterns; a reliable-ingestion envelope convention; shared `external.*` provenance metadata keys for RawMessage, Event, Observation, Flow, and future DLQ/backfill work; and the security and roadmap implications, while intentionally deferring runtime ingestion changes, DLQ runtime, idempotency enforcement, and batch/backfill execution.
 - Milestone 84 DLQ model and API foundation: AionCore now adds a first-class tenant-scoped `DlqRecord` model; in-memory and PostgreSQL persistence; `POST /dlq/records`, `GET /dlq/records`, `GET /dlq/records/{record_id}`, and `PATCH /dlq/records/{record_id}/status`; `dlq:read` and `dlq:write` token-mode protection; tenant-aware filtering and cross-tenant denial behavior; lifecycle audit events; and dashboard overview DLQ counts, while intentionally deferring automatic routing, replay execution, and batch/backfill runtime behavior.
+- Milestone 85 reliable ingestion envelope and tenant-scoped idempotency-key foundation: AionCore now adds a typed `ReliableIngestionEnvelope`; `POST /ingest/reliable`; tenant-scoped raw-message idempotency lookup and PostgreSQL uniqueness for present keys; replay-safe duplicate responses; token-mode `ingestion:write` protection for reliable ingestion; preserved `external.*` provenance metadata in `RawMessage.headers` and `Event.metadata`; and explicit documentation for NiFi/MiNiFi, SmartSentinel, and future replay/backfill alignment, while intentionally deferring batch/backfill APIs, replay execution, automatic DLQ routing, connector-aware reliable ingestion, and flow execution.
 
 ## Next
 
-1. Reliable ingestion envelope and tenant-scoped idempotency-key foundation.
-2. Batch and backfill ingestion API foundation.
-3. Flow validation and dry-run API.
-4. Dashboard frontend skeleton.
-5. Connector and broker management UI.
-6. Flow builder UI foundation.
-7. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
-8. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+1. Batch and backfill ingestion API foundation.
+2. Flow validation and dry-run API.
+3. Dashboard frontend skeleton.
+4. Connector and broker management UI.
+5. Flow builder UI foundation.
+6. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
+7. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
 
 ## Future
 

@@ -52,6 +52,8 @@ pub const MIGRATION_0013_CREATE_FLOWS: &str =
     include_str!("../../../migrations/0013_create_flows.sql");
 pub const MIGRATION_0014_CREATE_DLQ_RECORDS: &str =
     include_str!("../../../migrations/0014_create_dlq_records.sql");
+pub const MIGRATION_0015_ADD_RAW_MESSAGE_IDEMPOTENCY: &str =
+    include_str!("../../../migrations/0015_add_raw_message_idempotency.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -100,6 +102,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0014_create_dlq_records.sql",
         MIGRATION_0014_CREATE_DLQ_RECORDS,
+    ),
+    (
+        "0015_add_raw_message_idempotency.sql",
+        MIGRATION_0015_ADD_RAW_MESSAGE_IDEMPOTENCY,
     ),
 ];
 
@@ -607,6 +613,11 @@ pub trait RelationshipStore {
 
 pub trait RawMessageStore {
     fn store_raw_message(&self, raw_message: RawMessage) -> StorageResult<RawMessage>;
+    fn find_raw_message_by_idempotency_key(
+        &self,
+        tenant_id: Uuid,
+        idempotency_key: &str,
+    ) -> StorageResult<Option<RawMessage>>;
     fn get_raw_message(
         &self,
         tenant_id: Uuid,
@@ -1081,6 +1092,7 @@ struct InMemoryState {
     entity_key_index: HashMap<(Uuid, String), Uuid>,
     relationships: HashMap<Uuid, Relationship>,
     raw_messages: HashMap<Uuid, RawMessage>,
+    raw_message_idempotency_index: HashMap<(Uuid, String), Uuid>,
     observations: HashMap<Uuid, Observation>,
     payload_profiles: HashMap<(Uuid, Uuid), PayloadProfile>,
     ingestion_connectors: HashMap<Uuid, IngestionConnector>,
@@ -1299,11 +1311,36 @@ impl RawMessageStore for InMemoryStorage {
         if state.raw_messages.contains_key(&raw_message.id) {
             return Err(StorageError::Conflict);
         }
+        if let Some(idempotency_key) = raw_message.idempotency_key.as_ref() {
+            let index_key = (raw_message.tenant_id, idempotency_key.clone());
+            if state.raw_message_idempotency_index.contains_key(&index_key) {
+                return Err(StorageError::Conflict);
+            }
+            state
+                .raw_message_idempotency_index
+                .insert(index_key, raw_message.id);
+        }
 
         state
             .raw_messages
             .insert(raw_message.id, raw_message.clone());
         Ok(raw_message)
+    }
+
+    fn find_raw_message_by_idempotency_key(
+        &self,
+        tenant_id: Uuid,
+        idempotency_key: &str,
+    ) -> StorageResult<Option<RawMessage>> {
+        let state = self.read_state()?;
+        let Some(raw_message_id) = state
+            .raw_message_idempotency_index
+            .get(&(tenant_id, idempotency_key.to_string()))
+        else {
+            return Ok(None);
+        };
+
+        Ok(state.raw_messages.get(raw_message_id).cloned())
     }
 
     fn get_raw_message(
@@ -2998,7 +3035,7 @@ mod tests {
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 14);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 15);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
@@ -3022,6 +3059,10 @@ mod tests {
         assert_eq!(ORDERED_MIGRATIONS[11].0, "0012_create_api_tokens.sql");
         assert_eq!(ORDERED_MIGRATIONS[12].0, "0013_create_flows.sql");
         assert_eq!(ORDERED_MIGRATIONS[13].0, "0014_create_dlq_records.sql");
+        assert_eq!(
+            ORDERED_MIGRATIONS[14].0,
+            "0015_add_raw_message_idempotency.sql"
+        );
     }
 
     #[test]
@@ -3663,6 +3704,83 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_storage_indexes_raw_messages_by_tenant_scoped_idempotency_key() {
+        use aion_raw_message::RawMessageSource;
+        use chrono::TimeZone;
+        use serde_json::json;
+
+        let storage = InMemoryStorage::new();
+        let tenant_id = Uuid::new_v4();
+        let other_tenant_id = Uuid::new_v4();
+        let received_at = Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap();
+
+        let mut first = RawMessage::new(
+            tenant_id,
+            RawMessageSource::Http,
+            Some("/ingest/reliable".to_string()),
+            Some("sensor-01".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/json".to_string()),
+            None,
+            None,
+            Some("senml-json".to_string()),
+            json!({}),
+            br#"[{"n":"temperature","v":21.4}]"#.to_vec(),
+            received_at,
+        )
+        .unwrap();
+        first.idempotency_key = Some("tenant-a:key-01".to_string());
+
+        let mut same_tenant_duplicate = RawMessage::new(
+            tenant_id,
+            RawMessageSource::Http,
+            Some("/ingest/reliable".to_string()),
+            Some("sensor-01".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/json".to_string()),
+            None,
+            None,
+            Some("senml-json".to_string()),
+            json!({}),
+            br#"[{"n":"temperature","v":21.5}]"#.to_vec(),
+            received_at,
+        )
+        .unwrap();
+        same_tenant_duplicate.idempotency_key = Some("tenant-a:key-01".to_string());
+
+        let mut other_tenant_same_key = RawMessage::new(
+            other_tenant_id,
+            RawMessageSource::Http,
+            Some("/ingest/reliable".to_string()),
+            Some("sensor-02".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/json".to_string()),
+            None,
+            None,
+            Some("senml-json".to_string()),
+            json!({}),
+            br#"[{"n":"temperature","v":22.4}]"#.to_vec(),
+            received_at,
+        )
+        .unwrap();
+        other_tenant_same_key.idempotency_key = Some("tenant-a:key-01".to_string());
+
+        storage.store_raw_message(first.clone()).unwrap();
+        assert_eq!(
+            storage
+                .find_raw_message_by_idempotency_key(tenant_id, "tenant-a:key-01")
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        assert!(matches!(
+            storage.store_raw_message(same_tenant_duplicate),
+            Err(StorageError::Conflict)
+        ));
+        storage.store_raw_message(other_tenant_same_key).unwrap();
+    }
+
+    #[test]
     fn in_memory_storage_links_command_action_and_result() {
         use chrono::TimeZone;
         use serde_json::json;
@@ -4035,6 +4153,23 @@ mod tests {
             "idx_dlq_records_idempotency_key",
             "idx_dlq_records_external_flowfile_uuid",
             "idx_dlq_records_sync_session_id",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing migration item: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_message_idempotency_migration_defines_required_columns_and_indexes() {
+        let migration = MIGRATION_0015_ADD_RAW_MESSAGE_IDEMPOTENCY;
+        for required in [
+            "ALTER TABLE raw_messages",
+            "ADD COLUMN IF NOT EXISTS idempotency_key TEXT",
+            "raw_messages_idempotency_lookup_idx",
+            "raw_messages_tenant_idempotency_unique_idx",
+            "WHERE idempotency_key IS NOT NULL",
         ] {
             assert!(
                 migration.contains(required),

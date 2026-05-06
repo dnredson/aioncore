@@ -34,6 +34,8 @@ This milestone does not add:
 - batch or backfill ingestion
 - idempotency enforcement
 
+Milestone 85 now adds reliable-ingestion runtime idempotency handling for `POST /ingest/reliable`, but it still does not add automatic routing from ingestion failures into `DlqRecord`.
+
 ## Core Type
 
 `DlqRecord`
@@ -127,6 +129,8 @@ The DLQ model includes typed fields for the provenance contract documented in Mi
 - `payload_hash`
 
 These fields are preserved as evidence and correlation material. They are not treated as trusted proof by themselves.
+
+Reliable ingestion failures now preserve the same upstream provenance and idempotency context in `RawMessage.headers` and `Event.metadata` so a later routing milestone can create `DlqRecord` instances without losing upstream evidence.
 
 ## Why Automatic Routing Is Deferred
 

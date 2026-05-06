@@ -880,6 +880,7 @@ fn row_to_raw_message(row: Row) -> StorageResult<RawMessage> {
     Ok(RawMessage {
         id: row.get("id"),
         tenant_id: row.get("tenant_id"),
+        idempotency_key: row.get("idempotency_key"),
         source_type: raw_message_source_from_db(row.get::<_, String>("source_type"))?,
         source_ref: row.get("source_ref"),
         device_key: row.get("device_key"),
@@ -1316,6 +1317,7 @@ impl RawMessageStore for PostgresStorage {
                     INSERT INTO raw_messages (
                         id,
                         tenant_id,
+                        idempotency_key,
                         source_type,
                         source_ref,
                         device_key,
@@ -1329,12 +1331,13 @@ impl RawMessageStore for PostgresStorage {
                         received_at,
                         normalization_status,
                         normalization_error
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                    RETURNING id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    RETURNING id, tenant_id, idempotency_key, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
                     ",
                     &[
                         &raw_message.id,
                         &raw_message.tenant_id,
+                        &raw_message.idempotency_key,
                         &raw_message_source_to_db(&raw_message.source_type),
                         &raw_message.source_ref,
                         &raw_message.device_key,
@@ -1350,8 +1353,37 @@ impl RawMessageStore for PostgresStorage {
                         &raw_message.normalization_error,
                     ],
                 )
-                .map_err(|err| if is_unique_violation(&err) { StorageError::Conflict } else { map_postgres_error(err) })?;
+                .map_err(|err| {
+                    if is_unique_violation(&err) {
+                        StorageError::Conflict
+                    } else {
+                        map_postgres_error(err)
+                    }
+                })?;
             row_to_raw_message(row)
+        })
+    }
+
+    fn find_raw_message_by_idempotency_key(
+        &self,
+        tenant_id: Uuid,
+        idempotency_key: &str,
+    ) -> StorageResult<Option<RawMessage>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, idempotency_key, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    FROM raw_messages
+                    WHERE tenant_id = $1 AND idempotency_key = $2
+                    ",
+                    &[&tenant_id, &idempotency_key],
+                )
+                .map_err(map_postgres_error)?;
+            match row {
+                Some(row) => row_to_raw_message(row).map(Some),
+                None => Ok(None),
+            }
         })
     }
 
@@ -1364,7 +1396,7 @@ impl RawMessageStore for PostgresStorage {
             let row = client
                 .query_opt(
                     "
-                    SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    SELECT id, tenant_id, idempotency_key, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
                     FROM raw_messages
                     WHERE tenant_id = $1 AND id = $2
                     ",
@@ -1386,7 +1418,7 @@ impl RawMessageStore for PostgresStorage {
             let row = client
                 .query_opt(
                     "
-                    SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    SELECT id, tenant_id, idempotency_key, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
                     FROM raw_messages
                     WHERE id = $1
                     ",
@@ -1405,7 +1437,7 @@ impl RawMessageStore for PostgresStorage {
             let rows = client
                 .query(
                     "
-                    SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    SELECT id, tenant_id, idempotency_key, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
                     FROM raw_messages
                     WHERE tenant_id = $1
                     ORDER BY received_at DESC
@@ -1424,7 +1456,7 @@ impl RawMessageStore for PostgresStorage {
             let rows = client
                 .query(
                     "
-                    SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                    SELECT id, tenant_id, idempotency_key, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
                     FROM raw_messages
                     ORDER BY received_at DESC
                     ",
@@ -1447,7 +1479,7 @@ impl RawMessageStore for PostgresStorage {
         self.with_client(|client| {
             let mut sql = String::from(
                 "
-                SELECT id, tenant_id, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
+                SELECT id, tenant_id, idempotency_key, source_type, source_ref, device_key, decoder_hint, content_type, producer_entity_id, feature_of_interest_id, payload_format, headers, payload, received_at, normalization_status, normalization_error
                 FROM raw_messages
                 WHERE tenant_id = $1
                 ",
@@ -5821,6 +5853,22 @@ mod tests {
             received_c,
         )
         .expect("raw c");
+        let mut raw_idempotent = RawMessage::new(
+            tenant.id,
+            aion_raw_message::RawMessageSource::Http,
+            Some("/ingest/reliable".to_string()),
+            Some("device-d".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/json".to_string()),
+            Some(producer_b.id),
+            Some(feature_b.id),
+            Some("senml-json".to_string()),
+            json!({"source": "d"}),
+            br#"[{"n":"temperature","v":23.1}]"#.to_vec(),
+            received_c + chrono::Duration::seconds(1),
+        )
+        .expect("raw idempotent");
+        raw_idempotent.idempotency_key = Some(format!("tenant:{}:key-01", tenant.id));
 
         for store in [
             &in_memory as &dyn RawMessageStore,
@@ -5830,12 +5878,34 @@ mod tests {
             assert_eq!(store.store_raw_message(raw_b.clone()).unwrap(), raw_b);
             assert_eq!(store.store_raw_message(raw_c.clone()).unwrap(), raw_c);
             assert_eq!(
+                store.store_raw_message(raw_idempotent.clone()).unwrap(),
+                raw_idempotent
+            );
+            assert_eq!(
                 store.get_raw_message(tenant.id, raw_b.id).unwrap().unwrap(),
                 raw_b
             );
+            assert_eq!(
+                store
+                    .find_raw_message_by_idempotency_key(
+                        tenant.id,
+                        raw_idempotent.idempotency_key.as_deref().unwrap()
+                    )
+                    .unwrap()
+                    .unwrap(),
+                raw_idempotent
+            );
 
             let listed = store.list_raw_messages(tenant.id).unwrap();
-            assert_eq!(listed, vec![raw_c.clone(), raw_b.clone(), raw_a.clone()]);
+            assert_eq!(
+                listed,
+                vec![
+                    raw_idempotent.clone(),
+                    raw_c.clone(),
+                    raw_b.clone(),
+                    raw_a.clone()
+                ]
+            );
 
             let by_producer = store
                 .query_raw_messages(tenant.id, Some(producer_a.id), None, None)
