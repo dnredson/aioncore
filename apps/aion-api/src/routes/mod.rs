@@ -1,6 +1,11 @@
 pub(crate) mod adapters;
+pub(crate) mod ai;
 pub(crate) mod auth;
 pub(crate) mod commands;
+pub(crate) mod events;
 pub(crate) mod executors;
 pub(crate) mod mcp;
+pub(crate) mod observations;
+pub(crate) mod provenance;
+pub(crate) mod raw_messages;
 pub(crate) mod smartsentinel;

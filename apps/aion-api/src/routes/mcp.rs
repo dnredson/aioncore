@@ -1,8 +1,8 @@
 use crate::{
+    ai_context::{build_ai_entity_context, AiContextQuery},
     auth::{require_scope, AuthContext},
-    build_ai_entity_context,
     error::ApiError,
-    AiContextQuery, AppState,
+    AppState,
 };
 use aion_action::CommandStatus;
 use aion_event::EventSeverity;

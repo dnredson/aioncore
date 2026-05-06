@@ -25,3 +25,12 @@
 *.pdb
 *.rlib
 *.exe
+
+# Rust build artifacts
+/target/
+/target_*/
+/target-*/
+/target_smoke/
+*.pdb
+*.rlib
+*.exe
