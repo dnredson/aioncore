@@ -38,10 +38,11 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 74 route modularization: `apps/aion-api/src/lib.rs` now extracts the entity-centered `/entities*` and `/relationships` HTTP surface into `src/routes/entities.rs`, preserving endpoint paths, auth semantics, tenant/resource ownership behavior, JSON-LD parsing, `entity_key` derivation, relationship behavior, capability behavior, payload-profile behavior, and JSON shapes before later historical query and dashboard-facing work.
 - Milestone 75 route modularization: `apps/aion-api/src/lib.rs` now extracts the HTTP ingestion surface into `src/routes/ingestion.rs`, preserving endpoint paths, auth semantics, tenant/resource ownership behavior, raw-message-first preservation, payload decoding, connector-aware defaults, TTN-over-HTTP mapping resolution, rule evaluation, and JSON shapes while intentionally leaving connector admin, TTN admin/operations, and worker management in `lib.rs` for later milestones.
 - Milestone 76 route modularization: `apps/aion-api/src/lib.rs` now extracts the ingestion connector administration surface into `src/routes/connectors.rs`, preserving endpoint paths, auth semantics, tenant/resource ownership behavior, connector create/list/get/update/enable/disable/status behavior, connector lifecycle events, and post-mutation worker reconciliation while intentionally leaving TTN mapping/validation/live operations and worker management in `lib.rs` for later milestones.
+- Milestone 77 route modularization: `apps/aion-api/src/lib.rs` now extracts the TTN mapping, TTN validation, TTN live-readiness, and TTN live-validation HTTP surface into `src/routes/ttn.rs`, preserving endpoint paths, auth semantics, tenant/resource ownership behavior, TTN device mapping behavior, TTN validation diagnostics, dry-run/live-preflight safety behavior, and JSON shapes while intentionally leaving ingestion worker plan/status/reconcile routes in `lib.rs` for the next extraction step.
 
 ## Next
 
-1. Continue incremental `aion-api` route extraction only where a remaining route group or shared surface still has enough cohesion to justify a dedicated module after the connector-admin split, with TTN route surfaces and worker management still planned separately.
+1. Continue incremental `aion-api` route extraction only where a remaining route group or shared surface still has enough cohesion to justify a dedicated module after the TTN split, with ingestion worker management still planned as the next dedicated extraction.
 2. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
 3. Add historical observation/time-series query APIs without changing the existing `/observations` behavior.
 4. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
@@ -58,4 +59,4 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 
 - The roadmap is intentionally concise. Canonical details live in the individual model docs and ADRs.
 - Security hardening remains staged after the current selected write-surface rollout to avoid overreaching beyond verified behavior in one milestone.
-- `aion-api` modularization is intentionally incremental; Milestones 61 through 75 establish safe extraction patterns for later route-level and shared-surface splits.
+- `aion-api` modularization is intentionally incremental; Milestones 61 through 77 establish safe extraction patterns for later route-level and shared-surface splits.

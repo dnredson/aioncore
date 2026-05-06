@@ -12,3 +12,4 @@ pub(crate) mod observations;
 pub(crate) mod provenance;
 pub(crate) mod raw_messages;
 pub(crate) mod smartsentinel;
+pub(crate) mod ttn;
