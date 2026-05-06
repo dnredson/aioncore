@@ -1,16 +1,22 @@
 use crate::{
     auth::{is_admin_all, principal_tenant_id, require_scope, AuthContext},
     error::ApiError,
+    flow_support::{
+        analyze_flow, redact_sensitive_json, FlowPlannedSink, FlowReferencedConnector,
+        FlowValidationIssue, FlowValidationSeverity,
+    },
+    routes::flows::{draft_edges_from_flow, draft_nodes_from_flow, resolve_flow_for_read},
     routes::workers::{connector_runtime_status_from_spec, ConnectorWorkerRuntimeStatus},
     state_for_tenant,
     worker_support::{connector_worker_spec, ConnectorWorkerRuntimeState, IngestionWorkerKind},
     AppState, AuthMode,
 };
 use aion_entity::Entity;
+use aion_flow::{Flow, FlowEdge, FlowNode, FlowNodePosition, FlowNodeType};
 use aion_observation::Observation;
 use aion_storage::{DlqRecordFilter, EventFilter, IngestionConnector, IngestionConnectorType};
 use axum::{
-    extract::{Extension, State},
+    extract::{Extension, Path, State},
     routing::get,
     Json, Router,
 };
@@ -25,6 +31,8 @@ const UNBOUNDED_QUERY_LIMIT: u32 = u32::MAX;
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/dashboard/overview", get(get_dashboard_overview))
+        .route("/dashboard/flows", get(list_dashboard_flows))
+        .route("/dashboard/flows/:flow_id", get(get_dashboard_flow_detail))
         .route(
             "/dashboard/timeseries/entities",
             get(list_dashboard_timeseries_entities),
@@ -43,6 +51,8 @@ pub(crate) struct DashboardOverviewResponse {
     pub events_count: usize,
     pub flows_count: usize,
     pub enabled_flows_count: usize,
+    pub invalid_flows_count: usize,
+    pub flow_validation_warning_count: usize,
     pub dlq_pending_count: usize,
     pub dlq_total_count: usize,
     pub connectors_count: usize,
@@ -50,6 +60,131 @@ pub(crate) struct DashboardOverviewResponse {
     pub workers_running_count: usize,
     pub workers_degraded_count: usize,
     pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DashboardFlowsInventoryResponse {
+    pub generated_at: DateTime<Utc>,
+    pub flows: Vec<DashboardFlowInventoryItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DashboardFlowValidationStatus {
+    Valid,
+    Invalid,
+    Warning,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DashboardFlowInventoryItem {
+    pub flow_id: Uuid,
+    pub flow_key: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub source_count: usize,
+    pub decoder_count: usize,
+    pub transform_count: usize,
+    pub filter_count: usize,
+    pub rule_count: usize,
+    pub sink_count: usize,
+    pub dlq_count: usize,
+    pub validation_status: DashboardFlowValidationStatus,
+    pub validation_error_count: usize,
+    pub validation_warning_count: usize,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DashboardFlowDetailResponse {
+    pub generated_at: DateTime<Utc>,
+    pub flow: DashboardFlowMetadata,
+    pub nodes: Vec<DashboardFlowNodeDetail>,
+    pub edges: Vec<FlowEdge>,
+    pub graph_summary: DashboardFlowGraphSummary,
+    pub validation_summary: DashboardFlowValidationSummary,
+    pub planned_path: Vec<String>,
+    pub referenced_connectors: Vec<FlowReferencedConnector>,
+    pub planned_sinks: Vec<FlowPlannedSink>,
+    pub execution_supported: bool,
+    pub execution_status: &'static str,
+    pub side_effects_performed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DashboardFlowMetadata {
+    pub flow_id: Uuid,
+    pub flow_key: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DashboardFlowNodeDetail {
+    pub node_id: String,
+    pub node_type: FlowNodeType,
+    pub name: Option<String>,
+    pub config: Value,
+    pub position: Option<FlowNodePosition>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DashboardFlowGraphSummary {
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub source_count: usize,
+    pub decoder_count: usize,
+    pub transform_count: usize,
+    pub filter_count: usize,
+    pub rule_count: usize,
+    pub sink_count: usize,
+    pub dlq_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DashboardFlowValidationSummary {
+    pub valid: bool,
+    pub status: DashboardFlowValidationStatus,
+    pub error_count: usize,
+    pub warning_count: usize,
+    pub issues: Vec<FlowValidationIssue>,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardFlowAnalysis {
+    status: DashboardFlowValidationStatus,
+    error_count: usize,
+    warning_count: usize,
+    issues: Vec<FlowValidationIssue>,
+    planned_path: Vec<String>,
+    referenced_connectors: Vec<FlowReferencedConnector>,
+    planned_sinks: Vec<FlowPlannedSink>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DashboardFlowCounts {
+    node_count: usize,
+    edge_count: usize,
+    source_count: usize,
+    decoder_count: usize,
+    transform_count: usize,
+    filter_count: usize,
+    rule_count: usize,
+    sink_count: usize,
+    dlq_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DashboardOverviewFlowSummary {
+    invalid_flows_count: usize,
+    flow_validation_warning_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,6 +251,7 @@ async fn get_dashboard_overview(
     let raw_messages_count = scoped_raw_messages_count(&state, &auth)?;
     let events_count = scoped_events_count(&state, &auth)?;
     let flows = scoped_flows(&state, &auth)?;
+    let flow_summary = build_dashboard_overview_flow_summary(&state, &flows)?;
     let dlq_total_count = scoped_dlq_records_count(&state, &auth, None)?;
     let dlq_pending_count =
         scoped_dlq_records_count(&state, &auth, Some(aion_dlq::DlqStatus::Pending))?;
@@ -129,6 +265,8 @@ async fn get_dashboard_overview(
         events_count,
         flows_count: flows.len(),
         enabled_flows_count: flows.iter().filter(|flow| flow.enabled).count(),
+        invalid_flows_count: flow_summary.invalid_flows_count,
+        flow_validation_warning_count: flow_summary.flow_validation_warning_count,
         dlq_pending_count,
         dlq_total_count,
         connectors_count: connector_items.len(),
@@ -136,6 +274,69 @@ async fn get_dashboard_overview(
         workers_running_count: connector_items.iter().filter(|item| item.running).count(),
         workers_degraded_count: connector_items.iter().filter(|item| item.degraded).count(),
         generated_at: Utc::now(),
+    }))
+}
+
+async fn list_dashboard_flows(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<DashboardFlowsInventoryResponse>, ApiError> {
+    require_scope(&state, &auth, "/dashboard/flows", "dashboard:read")?;
+
+    let mut items = scoped_flows(&state, &auth)?
+        .into_iter()
+        .map(|flow| build_dashboard_flow_inventory_item(&state, &flow))
+        .collect::<Result<Vec<_>, _>>()?;
+    items.sort_by(|left, right| left.flow_key.cmp(&right.flow_key));
+
+    Ok(Json(DashboardFlowsInventoryResponse {
+        generated_at: Utc::now(),
+        flows: items,
+    }))
+}
+
+async fn get_dashboard_flow_detail(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(flow_id): Path<Uuid>,
+) -> Result<Json<DashboardFlowDetailResponse>, ApiError> {
+    require_scope(&state, &auth, "/dashboard/flows/:flow_id", "dashboard:read")?;
+
+    let flow = resolve_flow_for_read(&state, &auth, "/dashboard/flows/:flow_id", flow_id)?;
+    let graph_summary = summarize_flow_graph(&flow);
+    let validation = analyze_dashboard_flow(&state, &flow)?;
+
+    Ok(Json(DashboardFlowDetailResponse {
+        generated_at: Utc::now(),
+        flow: DashboardFlowMetadata {
+            flow_id: flow.id,
+            flow_key: flow.flow_key.clone(),
+            name: flow.name.clone(),
+            description: flow.description.clone(),
+            enabled: flow.enabled,
+            created_at: flow.created_at,
+            updated_at: flow.updated_at,
+        },
+        nodes: flow
+            .nodes
+            .iter()
+            .map(dashboard_flow_node_detail)
+            .collect::<Vec<_>>(),
+        edges: flow.edges.clone(),
+        graph_summary: graph_summary.into(),
+        validation_summary: DashboardFlowValidationSummary {
+            valid: validation.status != DashboardFlowValidationStatus::Invalid,
+            status: validation.status,
+            error_count: validation.error_count,
+            warning_count: validation.warning_count,
+            issues: validation.issues.clone(),
+        },
+        planned_path: validation.planned_path,
+        referenced_connectors: validation.referenced_connectors,
+        planned_sinks: validation.planned_sinks,
+        execution_supported: false,
+        execution_status: "not_implemented",
+        side_effects_performed: false,
     }))
 }
 
@@ -413,6 +614,151 @@ fn build_connector_overview_items(
 
     items.sort_by(|left, right| left.connector_key.cmp(&right.connector_key));
     Ok(items)
+}
+
+fn build_dashboard_overview_flow_summary(
+    state: &AppState,
+    flows: &[Flow],
+) -> Result<DashboardOverviewFlowSummary, ApiError> {
+    let mut invalid_flows_count = 0;
+    let mut flow_validation_warning_count = 0;
+
+    for flow in flows {
+        let validation = analyze_dashboard_flow(state, flow)?;
+        if validation.status == DashboardFlowValidationStatus::Invalid {
+            invalid_flows_count += 1;
+        }
+        flow_validation_warning_count += validation.warning_count;
+    }
+
+    Ok(DashboardOverviewFlowSummary {
+        invalid_flows_count,
+        flow_validation_warning_count,
+    })
+}
+
+fn build_dashboard_flow_inventory_item(
+    state: &AppState,
+    flow: &Flow,
+) -> Result<DashboardFlowInventoryItem, ApiError> {
+    let graph = summarize_flow_graph(flow);
+    let validation = analyze_dashboard_flow(state, flow)?;
+
+    Ok(DashboardFlowInventoryItem {
+        flow_id: flow.id,
+        flow_key: flow.flow_key.clone(),
+        name: flow.name.clone(),
+        description: flow.description.clone(),
+        enabled: flow.enabled,
+        node_count: graph.node_count,
+        edge_count: graph.edge_count,
+        source_count: graph.source_count,
+        decoder_count: graph.decoder_count,
+        transform_count: graph.transform_count,
+        filter_count: graph.filter_count,
+        rule_count: graph.rule_count,
+        sink_count: graph.sink_count,
+        dlq_count: graph.dlq_count,
+        validation_status: validation.status,
+        validation_error_count: validation.error_count,
+        validation_warning_count: validation.warning_count,
+        created_at: flow.created_at,
+        updated_at: flow.updated_at,
+    })
+}
+
+fn analyze_dashboard_flow(
+    state: &AppState,
+    flow: &Flow,
+) -> Result<DashboardFlowAnalysis, ApiError> {
+    let analysis = analyze_flow(
+        &state_for_tenant(state, flow.tenant_id),
+        flow.tenant_id,
+        &draft_nodes_from_flow(flow),
+        &draft_edges_from_flow(flow),
+        None,
+    )?;
+    let error_count = analysis
+        .validation_issues
+        .iter()
+        .filter(|issue| issue.severity == FlowValidationSeverity::Error)
+        .count();
+    let warning_count = analysis
+        .validation_issues
+        .iter()
+        .filter(|issue| issue.severity == FlowValidationSeverity::Warning)
+        .count();
+    let status = if error_count > 0 {
+        DashboardFlowValidationStatus::Invalid
+    } else if warning_count > 0 {
+        DashboardFlowValidationStatus::Warning
+    } else {
+        DashboardFlowValidationStatus::Valid
+    };
+
+    Ok(DashboardFlowAnalysis {
+        status,
+        error_count,
+        warning_count,
+        issues: analysis.validation_issues,
+        planned_path: analysis.planned_path,
+        referenced_connectors: analysis.referenced_connectors,
+        planned_sinks: analysis.planned_sinks,
+    })
+}
+
+fn summarize_flow_graph(flow: &Flow) -> DashboardFlowCounts {
+    let mut counts = DashboardFlowCounts {
+        node_count: flow.nodes.len(),
+        edge_count: flow.edges.len(),
+        source_count: 0,
+        decoder_count: 0,
+        transform_count: 0,
+        filter_count: 0,
+        rule_count: 0,
+        sink_count: 0,
+        dlq_count: 0,
+    };
+
+    for node in &flow.nodes {
+        match node.node_type {
+            FlowNodeType::Source => counts.source_count += 1,
+            FlowNodeType::Decoder => counts.decoder_count += 1,
+            FlowNodeType::Transform => counts.transform_count += 1,
+            FlowNodeType::Filter => counts.filter_count += 1,
+            FlowNodeType::Rule => counts.rule_count += 1,
+            FlowNodeType::Sink => counts.sink_count += 1,
+            FlowNodeType::Dlq => counts.dlq_count += 1,
+        }
+    }
+
+    counts
+}
+
+fn dashboard_flow_node_detail(node: &FlowNode) -> DashboardFlowNodeDetail {
+    DashboardFlowNodeDetail {
+        node_id: node.node_id.clone(),
+        node_type: node.node_type.clone(),
+        name: node.name.clone(),
+        config: redact_sensitive_json(&node.config),
+        position: node.position.clone(),
+    }
+}
+
+impl From<DashboardFlowCounts> for DashboardFlowGraphSummary {
+    fn from(value: DashboardFlowCounts) -> Self {
+        Self {
+            node_count: value.node_count,
+            edge_count: value.edge_count,
+            source_count: value.source_count,
+            decoder_count: value.decoder_count,
+            transform_count: value.transform_count,
+            filter_count: value.filter_count,
+            rule_count: value.rule_count,
+            sink_count: value.sink_count,
+            dlq_count: value.dlq_count,
+        }
+    }
 }
 
 fn runtime_status_for_connector(

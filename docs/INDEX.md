@@ -42,6 +42,11 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [Roadmap](ROADMAP.md)
 - [Architecture Decision Records](ADR)
 
+Recent dashboard and flow ADRs:
+
+- [ADR 0083: Dashboard flow inventory and detail API](ADR/0083-dashboard-flow-inventory-detail-api.md)
+- [ADR 0082: Flow validation and dry-run API](ADR/0082-flow-validation-dry-run-api.md)
+
 ## Validation And Deployment
 
 - [Runtime Validation](RUNTIME_VALIDATION.md)

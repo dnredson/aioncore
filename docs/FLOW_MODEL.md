@@ -22,6 +22,7 @@ The current flow foundation now adds:
 - in-memory and PostgreSQL persistence
 - CRUD plus enable and disable APIs
 - validation and non-executing dry-run APIs
+- dashboard inventory and detail read APIs
 - token-mode auth scopes and tenant filtering
 - lifecycle audit events
 
@@ -209,3 +210,13 @@ External flow references should use stable metadata keys where applicable:
 - `external.flow_id`
 - `external.flow_name`
 - `external.process_group_id`
+
+## Dashboard Read Relationship
+
+The flow dashboard endpoints are additive and do not replace `/flows`:
+
+- `/flows` remains the operational CRUD surface.
+- `/flows/{flow_id}/validation` and `/flows/{flow_id}/dry-run` remain the canonical validation and planning surfaces.
+- `/dashboard/flows` and `/dashboard/flows/{flow_id}` provide inventory/detail shapes optimized for future UI panels and graph rendering.
+
+Dashboard flow detail redacts secret-like node config keys using the same behavior as validation and dry-run output.

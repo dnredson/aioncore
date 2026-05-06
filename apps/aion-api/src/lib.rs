@@ -14270,6 +14270,305 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_flow_inventory_and_detail_work_in_dev_mode() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+
+        let valid_flow = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows",
+                    sample_flow_body_with_nodes(
+                        "dashboard-flow-valid",
+                        "Dashboard Valid Flow",
+                        json!([
+                            {
+                                "node_id": "source-1",
+                                "node_type": "source",
+                                "name": "Source",
+                                "config": {
+                                    "kind": "mqtt_subscribe",
+                                    "api_key": "top-secret"
+                                }
+                            },
+                            {
+                                "node_id": "decoder-1",
+                                "node_type": "decoder",
+                                "name": "Decoder",
+                                "config": { "kind": "senml_decode" }
+                            },
+                            {
+                                "node_id": "transform-1",
+                                "node_type": "transform",
+                                "name": "Transform",
+                                "config": { "kind": "canonical_json" }
+                            },
+                            {
+                                "node_id": "filter-1",
+                                "node_type": "filter",
+                                "name": "Filter",
+                                "config": { "kind": "filter_condition" }
+                            },
+                            {
+                                "node_id": "rule-1",
+                                "node_type": "rule",
+                                "name": "Rule",
+                                "config": { "kind": "threshold_rule" }
+                            },
+                            {
+                                "node_id": "sink-1",
+                                "node_type": "sink",
+                                "name": "Store",
+                                "config": {
+                                    "kind": "internal_observation_store",
+                                    "password": "also-secret"
+                                }
+                            },
+                            {
+                                "node_id": "dlq-1",
+                                "node_type": "dlq",
+                                "name": "DLQ",
+                                "config": { "kind": "dlq" }
+                            }
+                        ]),
+                        json!([
+                            { "edge_id": "edge-1", "source_node_id": "source-1", "target_node_id": "decoder-1" },
+                            { "edge_id": "edge-2", "source_node_id": "decoder-1", "target_node_id": "transform-1" },
+                            { "edge_id": "edge-3", "source_node_id": "transform-1", "target_node_id": "filter-1" },
+                            { "edge_id": "edge-4", "source_node_id": "filter-1", "target_node_id": "rule-1" },
+                            { "edge_id": "edge-5", "source_node_id": "rule-1", "target_node_id": "sink-1" },
+                            { "edge_id": "edge-6", "source_node_id": "rule-1", "target_node_id": "dlq-1" }
+                        ]),
+                    ),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let valid_flow_id = valid_flow["id"].as_str().unwrap();
+
+        to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows",
+                    sample_flow_body_with_nodes(
+                        "dashboard-flow-warning",
+                        "Dashboard Warning Flow",
+                        json!([
+                            {
+                                "node_id": "source-1",
+                                "node_type": "source",
+                                "config": { "kind": "mqtt_subscribe" }
+                            },
+                            {
+                                "node_id": "sink-1",
+                                "node_type": "sink",
+                                "config": { "kind": "internal_observation_store" }
+                            }
+                        ]),
+                        json!([]),
+                    ),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows",
+                    sample_flow_body_with_nodes(
+                        "dashboard-flow-invalid",
+                        "Dashboard Invalid Flow",
+                        json!([
+                            {
+                                "node_id": "sink-1",
+                                "node_type": "sink",
+                                "config": { "kind": "internal_observation_store" }
+                            }
+                        ]),
+                        json!([]),
+                    ),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let inventory = get_json(&app, "/dashboard/flows").await;
+        let flows = inventory["flows"].as_array().unwrap();
+        assert_eq!(flows.len(), 3);
+
+        let valid_item = flows
+            .iter()
+            .find(|entry| entry["flow_key"] == "dashboard-flow-valid")
+            .unwrap();
+        assert_eq!(valid_item["node_count"], 7);
+        assert_eq!(valid_item["edge_count"], 6);
+        assert_eq!(valid_item["source_count"], 1);
+        assert_eq!(valid_item["decoder_count"], 1);
+        assert_eq!(valid_item["transform_count"], 1);
+        assert_eq!(valid_item["filter_count"], 1);
+        assert_eq!(valid_item["rule_count"], 1);
+        assert_eq!(valid_item["sink_count"], 1);
+        assert_eq!(valid_item["dlq_count"], 1);
+        assert_eq!(valid_item["validation_status"], "valid");
+        assert_eq!(valid_item["validation_error_count"], 0);
+        assert_eq!(valid_item["validation_warning_count"], 0);
+
+        let invalid_item = flows
+            .iter()
+            .find(|entry| entry["flow_key"] == "dashboard-flow-invalid")
+            .unwrap();
+        assert_eq!(invalid_item["validation_status"], "invalid");
+        assert!(invalid_item["validation_error_count"].as_u64().unwrap() >= 1);
+
+        let warning_item = flows
+            .iter()
+            .find(|entry| entry["flow_key"] == "dashboard-flow-warning")
+            .unwrap();
+        assert_eq!(warning_item["validation_status"], "warning");
+        assert_eq!(warning_item["validation_warning_count"], 2);
+
+        let detail = get_json(&app, &format!("/dashboard/flows/{valid_flow_id}")).await;
+        assert_eq!(detail["flow"]["flow_key"], "dashboard-flow-valid");
+        assert_eq!(detail["nodes"].as_array().unwrap().len(), 7);
+        assert_eq!(detail["edges"].as_array().unwrap().len(), 6);
+        assert_eq!(detail["graph_summary"]["rule_count"], 1);
+        assert_eq!(detail["validation_summary"]["status"], "valid");
+        assert_eq!(detail["validation_summary"]["error_count"], 0);
+        assert_eq!(detail["execution_supported"], false);
+        assert_eq!(detail["execution_status"], "not_implemented");
+        assert_eq!(detail["side_effects_performed"], false);
+        assert_eq!(detail["planned_path"].as_array().unwrap().len(), 7);
+        assert_eq!(detail["nodes"][0]["config"]["api_key"], "***REDACTED***");
+        assert_eq!(detail["nodes"][5]["config"]["password"], "***REDACTED***");
+
+        let overview = get_json(&app, "/dashboard/overview").await;
+        assert_eq!(overview["flows_count"], 3);
+        assert_eq!(overview["invalid_flows_count"], 1);
+        assert_eq!(overview["flow_validation_warning_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_dashboard_flow_endpoints_with_dashboard_read_scope() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let dev_app = dev_mode_app_with_storage(storage.clone());
+        create_test_flow(&dev_app, "dashboard-token-flow", "Dashboard Token Flow").await;
+        let app = token_mode_app_with_storage(storage.clone());
+
+        let no_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/flows")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_scope_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("dashboard-flow-wrong-scope"),
+            &["flows:read"],
+        );
+        let wrong_scope = app
+            .clone()
+            .oneshot(auth_request("GET", "/dashboard/flows", &wrong_scope_token))
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+        let dashboard_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Service,
+            Some("dashboard-flow-reader"),
+            &["dashboard:read"],
+        );
+        let inventory = app
+            .clone()
+            .oneshot(auth_request("GET", "/dashboard/flows", &dashboard_token))
+            .await
+            .unwrap();
+        assert_eq!(inventory.status(), StatusCode::OK);
+
+        let admin_token = store_api_token(
+            &storage,
+            ApiTokenPrincipalType::Admin,
+            Some("dashboard-flow-admin"),
+            &["admin:all"],
+        );
+        let admin_inventory = app
+            .clone()
+            .oneshot(auth_request("GET", "/dashboard/flows", &admin_token))
+            .await
+            .unwrap();
+        assert_eq!(admin_inventory.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_filters_dashboard_flows_by_tenant_and_denies_cross_tenant_detail() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_a_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_a);
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let token_app = token_mode_app_with_storage(storage.clone());
+
+        create_test_flow(
+            &tenant_a_app,
+            "tenant-a-dashboard-flow",
+            "Tenant A Dashboard Flow",
+        )
+        .await;
+        let flow_b = create_test_flow(
+            &tenant_b_app,
+            "tenant-b-dashboard-flow",
+            "Tenant B Dashboard Flow",
+        )
+        .await;
+        let flow_b_id = flow_b["id"].as_str().unwrap();
+
+        let tenant_a_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("tenant-a-dashboard-reader"),
+            &["dashboard:read"],
+        );
+
+        let tenant_a_inventory = to_json(
+            token_app
+                .clone()
+                .oneshot(auth_request("GET", "/dashboard/flows", &tenant_a_token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let tenant_a_flows = tenant_a_inventory["flows"].as_array().unwrap();
+        assert_eq!(tenant_a_flows.len(), 1);
+        assert_eq!(tenant_a_flows[0]["flow_key"], "tenant-a-dashboard-flow");
+
+        let cross_tenant_detail = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/dashboard/flows/{flow_b_id}"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_detail.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn flow_validation_endpoint_reports_structured_issues_for_proposed_flows() {
         let storage = Arc::new(InMemoryStorage::new());
         let app = dev_mode_app_with_storage(storage);

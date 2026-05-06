@@ -15,6 +15,11 @@ They are read-only and planning-oriented.
 - `POST /flows/dry-run`
 - `POST /flows/{flow_id}/dry-run`
 
+Related dashboard read-only endpoints:
+
+- `GET /dashboard/flows`
+- `GET /dashboard/flows/{flow_id}`
+
 ## Validation Vs Dry-Run
 
 Validation answers: is the graph structurally usable?
@@ -165,3 +170,5 @@ A future dashboard or Node-RED-like flow builder should use:
 - `GET /flows/{flow_id}/validation` for stored flow inspection
 - `POST /flows/{flow_id}/dry-run` for planning-oriented previews
 - `POST /flows/validate` and `POST /flows/dry-run` for unsaved draft graphs
+
+The dashboard flow inventory and detail endpoints complement these APIs. They provide inventory counts, redacted node detail, graph summaries, and validation summaries for saved flows, but they still do not execute anything and are not a substitute for the validation and dry-run endpoints.

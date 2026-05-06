@@ -1,10 +1,12 @@
 # Dashboard Usage
 
-This guide covers the Milestone 81 read-only dashboard API foundation.
+This guide covers the read-only dashboard API foundation through Milestone 88.
 
 ## Scope
 
 - `GET /dashboard/overview`
+- `GET /dashboard/flows`
+- `GET /dashboard/flows/{flow_id}`
 - `GET /dashboard/timeseries/entities`
 - `GET /dashboard/connectors/overview`
 
@@ -26,6 +28,8 @@ Example response:
   "events_count": 38,
   "flows_count": 4,
   "enabled_flows_count": 2,
+  "invalid_flows_count": 1,
+  "flow_validation_warning_count": 3,
   "dlq_pending_count": 3,
   "dlq_total_count": 7,
   "connectors_count": 3,
@@ -35,6 +39,67 @@ Example response:
   "generated_at": "2026-05-06T12:00:00Z"
 }
 ```
+
+## Flow Inventory
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/dashboard/flows"
+```
+
+Example response:
+
+```json
+{
+  "generated_at": "2026-05-06T12:00:00Z",
+  "flows": [
+    {
+      "flow_id": "117f40ca-c1ab-4d3b-9300-96049602ef07",
+      "flow_key": "mqtt-normalize-store",
+      "name": "MQTT Normalize Store",
+      "description": "Store normalized telemetry",
+      "enabled": true,
+      "node_count": 3,
+      "edge_count": 2,
+      "source_count": 1,
+      "decoder_count": 1,
+      "transform_count": 0,
+      "filter_count": 0,
+      "rule_count": 0,
+      "sink_count": 1,
+      "dlq_count": 0,
+      "validation_status": "valid",
+      "validation_error_count": 0,
+      "validation_warning_count": 0,
+      "created_at": "2026-05-06T11:58:00Z",
+      "updated_at": "2026-05-06T11:59:00Z"
+    }
+  ]
+}
+```
+
+The inventory is intentionally compact. It does not include full node configs.
+
+## Flow Detail
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/dashboard/flows/<flow-id>"
+```
+
+Example detail fields include:
+
+- `flow`
+- `nodes`
+- `edges`
+- `graph_summary`
+- `validation_summary`
+- `planned_path`
+- `referenced_connectors`
+- `planned_sinks`
+- `execution_supported = false`
+- `execution_status = "not_implemented"`
+- `side_effects_performed = false`
+
+Node configs are redacted with the same secret-like key behavior used by the flow validation and dry-run APIs.
 
 ## Time-Series Entity Discovery
 
@@ -121,12 +186,13 @@ Token-mode behavior:
 - valid token without `dashboard:read`: `403`
 - `admin:all`: allowed
 - non-admin principals: limited to dashboard data owned by the principal tenant
+- cross-tenant dashboard flow detail: `403`
 
-The overview response now also includes flow and DLQ inventory counts. It still does not render or execute flows and does not provide a dashboard UI yet.
+The overview response now also includes flow and DLQ inventory counts plus flow validation summary counts. The dashboard API still does not render or execute flows and does not provide a dashboard UI yet.
 
 Future dashboard and flow-builder work should use the dedicated flow read-only planning endpoints rather than trying to infer usability from `/flows` alone:
 
 - `GET /flows/{flow_id}/validation`
 - `POST /flows/{flow_id}/dry-run`
 
-Those endpoints are additive and do not execute flows.
+Those endpoints are additive and do not execute flows. The dashboard flow endpoints complement them with inventory/detail shapes optimized for future UI rendering.

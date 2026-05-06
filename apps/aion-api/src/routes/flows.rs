@@ -539,7 +539,7 @@ fn draft_edges_from_requests(edges: &[ProposedFlowEdgeRequest]) -> Vec<FlowEdgeD
         .collect()
 }
 
-fn draft_nodes_from_flow(flow: &Flow) -> Vec<FlowNodeDraft> {
+pub(crate) fn draft_nodes_from_flow(flow: &Flow) -> Vec<FlowNodeDraft> {
     flow.nodes
         .iter()
         .map(|node| FlowNodeDraft {
@@ -551,7 +551,7 @@ fn draft_nodes_from_flow(flow: &Flow) -> Vec<FlowNodeDraft> {
         .collect()
 }
 
-fn draft_edges_from_flow(flow: &Flow) -> Vec<FlowEdgeDraft> {
+pub(crate) fn draft_edges_from_flow(flow: &Flow) -> Vec<FlowEdgeDraft> {
     flow.edges
         .iter()
         .map(|edge| FlowEdgeDraft {
@@ -622,7 +622,7 @@ fn dry_run_response(
     }
 }
 
-fn resolve_flow_for_read(
+pub(crate) fn resolve_flow_for_read(
     state: &AppState,
     auth: &AuthContext,
     endpoint: &'static str,
