@@ -8,6 +8,10 @@ This guide covers the Milestone 82 flow and pipeline model foundation.
 - `GET /flows`
 - `GET /flows/{flow_id}`
 - `PATCH /flows/{flow_id}`
+- `POST /flows/validate`
+- `GET /flows/{flow_id}/validation`
+- `POST /flows/dry-run`
+- `POST /flows/{flow_id}/dry-run`
 - `PUT /flows/{flow_id}/enable`
 - `PUT /flows/{flow_id}/disable`
 - `DELETE /flows/{flow_id}`
@@ -114,6 +118,63 @@ Invoke-RestMethod -Method Post -Uri "http://localhost:8080/flows" -ContentType "
 
 The second example stores only configuration. AionCore does not publish to MQTT from flows yet.
 
+## Validation
+
+Use `POST /flows/validate` to validate a proposed flow without saving it.
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/flows/validate" -ContentType "application/json" -Body $body
+```
+
+Use `GET /flows/{flow_id}/validation` to validate a stored flow.
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://localhost:8080/flows/<flow-id>/validation"
+```
+
+Validation returns:
+
+- `valid`
+- `validation_issues`
+- `node_inventory`
+- `referenced_connectors`
+- `planned_sinks`
+
+Validation is read-only. It does not enable, execute, publish, write observations, or create DLQ records.
+
+## Dry-Run
+
+Use `POST /flows/dry-run` to dry-run a proposed flow, or `POST /flows/{flow_id}/dry-run` for a stored flow.
+
+```powershell
+$dryRun = @{
+  sample_payload = @{
+    temperature = 21.4
+  }
+  payload_format = "senml-json"
+} | ConvertTo-Json -Depth 8
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/flows/<flow-id>/dry-run" -ContentType "application/json" -Body $dryRun
+```
+
+Dry-run returns planning-oriented fields such as:
+
+- `execution_supported = false`
+- `simulated = true`
+- `planned_path`
+- `node_plan`
+- `planned_sinks`
+- `referenced_connectors`
+- `would_store_observation`
+- `would_publish_mqtt`
+- `would_forward_http`
+- `would_create_event`
+- `would_create_command`
+- `would_use_dlq`
+- `side_effects_performed = false`
+
+Dry-run does not execute the flow or perform any side effects.
+
 ## List And Get
 
 ```powershell
@@ -175,3 +236,12 @@ Token-mode behavior:
 - valid token missing required flow scope: `403`
 - non-admin principals only see and manage their own tenant flows
 - `admin:all` can read and manage flows across tenants
+
+Validation and dry-run scope rules:
+
+- `POST /flows/validate`: `flows:read` or `flows:write`
+- `GET /flows/{flow_id}/validation`: `flows:read`
+- `POST /flows/dry-run`: `flows:read`
+- `POST /flows/{flow_id}/dry-run`: `flows:read`
+
+Validation and dry-run also preserve tenant-aware flow ownership checks for stored flows in token mode.

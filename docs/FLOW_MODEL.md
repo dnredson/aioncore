@@ -15,16 +15,17 @@ This model is intentionally inspired by Node-RED-style operational graphs while 
 
 ## Current Scope
 
-The current flow foundation adds:
+The current flow foundation now adds:
 
 - a tenant-scoped `Flow` domain model
 - node and edge graph storage
 - in-memory and PostgreSQL persistence
 - CRUD plus enable and disable APIs
+- validation and non-executing dry-run APIs
 - token-mode auth scopes and tenant filtering
 - lifecycle audit events
 
-The current milestone does not add:
+The current flow milestones still do not add:
 
 - visual UI
 - drag-and-drop editing
@@ -34,6 +35,7 @@ The current milestone does not add:
 - broker subscriptions driven by flows
 - DLQ runtime processing
 - external flow-engine execution, including NiFi or MiNiFi execution
+- any side effects from validation or dry-run
 
 ## Core Types
 
@@ -136,7 +138,7 @@ Flows do not replace these models. They provide an explicit graph representation
 
 ## Validation Rules
 
-The current API validates:
+Create and update still validate:
 
 - `flow_key` is required on create
 - `name` is required on create
@@ -144,7 +146,50 @@ The current API validates:
 - every edge source and target must reference an existing node
 - `node_type` must be one of the supported enum values
 
-The current API does not validate external connector existence or sink reachability.
+The dedicated validation API adds richer structured checks without changing `/flows` CRUD behavior:
+
+- flow has at least one node
+- node IDs are unique
+- edge IDs are unique when present
+- every edge source and target exists
+- at least one source node exists
+- at least one sink or `dlq` node exists
+- isolated nodes are reported as warnings
+- simple cycle detection is performed and reported as an error when detected
+- source and sink `connector_id` references are checked when they can be safely verified
+- secret-like config fields are redacted in validation and dry-run output
+
+Structured issues include:
+
+- `severity`
+- `code`
+- `message`
+- optional `node_id`
+- optional `edge_id`
+- optional `field`
+
+## Dry-Run Model
+
+Dry-run is planning-oriented and non-executing.
+
+It can report:
+
+- whether the flow is structurally valid
+- the reachable node path from one source or all sources
+- the sources, transforms, sinks, and DLQ nodes present in the plan
+- referenced connectors
+- whether the flow would conceptually store observations, publish MQTT, forward HTTP, create events, create commands, or use DLQ
+
+Dry-run does not:
+
+- subscribe to brokers
+- publish MQTT
+- forward HTTP
+- create observations
+- create events
+- create commands
+- create DLQ records
+- change stored flow state
 
 ## Future Direction
 
@@ -152,9 +197,10 @@ This model is the backend contract for later milestones:
 
 - dashboard flow list and detail views
 - Node-RED-like graph editing
+- dashboard-driven validation and dry-run inspection
 - flow execution engine
 - runtime source binding and sink dispatch
-- operational validation and simulation
+- deeper operational validation and simulation
 - DLQ visibility and replay tooling
 
 External flow references should use stable metadata keys where applicable:

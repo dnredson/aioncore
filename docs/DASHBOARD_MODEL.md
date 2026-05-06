@@ -30,6 +30,7 @@ The future AionCore dashboard is intended to emphasize:
 - worker/runtime health
 - later pipeline and flow visibility
 - later flow list, detail, and graph rendering
+- later flow validation and dry-run inspection
 - later reliability and provenance visibility for external flow engines such as NiFi and MiNiFi
 
 This is intentionally different from a generic chart-only experience. Grafana can still complement AionCore for richer chart composition later.
@@ -46,6 +47,11 @@ The following are explicitly out of scope for this milestone:
 - automated pipeline/rule authoring from the dashboard
 
 Node-RED-like flow editing remains future work. The current milestones only establish safe backend summaries and the flow storage model that a future dashboard can build on.
+
+Future dashboard flow-builder work should call:
+
+- `GET /flows/{flow_id}/validation`
+- `POST /flows/{flow_id}/dry-run`
 
 For reliable external runtimes, future dashboard work should be able to show:
 

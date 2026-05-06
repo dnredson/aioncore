@@ -40,6 +40,7 @@ mod auth;
 mod command_support;
 mod connector_support;
 mod error;
+mod flow_support;
 mod mqtt_ingest;
 mod query_filters;
 mod routes;
@@ -14266,6 +14267,417 @@ mod tests {
         )
         .await;
         assert_eq!(enabled["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn flow_validation_endpoint_reports_structured_issues_for_proposed_flows() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage);
+
+        let valid = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows/validate",
+                    sample_flow_body("flow-validate-01", "Validate Flow"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(valid["valid"], true);
+        assert_eq!(valid["validation_issues"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            valid["validation_issues"][0]["code"],
+            "flow_connector_reference_unverified"
+        );
+
+        let duplicate = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows/validate",
+                    sample_flow_body_with_nodes(
+                        "flow-validate-dup",
+                        "Duplicate Nodes",
+                        json!([
+                            {"node_id": "dup", "node_type": "source", "config": {"kind": "mqtt_subscribe"}},
+                            {"node_id": "dup", "node_type": "sink", "config": {"kind": "internal_observation_store"}}
+                        ]),
+                        json!([]),
+                    ),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(duplicate["valid"], false);
+        assert!(validation_issue_codes(&duplicate, "validation_issues")
+            .contains(&"flow_duplicate_node_id"));
+
+        let unknown_edge = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows/validate",
+                    sample_flow_body_with_nodes(
+                        "flow-validate-edge",
+                        "Unknown Edge",
+                        json!([
+                            {"node_id": "source-1", "node_type": "source", "config": {"kind": "mqtt_subscribe"}},
+                            {"node_id": "sink-1", "node_type": "sink", "config": {"kind": "internal_observation_store"}}
+                        ]),
+                        json!([
+                            {"edge_id": "edge-1", "source_node_id": "missing-source", "target_node_id": "sink-1"},
+                            {"edge_id": "edge-2", "source_node_id": "source-1", "target_node_id": "missing-target"}
+                        ]),
+                    ),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(validation_issue_codes(&unknown_edge, "validation_issues")
+            .contains(&"flow_unknown_edge_source"));
+        assert!(validation_issue_codes(&unknown_edge, "validation_issues")
+            .contains(&"flow_unknown_edge_target"));
+
+        let missing_source = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows/validate",
+                    sample_flow_body_with_nodes(
+                        "flow-validate-no-source",
+                        "No Source",
+                        json!([
+                            {"node_id": "decoder-1", "node_type": "decoder", "config": {"kind": "senml_decode"}},
+                            {"node_id": "sink-1", "node_type": "sink", "config": {"kind": "internal_observation_store"}}
+                        ]),
+                        json!([
+                            {"edge_id": "edge-1", "source_node_id": "decoder-1", "target_node_id": "sink-1"}
+                        ]),
+                    ),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(validation_issue_codes(&missing_source, "validation_issues")
+            .contains(&"flow_source_missing"));
+
+        let missing_sink = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows/validate",
+                    sample_flow_body_with_nodes(
+                        "flow-validate-no-sink",
+                        "No Sink",
+                        json!([
+                            {"node_id": "source-1", "node_type": "source", "config": {"kind": "mqtt_subscribe"}},
+                            {"node_id": "filter-1", "node_type": "filter", "config": {"kind": "filter_condition"}}
+                        ]),
+                        json!([
+                            {"edge_id": "edge-1", "source_node_id": "source-1", "target_node_id": "filter-1"}
+                        ]),
+                    ),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(validation_issue_codes(&missing_sink, "validation_issues")
+            .contains(&"flow_sink_or_dlq_missing"));
+    }
+
+    #[tokio::test]
+    async fn flow_validation_and_dry_run_support_stored_flows_and_redaction() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage.clone());
+        let connector = create_mqtt_connector(
+            &app,
+            "flow-validator-connector",
+            "generic-mqtt",
+            true,
+            Some("mqtt://broker.example:1883"),
+            Some("devices/+/up"),
+            Some("senml-json"),
+        )
+        .await;
+        let connector_id = connector["id"].as_str().unwrap();
+
+        let created = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows",
+                    json!({
+                        "flow_key": "stored-flow-validate",
+                        "name": "Stored Flow Validate",
+                        "enabled": false,
+                        "nodes": [
+                            {
+                                "node_id": "source-1",
+                                "node_type": "source",
+                                "config": {
+                                    "kind": "mqtt_subscribe",
+                                    "connector_id": connector_id,
+                                    "access_token": "super-secret-token"
+                                }
+                            },
+                            {
+                                "node_id": "sink-1",
+                                "node_type": "sink",
+                                "config": {
+                                    "kind": "mqtt_publish",
+                                    "topic": "alerts/out",
+                                    "password": "secret-password"
+                                }
+                            },
+                            {
+                                "node_id": "dlq-1",
+                                "node_type": "dlq",
+                                "config": {
+                                    "kind": "dlq",
+                                    "credential_ref": "hidden-credential"
+                                }
+                            }
+                        ],
+                        "edges": [
+                            {"edge_id": "edge-1", "source_node_id": "source-1", "target_node_id": "sink-1"},
+                            {"edge_id": "edge-2", "source_node_id": "source-1", "target_node_id": "dlq-1"}
+                        ]
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let flow_id = created["id"].as_str().unwrap();
+
+        let validation = to_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/flows/{flow_id}/validation"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(validation["valid"], true);
+        assert_eq!(validation["flow_id"], created["id"]);
+        assert_eq!(validation["referenced_connectors"][0]["exists"], true);
+
+        let dry_run = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/flows/{flow_id}/dry-run"),
+                    json!({
+                        "sample_payload": {"temperature": 21.4},
+                        "payload_format": "senml-json"
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(dry_run["simulated"], true);
+        assert_eq!(dry_run["side_effects_performed"], false);
+        assert_eq!(dry_run["would_publish_mqtt"], true);
+        assert_eq!(dry_run["would_use_dlq"], true);
+        assert_eq!(dry_run["planned_sinks"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            dry_run["node_plan"][0]["config"]["access_token"],
+            "***REDACTED***"
+        );
+        assert_eq!(
+            dry_run["planned_sinks"][0]["config"]["password"],
+            "***REDACTED***"
+        );
+        assert_eq!(
+            dry_run["planned_sinks"][1]["config"]["credential_ref"],
+            "***REDACTED***"
+        );
+
+        let proposed_dry_run = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows/dry-run",
+                    json!({
+                        "flow_key": "proposed-dry-run",
+                        "nodes": [
+                            {
+                                "node_id": "source-1",
+                                "node_type": "source",
+                                "config": {
+                                    "kind": "mqtt_subscribe",
+                                    "connector_id": connector_id,
+                                    "api_key": "hidden"
+                                }
+                            },
+                            {
+                                "node_id": "sink-1",
+                                "node_type": "sink",
+                                "config": {
+                                    "kind": "internal_observation_store"
+                                }
+                            }
+                        ],
+                        "edges": [
+                            {"source_node_id": "source-1", "target_node_id": "sink-1"}
+                        ],
+                        "sample_payload": {"n": "temperature", "v": 21.4},
+                        "payload_format": "senml-json"
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(proposed_dry_run["side_effects_performed"], false);
+        assert_eq!(proposed_dry_run["would_store_observation"], true);
+        assert_eq!(
+            proposed_dry_run["node_plan"][0]["config"]["api_key"],
+            "***REDACTED***"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_flow_validation_and_dry_run_and_enforces_tenants() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let flow_b =
+            create_test_flow(&tenant_b_app, "tenant-b-validate", "Tenant B Validate").await;
+        let flow_b_id = flow_b["id"].as_str().unwrap();
+
+        let no_token = token_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/flows/{flow_b_id}/validation"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_scope_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("flow-validate-wrong-scope"),
+            &["dashboard:read"],
+        );
+        let wrong_scope = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/flows/{flow_b_id}/validation"),
+                &wrong_scope_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+        let tenant_b_token = store_api_token_for_tenant(
+            &storage,
+            tenant_b,
+            ApiTokenPrincipalType::Service,
+            Some("flow-validate-reader"),
+            &["flows:read"],
+        );
+        let tenant_b_validation = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/flows/{flow_b_id}/validation"),
+                &tenant_b_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tenant_b_validation.status(), StatusCode::OK);
+
+        let tenant_a_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("flow-validate-tenant-a"),
+            &["flows:read"],
+        );
+        let cross_tenant_validation = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/flows/{flow_b_id}/validation"),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_validation.status(), StatusCode::FORBIDDEN);
+
+        let cross_tenant_dry_run = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/flows/{flow_b_id}/dry-run"),
+                json!({"sample_payload": {"x": 1}}),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_dry_run.status(), StatusCode::FORBIDDEN);
+
+        let proposed_validation = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                "/flows/validate",
+                sample_flow_body("token-validate", "Token Validate"),
+                &tenant_b_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(proposed_validation.status(), StatusCode::OK);
+
+        let admin_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Admin,
+            Some("flow-admin-validation"),
+            &["admin:all"],
+        );
+        let admin_validation = token_app
+            .clone()
+            .oneshot(auth_request(
+                "GET",
+                &format!("/flows/{flow_b_id}/validation"),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(admin_validation.status(), StatusCode::OK);
+
+        let admin_dry_run = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/flows/{flow_b_id}/dry-run"),
+                json!({"sample_payload": {"x": 1}}),
+                &admin_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(admin_dry_run.status(), StatusCode::OK);
     }
 
     async fn create_test_entity(app: &Router, key: &str, entity_type: &str) -> String {

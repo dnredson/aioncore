@@ -48,21 +48,22 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 84 DLQ model and API foundation: AionCore now adds a first-class tenant-scoped `DlqRecord` model; in-memory and PostgreSQL persistence; `POST /dlq/records`, `GET /dlq/records`, `GET /dlq/records/{record_id}`, and `PATCH /dlq/records/{record_id}/status`; `dlq:read` and `dlq:write` token-mode protection; tenant-aware filtering and cross-tenant denial behavior; lifecycle audit events; and dashboard overview DLQ counts, while intentionally deferring automatic routing, replay execution, and batch/backfill runtime behavior.
 - Milestone 85 reliable ingestion envelope and tenant-scoped idempotency-key foundation: AionCore now adds a typed `ReliableIngestionEnvelope`; `POST /ingest/reliable`; tenant-scoped raw-message idempotency lookup and PostgreSQL uniqueness for present keys; replay-safe duplicate responses; token-mode `ingestion:write` protection for reliable ingestion; preserved `external.*` provenance metadata in `RawMessage.headers` and `Event.metadata`; and explicit documentation for NiFi/MiNiFi, SmartSentinel, and future replay/backfill alignment, while intentionally deferring batch/backfill APIs, replay execution, automatic DLQ routing, connector-aware reliable ingestion, and flow execution.
 - Milestone 86 batch and backfill reliable ingestion API foundation: `aion-api` now adds `POST /ingest/batch`; sequential independent processing of multiple reliable ingestion items; tenant-scoped per-item idempotency and duplicate reporting; batch-level provenance inheritance for SmartSentinel, Aion Edge Adapter, NiFi, and MiNiFi reconnect/backfill flows; `continue_on_error` stop/continue behavior; `aion:ReliableBatchIngested` audit events; `batches:write` token-mode protection; and focused documentation for disconnected and store-and-forward deployments, while intentionally deferring replay execution, automatic DLQ routing, flow execution, connector-aware reliable batching, and persistent batch session tables.
+- Milestone 87 flow validation and dry-run API foundation: `aion-api` now adds `POST /flows/validate`, `GET /flows/{flow_id}/validation`, `POST /flows/dry-run`, and `POST /flows/{flow_id}/dry-run`; structured graph-validation issues; simple cycle and isolation checks; connector-reference inspection when safely verifiable; recursive secret-like config redaction; tenant-aware token-mode validation and dry-run protection on `flows:read`; and planning-oriented responses that report conceptual path and sink behavior while intentionally deferring any flow execution, broker subscription, MQTT/HTTP dispatch, observation creation, command/event creation, and DLQ writes.
 
 ## Next
 
-1. Flow validation and dry-run API.
-2. Dashboard frontend skeleton.
-3. Connector and broker management UI.
-4. Flow builder UI foundation.
-5. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
-6. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
+1. Dashboard frontend skeleton.
+2. Connector and broker management UI.
+3. Flow builder UI foundation.
+4. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
+5. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
 
 ## Future
 
 - Cassandra telemetry adapter.
 - Dashboard exploration UI.
 - Node-RED-like flow editor and flow execution model.
+- deeper flow simulation and typed node-kind validation.
 - MCP time-series query tools.
 - Production MCP transport.
 - SmartSentinel runtime and agent integration.

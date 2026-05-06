@@ -1,9 +1,13 @@
 use crate::{
     auth::{
-        is_admin_all, principal_tenant_id, require_scope, require_scope_for_write,
-        tenant_for_created_resource, AuthContext,
+        is_admin_all, principal_tenant_id, principal_tenant_or_default, require_any_scope,
+        require_scope, require_scope_for_write, tenant_for_created_resource, AuthContext,
     },
     error::ApiError,
+    flow_support::{
+        analyze_flow, FlowAnalysis, FlowEdgeDraft, FlowNodeDraft, FlowNodePlan, FlowPlannedSink,
+        FlowReferencedConnector, FlowValidationIssue,
+    },
     record_event, require_same_tenant_for_target_flow, state_for_tenant, AppState, AuthMode,
     EventDraft,
 };
@@ -18,7 +22,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -26,10 +30,14 @@ use uuid::Uuid;
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/flows", post(create_flow).get(list_flows))
+        .route("/flows/validate", post(validate_proposed_flow))
+        .route("/flows/dry-run", post(dry_run_proposed_flow))
         .route(
             "/flows/:flow_id",
             get(get_flow).patch(update_flow).delete(delete_flow),
         )
+        .route("/flows/:flow_id/validation", get(validate_stored_flow))
+        .route("/flows/:flow_id/dry-run", post(dry_run_stored_flow))
         .route("/flows/:flow_id/enable", put(enable_flow))
         .route("/flows/:flow_id/disable", put(disable_flow))
 }
@@ -84,6 +92,99 @@ pub(crate) struct FlowEdgeRequest {
     pub metadata: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProposedFlowRequest {
+    pub flow_key: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub nodes: Vec<ProposedFlowNodeRequest>,
+    #[serde(default)]
+    pub edges: Vec<ProposedFlowEdgeRequest>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProposedFlowNodeRequest {
+    pub node_id: String,
+    pub node_type: String,
+    pub name: Option<String>,
+    #[serde(default = "default_json_object")]
+    pub config: Value,
+    pub position: Option<FlowNodePositionRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProposedFlowEdgeRequest {
+    pub edge_id: Option<String>,
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub label: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DryRunRequest {
+    pub flow_key: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub nodes: Vec<ProposedFlowNodeRequest>,
+    #[serde(default)]
+    pub edges: Vec<ProposedFlowEdgeRequest>,
+    pub sample_payload: Option<Value>,
+    pub payload_format: Option<String>,
+    pub source_node_id: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct StoredDryRunRequest {
+    pub sample_payload: Option<Value>,
+    pub payload_format: Option<String>,
+    pub source_node_id: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FlowValidationResponse {
+    pub flow_id: Option<Uuid>,
+    pub flow_key: Option<String>,
+    pub valid: bool,
+    pub validation_issues: Vec<FlowValidationIssue>,
+    pub node_inventory: Vec<FlowNodePlan>,
+    pub referenced_connectors: Vec<FlowReferencedConnector>,
+    pub planned_sinks: Vec<FlowPlannedSink>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FlowDryRunResponse {
+    pub execution_supported: bool,
+    pub simulated: bool,
+    pub flow_id: Option<Uuid>,
+    pub flow_key: Option<String>,
+    pub valid: bool,
+    pub validation_issues: Vec<FlowValidationIssue>,
+    pub planned_path: Vec<String>,
+    pub node_plan: Vec<FlowNodePlan>,
+    pub referenced_connectors: Vec<FlowReferencedConnector>,
+    pub planned_sinks: Vec<FlowPlannedSink>,
+    pub would_store_observation: bool,
+    pub would_publish_mqtt: bool,
+    pub would_forward_http: bool,
+    pub would_create_event: bool,
+    pub would_create_command: bool,
+    pub would_use_dlq: bool,
+    pub side_effects_performed: bool,
+    pub sample_payload_provided: bool,
+    pub payload_format: Option<String>,
+    pub source_node_id: Option<String>,
+}
+
 async fn create_flow(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -116,6 +217,66 @@ async fn create_flow(
     Ok((StatusCode::CREATED, Json(flow)))
 }
 
+async fn validate_proposed_flow(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<ProposedFlowRequest>,
+) -> Result<Json<FlowValidationResponse>, ApiError> {
+    require_any_scope(
+        &state,
+        &auth,
+        "/flows/validate",
+        &["flows:read", "flows:write"],
+    )?;
+    let tenant_id = principal_tenant_or_default(&state, &auth)?;
+    let _ = (
+        request.name.as_ref(),
+        request.description.as_ref(),
+        request.enabled,
+        request.metadata.as_ref(),
+    );
+    let analysis = analyze_flow(
+        &state_for_tenant(&state, tenant_id),
+        tenant_id,
+        &draft_nodes_from_requests(&request.nodes),
+        &draft_edges_from_requests(&request.edges),
+        None,
+    )?;
+
+    Ok(Json(validation_response(None, request.flow_key, analysis)))
+}
+
+async fn dry_run_proposed_flow(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<DryRunRequest>,
+) -> Result<Json<FlowDryRunResponse>, ApiError> {
+    require_scope(&state, &auth, "/flows/dry-run", "flows:read")?;
+    let tenant_id = principal_tenant_or_default(&state, &auth)?;
+    let _ = (
+        request.name.as_ref(),
+        request.description.as_ref(),
+        request.enabled,
+        request.metadata.as_ref(),
+    );
+    let analysis = analyze_flow(
+        &state_for_tenant(&state, tenant_id),
+        tenant_id,
+        &draft_nodes_from_requests(&request.nodes),
+        &draft_edges_from_requests(&request.edges),
+        request.source_node_id.as_deref(),
+    )?;
+
+    Ok(Json(dry_run_response(
+        None,
+        request.flow_key,
+        request.sample_payload.is_some(),
+        request.payload_format,
+        request.source_node_id,
+        analysis,
+    )))
+}
+
 async fn list_flows(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -139,38 +300,61 @@ async fn get_flow(
     Path(flow_id): Path<Uuid>,
 ) -> Result<Json<Flow>, ApiError> {
     require_scope(&state, &auth, "/flows/:flow_id", "flows:read")?;
+    Ok(Json(resolve_flow_for_read(
+        &state,
+        &auth,
+        "/flows/:flow_id",
+        flow_id,
+    )?))
+}
 
-    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
-        return Ok(Json(
-            state
-                .storage
-                .get_flow(state.tenant_id, flow_id)?
-                .ok_or_else(ApiError::not_found)?,
-        ));
-    }
+async fn validate_stored_flow(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(flow_id): Path<Uuid>,
+) -> Result<Json<FlowValidationResponse>, ApiError> {
+    require_scope(&state, &auth, "/flows/:flow_id/validation", "flows:read")?;
+    let flow = resolve_flow_for_read(&state, &auth, "/flows/:flow_id/validation", flow_id)?;
+    let analysis = analyze_flow(
+        &state_for_tenant(&state, flow.tenant_id),
+        flow.tenant_id,
+        &draft_nodes_from_flow(&flow),
+        &draft_edges_from_flow(&flow),
+        None,
+    )?;
 
-    if is_admin_all(&auth) {
-        return Ok(Json(
-            state
-                .storage
-                .get_flow_any_tenant(flow_id)?
-                .ok_or_else(ApiError::not_found)?,
-        ));
-    }
+    Ok(Json(validation_response(
+        Some(flow.id),
+        Some(flow.flow_key),
+        analysis,
+    )))
+}
 
-    let tenant_id = principal_tenant_id(&auth)?;
-    match state.storage.get_flow(tenant_id, flow_id)? {
-        Some(flow) => Ok(Json(flow)),
-        None => {
-            if state.storage.get_flow_any_tenant(flow_id)?.is_some() {
-                Err(ApiError::forbidden(
-                    "principal tenant does not own the resource for /flows/:flow_id",
-                ))
-            } else {
-                Err(ApiError::not_found())
-            }
-        }
-    }
+async fn dry_run_stored_flow(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(flow_id): Path<Uuid>,
+    Json(request): Json<StoredDryRunRequest>,
+) -> Result<Json<FlowDryRunResponse>, ApiError> {
+    require_scope(&state, &auth, "/flows/:flow_id/dry-run", "flows:read")?;
+    let flow = resolve_flow_for_read(&state, &auth, "/flows/:flow_id/dry-run", flow_id)?;
+    let _ = request.metadata.as_ref();
+    let analysis = analyze_flow(
+        &state_for_tenant(&state, flow.tenant_id),
+        flow.tenant_id,
+        &draft_nodes_from_flow(&flow),
+        &draft_edges_from_flow(&flow),
+        request.source_node_id.as_deref(),
+    )?;
+
+    Ok(Json(dry_run_response(
+        Some(flow.id),
+        Some(flow.flow_key),
+        request.sample_payload.is_some(),
+        request.payload_format,
+        request.source_node_id,
+        analysis,
+    )))
 }
 
 async fn update_flow(
@@ -326,6 +510,153 @@ fn build_flow_edges(edges: Vec<FlowEdgeRequest>) -> Vec<FlowEdge> {
         .collect()
 }
 
+fn draft_nodes_from_requests(nodes: &[ProposedFlowNodeRequest]) -> Vec<FlowNodeDraft> {
+    nodes
+        .iter()
+        .map(|node| {
+            let _ = &node.position;
+            FlowNodeDraft {
+                node_id: node.node_id.clone(),
+                node_type: node.node_type.clone(),
+                name: node.name.clone(),
+                config: node.config.clone(),
+            }
+        })
+        .collect()
+}
+
+fn draft_edges_from_requests(edges: &[ProposedFlowEdgeRequest]) -> Vec<FlowEdgeDraft> {
+    edges
+        .iter()
+        .map(|edge| {
+            let _ = (&edge.label, &edge.metadata);
+            FlowEdgeDraft {
+                edge_id: edge.edge_id.clone(),
+                source_node_id: edge.source_node_id.clone(),
+                target_node_id: edge.target_node_id.clone(),
+            }
+        })
+        .collect()
+}
+
+fn draft_nodes_from_flow(flow: &Flow) -> Vec<FlowNodeDraft> {
+    flow.nodes
+        .iter()
+        .map(|node| FlowNodeDraft {
+            node_id: node.node_id.clone(),
+            node_type: flow_node_type_name(&node.node_type).to_string(),
+            name: node.name.clone(),
+            config: node.config.clone(),
+        })
+        .collect()
+}
+
+fn draft_edges_from_flow(flow: &Flow) -> Vec<FlowEdgeDraft> {
+    flow.edges
+        .iter()
+        .map(|edge| FlowEdgeDraft {
+            edge_id: Some(edge.edge_id.clone()),
+            source_node_id: edge.source_node_id.clone(),
+            target_node_id: edge.target_node_id.clone(),
+        })
+        .collect()
+}
+
+fn flow_node_type_name(node_type: &FlowNodeType) -> &'static str {
+    match node_type {
+        FlowNodeType::Source => "source",
+        FlowNodeType::Decoder => "decoder",
+        FlowNodeType::Transform => "transform",
+        FlowNodeType::Filter => "filter",
+        FlowNodeType::Rule => "rule",
+        FlowNodeType::Sink => "sink",
+        FlowNodeType::Dlq => "dlq",
+    }
+}
+
+fn validation_response(
+    flow_id: Option<Uuid>,
+    flow_key: Option<String>,
+    analysis: FlowAnalysis,
+) -> FlowValidationResponse {
+    FlowValidationResponse {
+        flow_id,
+        flow_key,
+        valid: analysis.valid,
+        validation_issues: analysis.validation_issues,
+        node_inventory: analysis.node_plan,
+        referenced_connectors: analysis.referenced_connectors,
+        planned_sinks: analysis.planned_sinks,
+    }
+}
+
+fn dry_run_response(
+    flow_id: Option<Uuid>,
+    flow_key: Option<String>,
+    sample_payload_provided: bool,
+    payload_format: Option<String>,
+    source_node_id: Option<String>,
+    analysis: FlowAnalysis,
+) -> FlowDryRunResponse {
+    FlowDryRunResponse {
+        execution_supported: false,
+        simulated: true,
+        flow_id,
+        flow_key,
+        valid: analysis.valid,
+        validation_issues: analysis.validation_issues,
+        planned_path: analysis.planned_path,
+        node_plan: analysis.node_plan,
+        referenced_connectors: analysis.referenced_connectors,
+        planned_sinks: analysis.planned_sinks,
+        would_store_observation: analysis.would_store_observation,
+        would_publish_mqtt: analysis.would_publish_mqtt,
+        would_forward_http: analysis.would_forward_http,
+        would_create_event: analysis.would_create_event,
+        would_create_command: analysis.would_create_command,
+        would_use_dlq: analysis.would_use_dlq,
+        side_effects_performed: false,
+        sample_payload_provided,
+        payload_format,
+        source_node_id,
+    }
+}
+
+fn resolve_flow_for_read(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    flow_id: Uuid,
+) -> Result<Flow, ApiError> {
+    if matches!(auth.mode, AuthMode::Dev | AuthMode::Disabled) {
+        return state
+            .storage
+            .get_flow(state.tenant_id, flow_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    if is_admin_all(auth) {
+        return state
+            .storage
+            .get_flow_any_tenant(flow_id)?
+            .ok_or_else(ApiError::not_found);
+    }
+
+    let tenant_id = principal_tenant_id(auth)?;
+    match state.storage.get_flow(tenant_id, flow_id)? {
+        Some(flow) => Ok(flow),
+        None => {
+            if state.storage.get_flow_any_tenant(flow_id)?.is_some() {
+                Err(ApiError::forbidden(format!(
+                    "principal tenant does not own the resource for {endpoint}"
+                )))
+            } else {
+                Err(ApiError::not_found())
+            }
+        }
+    }
+}
+
 fn map_flow_error(error: FlowError) -> ApiError {
     ApiError::bad_request(error.to_string())
 }
@@ -361,4 +692,8 @@ fn record_flow_event(
         },
     )?;
     Ok(())
+}
+
+fn default_json_object() -> Value {
+    Value::Object(Default::default())
 }

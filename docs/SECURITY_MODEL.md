@@ -31,7 +31,7 @@ Milestone 60 adds selected tenant-aware write authorization on top of the Milest
   - `/observations` requires `observations:read`
   - `POST /observations` requires `observations:write`
   - `/dashboard/overview`, `/dashboard/timeseries/entities`, and `/dashboard/connectors/overview` require `dashboard:read`
-  - `/flows` and `/flows/{flow_id}` require `flows:read`
+  - `/flows`, `/flows/{flow_id}`, `/flows/validate`, `/flows/dry-run`, `/flows/{flow_id}/validation`, and `/flows/{flow_id}/dry-run` require `flows:read` except `POST /flows/validate`, which also accepts `flows:write`
   - `POST /flows`, `PATCH /flows/{flow_id}`, `PUT /flows/{flow_id}/enable`, `PUT /flows/{flow_id}/disable`, and `DELETE /flows/{flow_id}` require `flows:write`
   - `/commands` and `/commands/{command_id}` require `commands:read`
   - selected generic command writes require `commands:create`, `commands:approve`, `commands:write`, `commands:claim`, or `commands:lease`
@@ -378,7 +378,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `connectors:admin` covers connector lifecycle mutation, TTN device-mapping administration, worker reconciliation, TTN live validation preflight, validation-related operator actions, enable/disable, and configuration updates.
 - `dashboard:read` covers read-only dashboard aggregation routes that summarize entities, time-series discovery, connectors, brokers, and worker health.
 - `dlq:read` covers DLQ list and detail inspection.
-- `flows:read` covers flow list and detail inspection.
+- `flows:read` covers flow list and detail inspection plus validation and dry-run inspection.
 - `flows:write` covers flow creation, update, enable, disable, and deletion.
 - `provenance:read` covers provenance-oriented aggregate search and future provenance-heavy operational APIs.
 - `events:read` covers `/events` list and detail reads without broadening command, observation, or provenance access.
@@ -534,7 +534,7 @@ The table below describes the intended future protection model. It does not chan
 | `/observations` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `observations:read` for GET, `observations:write` for POST | Direct write path should remain limited; most machine writers should prefer ingestion endpoints. |
 | `/dashboard/*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `dashboard:read` | Implemented in Milestone 81 for read-only dashboard aggregation and discovery routes. Non-admin principals remain tenant-filtered. |
 | `/dlq/records*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal`, NiFi or MiNiFi-style machine principals | `dlq:read` for GET and `dlq:write` for POST and PATCH | Implemented in Milestone 84 as DLQ storage and API foundation only. Non-admin principals remain tenant-filtered. No replay execution exists yet. |
-| `/flows*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `flows:read` for GET, `flows:write` for create, update, enable, disable, and delete | Implemented in Milestone 82 as storage and API foundation only. No visual editor or runtime execution exists yet. |
+| `/flows*` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `flows:read` for GET plus validation and dry-run inspection, `flows:write` for create, update, enable, disable, and delete | Implemented in Milestones 82 and 87 as storage, validation, and planning foundation only. No visual editor or runtime execution exists yet. |
 | `/raw-messages` | `UserPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `raw-messages:read` | Implemented in Milestone 55 for list and detail reads. Sensitive because raw payloads and headers may include operational metadata. |
 | `/ingest/http` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Primary generic ingestion write surface. |
 | `/ingest/reliable` | `DevicePrincipal`, `ConnectorPrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in development or tooling cases | `ingestion:write` | Reliable generic ingestion write surface with tenant-scoped idempotency behavior and preserved upstream provenance metadata. |
@@ -641,6 +641,7 @@ The table below describes the intended future protection model. It does not chan
 - Selected protected routes in this milestone return:
   - `401` for missing or invalid bearer tokens
   - `403` for valid authenticated principals missing the required scope
+- Stored flow validation and dry-run also return `403` for known cross-tenant access in `token` mode unless `admin:all` is present.
 - Selected protected routes also emit:
   - `aion:AuthTokenAccepted`
   - `aion:AuthAccessDenied`

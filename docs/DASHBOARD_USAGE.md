@@ -123,3 +123,10 @@ Token-mode behavior:
 - non-admin principals: limited to dashboard data owned by the principal tenant
 
 The overview response now also includes flow and DLQ inventory counts. It still does not render or execute flows and does not provide a dashboard UI yet.
+
+Future dashboard and flow-builder work should use the dedicated flow read-only planning endpoints rather than trying to infer usability from `/flows` alone:
+
+- `GET /flows/{flow_id}/validation`
+- `POST /flows/{flow_id}/dry-run`
+
+Those endpoints are additive and do not execute flows.
