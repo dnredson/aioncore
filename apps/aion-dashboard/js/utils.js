@@ -277,15 +277,41 @@ export function renderKeyValueBlock(items, allowHtml = false) {
 }
 
 export function safeBrokerUrl(value) {
+  return safeUrlLikeValue(value);
+}
+
+export function safeUrlLikeValue(value) {
   if (!value) {
     return value;
   }
   const trimmed = String(value).trim();
-  const match = trimmed.match(/^([a-z]+:\/\/)([^@/]+@)(.+)$/i);
-  if (match) {
-    return `${match[1]}***REDACTED***@${match[3]}`;
+  const withoutUserInfo = trimmed.replace(/^([a-z]+:\/\/)([^@/]+@)(.+)$/i, "$1***REDACTED***@$3");
+  const queryIndex = withoutUserInfo.indexOf("?");
+  if (queryIndex < 0) {
+    return withoutUserInfo;
   }
-  return trimmed;
+  const path = withoutUserInfo.slice(0, queryIndex);
+  const suffix = withoutUserInfo.slice(queryIndex + 1);
+  const hashIndex = suffix.indexOf("#");
+  const query = hashIndex >= 0 ? suffix.slice(0, hashIndex) : suffix;
+  const hash = hashIndex >= 0 ? suffix.slice(hashIndex) : "";
+  const redactedQuery = query.split("&").map((part) => {
+    if (!part) {
+      return part;
+    }
+    const [rawKey, ...rest] = part.split("=");
+    const key = rawKey || "";
+    const normalized = key.toLowerCase();
+    if (SECRET_LIKE_KEYS.has(normalized)
+      || normalized.endsWith("_token")
+      || normalized.endsWith("_secret")
+      || normalized.endsWith("_key")
+      || normalized.includes("credential")) {
+      return `${key}=***REDACTED***`;
+    }
+    return [key].concat(rest).join("=");
+  }).join("&");
+  return `${path}?${redactedQuery}${hash}`;
 }
 
 export function redactSecrets(value, parentKey = "") {
@@ -298,6 +324,9 @@ export function redactSecrets(value, parentKey = "") {
       if (normalized === "broker_url" && typeof childValue === "string") {
         return [key, safeBrokerUrl(childValue)];
       }
+      if ((normalized === "endpoint_url" || normalized === "url" || normalized.endsWith("_url")) && typeof childValue === "string") {
+        return [key, safeUrlLikeValue(childValue)];
+      }
       if (SECRET_LIKE_KEYS.has(normalized) || normalized.endsWith("_token") || normalized.endsWith("_secret")) {
         return [key, "***REDACTED***"];
       }
@@ -306,6 +335,9 @@ export function redactSecrets(value, parentKey = "") {
   }
   if (typeof value === "string" && parentKey.toLowerCase() === "broker_url") {
     return safeBrokerUrl(value);
+  }
+  if (typeof value === "string" && (parentKey.toLowerCase() === "endpoint_url" || parentKey.toLowerCase() === "url" || parentKey.toLowerCase().endsWith("_url"))) {
+    return safeUrlLikeValue(value);
   }
   return value;
 }

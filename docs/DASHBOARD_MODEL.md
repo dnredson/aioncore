@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, 94, 95, and 96 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, optional static hosting through `aion-api`, the first read-only visual flow graph layer, and constrained visual editing for proposed linear drafts only so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
+The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, and 97 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, optional static hosting through `aion-api`, the first read-only visual flow graph layer, constrained visual editing for proposed linear drafts only, and typed node inspectors for known draft node kinds so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
 
 ## Current Intent
 
@@ -14,6 +14,7 @@ The AionCore dashboard is currently a static operational surface served from `ap
 - Keep the frontend split into browser-native modules before introducing runtime-heavy features.
 - Add a Node-RED-like inspection and preview layer before any drag-and-drop or execution surface exists.
 - Add constrained visual draft editing for known safe linear flow patterns before any arbitrary graph editor exists.
+- Add typed node inspectors for known safe flow node kinds before any runtime execution exists.
 - Preserve Grafana as a valid future option for advanced charting and long-range analytics.
 
 ## Current Read Surface
@@ -116,6 +117,7 @@ It currently provides:
 - a guided source -> constrained middle chain -> sink or dlq builder that generates a flow definition with linear edges
 - a dependency-free SVG visual graph panel for the current builder draft and stored flow detail
 - constrained builder-draft editing for selected nodes and linear chain order only
+- typed inspectors for `mqtt_subscribe`, `http_input`, `ttn_uplink`, `internal_observation`, `senml_decode`, `ultralight_decode`, `canonical_json`, `json_map`, `filter_condition`, `threshold_rule`, `internal_observation_store`, `raw_message_store`, `mqtt_publish`, `http_forward`, `event_create`, `command_create`, and `dlq`
 - click-to-select node detail panels that show redacted config JSON and node-scoped issues when available
 - proposed-flow validation from `POST /flows/validate`
 - proposed-flow dry-run planning from `POST /flows/dry-run`
@@ -145,6 +147,7 @@ Milestone 90 keeps several safety boundaries:
 - no secret value persistence in browser storage
 - redaction of secret-like fields in JSON previews
 - redaction of secret-like fields in flow preview JSON and stored flow details
+- redaction of secret-like URL and token fragments in typed inspector fields
 - no automatic TTN live validation
 - no flow execution
 - no drag-and-drop flow editing
@@ -166,6 +169,7 @@ The following are still explicitly out of scope for the current dashboard phase:
 - drag-and-drop flow editor
 - arbitrary graph editing
 - arbitrary stored-flow graph mutation
+- arbitrary node-kind-specific runtime configuration beyond the typed planning inspectors
 - graph panning or zooming
 - flow execution
 - broker subscription changes outside connector config

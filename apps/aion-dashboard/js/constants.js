@@ -12,7 +12,6 @@ export const DEFAULT_FLOW_SAMPLE_PAYLOAD = '{\n  "temperature": 21.4\n}';
 
 export const FLOW_SOURCE_KINDS_WITH_CONNECTOR = new Set([
   "mqtt_subscribe",
-  "http_input",
   "ttn_uplink",
 ]);
 

@@ -144,6 +144,7 @@ Validation is read-only. It does not enable, execute, publish, write observation
 
 The static dashboard Flow Builder uses this endpoint before create and shows structured issue detail without auto-saving.
 The visual graph layer can also show node-level validation markers when returned issues include `node_id`.
+Milestone 97 also lets the constrained builder write known node config fields through typed inspectors before the flow is saved.
 
 ## Dry-Run
 
@@ -180,6 +181,7 @@ Dry-run does not execute the flow or perform any side effects.
 
 The static dashboard Flow Builder uses this endpoint for both proposed drafts and stored flows. It surfaces planning fields such as `planned_path`, `planned_sinks`, `referenced_connectors`, and the conceptual sink flags while keeping `execution_supported = false`.
 Milestone 95 also lets the static dashboard highlight conceptual sink nodes in its graph layer when these flags are present.
+Milestone 97 keeps that same API usage but improves the draft authoring surface with typed inspectors for known source, middle-node, sink, and DLQ kinds.
 
 ## List And Get
 
@@ -261,6 +263,7 @@ Milestone 92 adds a form-based builder in `apps/aion-dashboard/` that consumes t
 It supports:
 
 - guided source -> zero or more constrained middle nodes -> sink or dlq draft creation
+- typed node inspectors for known constrained-builder node kinds
 - redacted preview JSON
 - constrained SVG graph editing for the current draft
 - read-only SVG graph preview for the selected stored flow

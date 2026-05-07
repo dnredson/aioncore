@@ -19,6 +19,7 @@ import {
   redactSecrets,
   renderDetailItem,
   requireNonEmpty,
+  safeUrlLikeValue,
   setStatus,
   validationBadgeTone,
   withGeneratedAt,
@@ -92,6 +93,90 @@ const SINK_KIND_OPTIONS = [
 const DLQ_KIND_OPTIONS = [
   "dlq",
 ];
+
+const FLOW_PAYLOAD_FORMAT_OPTIONS = [
+  "",
+  "senml-json",
+  "ultralight",
+  "canonical-json",
+  "application/json",
+  "ttn-uplink-json",
+];
+
+const FLOW_FILTER_OPERATORS = [
+  "eq",
+  "neq",
+  "gt",
+  "gte",
+  "lt",
+  "lte",
+  "contains",
+  "exists",
+];
+
+const FLOW_HTTP_METHOD_OPTIONS = [
+  "POST",
+  "PUT",
+  "PATCH",
+];
+
+const FLOW_EVENT_SEVERITY_OPTIONS = [
+  "info",
+  "warning",
+  "error",
+  "critical",
+];
+
+const FLOW_DLQ_FAILURE_STAGES = [
+  "ingestion",
+  "decoding",
+  "validation",
+  "mapping",
+  "rule_evaluation",
+  "flow_processing",
+  "sink_delivery",
+  "command_creation",
+  "unknown",
+];
+
+const INSPECTOR_MANAGED_CONFIG_KEYS = new Set([
+  "kind",
+  "connector_id",
+  "topic_filter",
+  "payload_format",
+  "notes",
+  "path_hint",
+  "entity_id",
+  "observed_property",
+  "unit_strategy",
+  "payload_profile_id",
+  "payload_profile_key",
+  "mapping_hint",
+  "mapping",
+  "field",
+  "operator",
+  "value",
+  "rule_key",
+  "condition",
+  "action_hint",
+  "feature_of_interest_id",
+  "unit",
+  "label",
+  "topic_template",
+  "endpoint_url",
+  "method",
+  "event_type",
+  "severity",
+  "command_type",
+  "target_entity_id",
+  "failure_stage",
+  "failure_reason",
+]);
+
+const JSON_INSPECTOR_FIELDS = new Set([
+  "mapping",
+  "condition",
+]);
 
 const EDITABLE_CHAIN_NODE_TYPES = new Set(["decoder", "transform", "filter", "rule"]);
 const STORED_COPY_ALLOWED_NODE_TYPES = new Set(["source", "decoder", "transform", "filter", "rule", "sink", "dlq"]);
@@ -186,6 +271,10 @@ export function bindFlowEvents() {
 
   document.getElementById("flow-add-transform-button").addEventListener("click", () => {
     addDraftChainNode("transform");
+  });
+
+  document.getElementById("flow-add-decoder-button").addEventListener("click", () => {
+    addDraftChainNode("decoder");
   });
 
   document.getElementById("flow-add-filter-button").addEventListener("click", () => {
@@ -499,13 +588,23 @@ function applyFormFieldsToDraft(draft) {
   sourceNode.node_id = requireNonEmpty(form.elements.source_node_id.value, "Source node ID");
   sourceNode.name = cleanString(form.elements.source_name.value) || undefined;
   sourceNode.node_type = "source";
-  sourceNode.config = buildNodeConfig("source", requireNonEmpty(form.elements.source_kind.value, "Source kind"), cleanString(form.elements.source_connector_id.value));
+  sourceNode.config = buildNodeConfig(
+    "source",
+    requireNonEmpty(form.elements.source_kind.value, "Source kind"),
+    cleanString(form.elements.source_connector_id.value),
+    sourceNode.config,
+  );
 
   terminalNode.node_id = requireNonEmpty(form.elements.sink_node_id.value, "Sink node ID");
   terminalNode.name = cleanString(form.elements.sink_name.value) || undefined;
   const sinkKind = requireNonEmpty(form.elements.sink_kind.value, "Sink kind");
   terminalNode.node_type = sinkKind === "dlq" ? "dlq" : "sink";
-  terminalNode.config = buildNodeConfig(terminalNode.node_type, sinkKind, cleanString(form.elements.sink_connector_id.value));
+  terminalNode.config = buildNodeConfig(
+    terminalNode.node_type,
+    sinkKind,
+    cleanString(form.elements.sink_connector_id.value),
+    terminalNode.config,
+  );
 
   return next;
 }
@@ -541,15 +640,89 @@ function renderFlowBuilderFormFromDraft() {
   syncFlowConnectorFieldState();
 }
 
-function buildNodeConfig(nodeType, kind, connectorId) {
-  const config = { kind };
+function buildNodeConfig(nodeType, kind, connectorId, existingConfig = {}) {
+  const config = normalizeInspectorConfig(nodeType, kind, existingConfig);
   if (nodeType === "source" && FLOW_SOURCE_KINDS_WITH_CONNECTOR.has(kind) && connectorId) {
     config.connector_id = connectorId;
   }
   if ((nodeType === "sink" || nodeType === "dlq") && FLOW_SINK_KINDS_WITH_CONNECTOR.has(kind) && connectorId) {
     config.connector_id = connectorId;
   }
+  if ((nodeType !== "source" || !FLOW_SOURCE_KINDS_WITH_CONNECTOR.has(kind))
+    && (nodeType !== "sink" && nodeType !== "dlq" || !FLOW_SINK_KINDS_WITH_CONNECTOR.has(kind))) {
+    delete config.connector_id;
+  }
   return config;
+}
+
+function normalizeInspectorConfig(nodeType, kind, existingConfig = {}) {
+  const previousKind = cleanString(existingConfig?.kind);
+  const base = previousKind && previousKind !== kind
+    ? Object.fromEntries(Object.entries(existingConfig || {}).filter(([key]) => !INSPECTOR_MANAGED_CONFIG_KEYS.has(key)))
+    : cloneJson(existingConfig || {}) || {};
+  const next = { ...base, kind };
+
+  if (FLOW_SOURCE_KINDS_WITH_CONNECTOR.has(kind) || FLOW_SINK_KINDS_WITH_CONNECTOR.has(kind)) {
+    const connectorId = cleanString(existingConfig?.connector_id);
+    if (connectorId) {
+      next.connector_id = connectorId;
+    }
+  }
+
+  if (kind === "ttn_uplink") {
+    next.payload_format = cleanString(existingConfig?.payload_format) || "ttn-uplink-json";
+  }
+  if (kind === "filter_condition") {
+    next.operator = cleanString(existingConfig?.operator) || "eq";
+  }
+  if (kind === "http_forward") {
+    next.method = cleanString(existingConfig?.method) || "POST";
+  }
+  if (kind === "event_create") {
+    next.severity = cleanString(existingConfig?.severity) || "info";
+  }
+  if (kind === "dlq") {
+    next.failure_stage = cleanString(existingConfig?.failure_stage) || "unknown";
+  }
+  if (nodeType === "decoder" && kind === "senml_decode" && cleanString(existingConfig?.unit_strategy)) {
+    next.unit_strategy = cleanString(existingConfig.unit_strategy);
+  }
+  if (nodeType === "transform" && kind === "canonical_json" && cleanString(existingConfig?.mapping_hint)) {
+    next.mapping_hint = cleanString(existingConfig.mapping_hint);
+  }
+  return next;
+}
+
+function updateNodeConfigField(config, field, value, options = {}) {
+  const { allowObject = false } = options;
+  if (allowObject) {
+    if (value === undefined) {
+      delete config[field];
+    } else {
+      config[field] = value;
+    }
+    return;
+  }
+
+  const cleaned = cleanString(value);
+  if (!cleaned) {
+    delete config[field];
+    return;
+  }
+  config[field] = cleaned;
+}
+
+function renderSelectOptions(options, selectedValue = "") {
+  return options.map((value) => `
+    <option value="${escapeHtml(value)}"${String(value) === String(selectedValue) ? " selected" : ""}>${escapeHtml(value || "None")}</option>
+  `).join("");
+}
+
+function formatConfigJsonForTextarea(value) {
+  if (value === undefined) {
+    return "";
+  }
+  return JSON.stringify(redactSecrets(value), null, 2);
 }
 
 function getEffectiveFlowDraft() {
@@ -807,6 +980,7 @@ function renderFlowDetail(data) {
     validateButton.disabled = true;
     dryRunButton.disabled = true;
     copyButton.disabled = true;
+    copyButton.title = "";
     enableButton.disabled = true;
     disableButton.disabled = true;
     deleteButton.disabled = true;
@@ -819,6 +993,7 @@ function renderFlowDetail(data) {
   validateButton.disabled = false;
   dryRunButton.disabled = false;
   copyButton.disabled = false;
+  copyButton.title = analyzeStoredFlowCopyability(data).message;
   enableButton.disabled = Boolean(data.flow.enabled);
   disableButton.disabled = !data.flow.enabled;
   deleteButton.disabled = false;
@@ -1104,12 +1279,19 @@ function renderEditableDraftNode(node, issueMaps, dryRun) {
           </select>
         </label>
         <label>
-          <span>Connector</span>
+          <span>Connector ID</span>
           <select id="flow-draft-node-connector" ${showConnector ? "" : "disabled"}>
             ${connectorOptions}
           </select>
         </label>
       </div>
+      <section class="typed-inspector-panel">
+        <div class="panel-heading compact">
+          <h4>Typed Inspector</h4>
+        </div>
+        ${renderTypedInspectorSection(node)}
+        <div id="flow-draft-node-json-error" class="flow-node-editor-error hidden" aria-live="polite"></div>
+      </section>
       <div class="flow-node-editor-actions">
         <button class="button subtle" type="button" id="flow-draft-node-move-up"${canMoveUp ? "" : " disabled"}>Move Up</button>
         <button class="button subtle" type="button" id="flow-draft-node-move-down"${canMoveDown ? "" : " disabled"}>Move Down</button>
@@ -1125,6 +1307,192 @@ function renderEditableDraftNode(node, issueMaps, dryRun) {
         ${renderIssueList(nodeIssues, "No node-specific validation issues.")}
       </div>
     </div>
+  `;
+}
+
+function renderTypedInspectorSection(node) {
+  const kind = cleanString(node?.config?.kind);
+  const config = node?.config || {};
+
+  if (node.node_type === "source") {
+    if (kind === "mqtt_subscribe") {
+      return renderTypedInspectorBlock(`
+        ${renderPayloadFormatField(config.payload_format)}
+        ${renderTextField("topic_filter", "Topic Filter", config.topic_filter, "devices/+/up")}
+      `, "Declarative source only. Saving this flow does not start an MQTT subscription yet.");
+    }
+    if (kind === "http_input") {
+      return renderTypedInspectorBlock(`
+        ${renderPayloadFormatField(config.payload_format)}
+        ${renderTextField("path_hint", "Path Hint", config.path_hint, "/ingest/demo")}
+      `, "HTTP runtime execution remains future work. This only captures intended source semantics.");
+    }
+    if (kind === "ttn_uplink") {
+      return renderTypedInspectorBlock(`
+        ${renderReadonlyField("payload_format_hint", "Payload Format Hint", cleanString(config.payload_format) || "ttn-uplink-json")}
+      `, "TTN connector mappings are configured elsewhere. This builder only records the planned flow source.");
+    }
+    if (kind === "internal_observation") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("entity_id", "Entity ID", config.entity_id, "Optional entity or feature id")}
+        ${renderTextField("observed_property", "Observed Property", config.observed_property, "temperature")}
+      `, "Internal observation source semantics are future work. No internal source execution is implemented.");
+    }
+  }
+
+  if (node.node_type === "decoder") {
+    if (kind === "senml_decode") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("unit_strategy", "Unit Strategy", config.unit_strategy, "Optional unit handling hint")}
+      `, "No required fields. This decoder remains declarative until flow execution exists.");
+    }
+    if (kind === "ultralight_decode") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("payload_profile_id", "Payload Profile ID", config.payload_profile_id, "Optional profile id")}
+        ${renderTextField("payload_profile_key", "Payload Profile Key", config.payload_profile_key, "Optional profile key")}
+      `, "Payload profiles are configured on entities. This node only records which profile hint the future runtime should use.");
+    }
+  }
+
+  if (node.node_type === "transform") {
+    if (kind === "canonical_json") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("mapping_hint", "Mapping Hint", config.mapping_hint, "Optional canonical mapping hint")}
+      `, "No required fields. Canonical JSON interpretation remains planning-only.");
+    }
+    if (kind === "json_map") {
+      return renderTypedInspectorBlock(`
+        ${renderJsonField("mapping", "Mapping JSON", config.mapping, '{"observed_property":"temperature"}')}
+      `, "Mapping JSON must parse before it is written into node config.");
+    }
+  }
+
+  if (node.node_type === "filter" && kind === "filter_condition") {
+    return renderTypedInspectorBlock(`
+      ${renderTextField("field", "Field", config.field, "temperature")}
+      ${renderSelectField("operator", "Operator", FLOW_FILTER_OPERATORS, cleanString(config.operator) || "eq")}
+      ${renderTextField("value", "Value", config.value, "30")}
+    `, "Declarative filter only. It is validated and previewed, but not executed yet.");
+  }
+
+  if (node.node_type === "rule" && kind === "threshold_rule") {
+    return renderTypedInspectorBlock(`
+      ${renderTextField("rule_key", "Rule Key", config.rule_key, "Optional rule key")}
+      ${renderJsonField("condition", "Condition JSON", config.condition, '{"field":"temperature","operator":"gt","value":30}')}
+      ${renderTextField("action_hint", "Action Hint", config.action_hint, "Optional future action hint")}
+    `, "Rule execution is future work. This node only documents intended condition and action planning.");
+  }
+
+  if (node.node_type === "sink" || node.node_type === "dlq") {
+    if (kind === "internal_observation_store") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("feature_of_interest_id", "Feature Of Interest ID", config.feature_of_interest_id, "Optional UUID or entity id")}
+        ${renderTextField("observed_property", "Observed Property", config.observed_property, "temperature")}
+        ${renderTextField("unit", "Unit", config.unit, "Cel")}
+      `, "This sink remains declarative only. It does not create observations from UI actions.");
+    }
+    if (kind === "raw_message_store") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("label", "Label", config.label, "Optional storage label")}
+      `, "No required fields. The UI only stores the sink definition.");
+    }
+    if (kind === "mqtt_publish") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("topic_template", "Topic Template", config.topic_template, "alerts/{device_id}")}
+      `, "MQTT publish execution is not implemented yet. This node is planning metadata only.");
+    }
+    if (kind === "http_forward") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("endpoint_url", "Endpoint URL", safeUrlLikeValue(config.endpoint_url), "https://example.invalid/hooks/aion")}
+        ${renderSelectField("method", "Method", FLOW_HTTP_METHOD_OPTIONS, cleanString(config.method) || "POST")}
+      `, "HTTP forward execution is not implemented yet. Secret-like URL values stay redacted in this inspector and preview.");
+    }
+    if (kind === "event_create") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("event_type", "Event Type", config.event_type, "aion:FlowAlert")}
+        ${renderSelectField("severity", "Severity", FLOW_EVENT_SEVERITY_OPTIONS, cleanString(config.severity) || "info")}
+      `, "Event creation is deferred. This sink only records intended event semantics.");
+    }
+    if (kind === "command_create") {
+      return renderTypedInspectorBlock(`
+        ${renderTextField("command_type", "Command Type", config.command_type, "StartPump")}
+        ${renderTextField("target_entity_id", "Target Entity ID", config.target_entity_id, "Optional target entity id")}
+      `, "Command creation is deferred. No command records are created from dashboard actions.");
+    }
+    if (kind === "dlq") {
+      return renderTypedInspectorBlock(`
+        ${renderSelectField("failure_stage", "Failure Stage", FLOW_DLQ_FAILURE_STAGES, cleanString(config.failure_stage) || "unknown")}
+        ${renderTextField("failure_reason", "Failure Reason", config.failure_reason, "Optional planning reason")}
+      `, "DLQ routing is future work. This node only captures intended failure-stage semantics.");
+    }
+  }
+
+  return renderTypedInspectorBlock("", "No typed inspector is defined for this node kind yet. The redacted JSON preview remains available.");
+}
+
+function renderTypedInspectorBlock(fieldsHtml, helpText) {
+  return `
+    <div class="flow-node-editor-grid">
+      ${fieldsHtml || '<p class="flow-node-editor-note">No typed fields for this node kind.</p>'}
+    </div>
+    <p class="flow-node-editor-note">${escapeHtml(helpText)}</p>
+  `;
+}
+
+function renderTextField(field, label, value, placeholder = "") {
+  return `
+    <label>
+      <span>${escapeHtml(label)}</span>
+      <input
+        type="text"
+        data-node-config-field="${escapeHtml(field)}"
+        value="${escapeHtml(value || "")}"
+        placeholder="${escapeHtml(placeholder)}"
+      >
+    </label>
+  `;
+}
+
+function renderReadonlyField(field, label, value) {
+  return `
+    <label>
+      <span>${escapeHtml(label)}</span>
+      <input
+        type="text"
+        data-node-config-field="${escapeHtml(field)}"
+        value="${escapeHtml(value || "")}"
+        disabled
+      >
+    </label>
+  `;
+}
+
+function renderSelectField(field, label, options, selectedValue) {
+  return `
+    <label>
+      <span>${escapeHtml(label)}</span>
+      <select data-node-config-field="${escapeHtml(field)}">
+        ${renderSelectOptions(options, selectedValue)}
+      </select>
+    </label>
+  `;
+}
+
+function renderPayloadFormatField(value) {
+  return renderSelectField("payload_format", "Payload Format", FLOW_PAYLOAD_FORMAT_OPTIONS, cleanString(value));
+}
+
+function renderJsonField(field, label, value, placeholder = "") {
+  return `
+    <label class="full-span">
+      <span>${escapeHtml(label)}</span>
+      <textarea
+        rows="8"
+        data-node-config-field="${escapeHtml(field)}"
+        data-json-field="true"
+        placeholder="${escapeHtml(placeholder)}"
+      >${escapeHtml(formatConfigJsonForTextarea(value))}</textarea>
+    </label>
   `;
 }
 
@@ -1148,7 +1516,7 @@ function bindEditableDraftNodeEvents(nodeId) {
     kindSelect.addEventListener("change", () => {
       updateDraftNode(nodeId, (node) => {
         const kind = requireNonEmpty(kindSelect.value, "Node kind");
-        node.config = buildNodeConfig(node.node_type, kind, cleanString(node?.config?.connector_id));
+        node.config = buildNodeConfig(node.node_type, kind, cleanString(node?.config?.connector_id), node.config);
       });
     });
   }
@@ -1157,10 +1525,12 @@ function bindEditableDraftNodeEvents(nodeId) {
     connectorSelect.addEventListener("change", () => {
       updateDraftNode(nodeId, (node) => {
         const kind = cleanString(node?.config?.kind);
-        node.config = buildNodeConfig(node.node_type, kind, cleanString(connectorSelect.value));
+        node.config = buildNodeConfig(node.node_type, kind, cleanString(connectorSelect.value), node.config);
       });
     });
   }
+
+  bindTypedInspectorEvents(nodeId);
 
   if (moveUpButton) {
     moveUpButton.addEventListener("click", () => {
@@ -1179,6 +1549,72 @@ function bindEditableDraftNodeEvents(nodeId) {
       removeDraftChainNode(nodeId);
     });
   }
+}
+
+function bindTypedInspectorEvents(nodeId) {
+  document.querySelectorAll("[data-node-config-field]").forEach((element) => {
+    const field = element.getAttribute("data-node-config-field");
+    if (!field || field === "payload_format_hint") {
+      return;
+    }
+    if (JSON_INSPECTOR_FIELDS.has(field)) {
+      element.addEventListener("input", () => {
+        updateInspectorJsonError(parseJsonInspectorInput(element.value, field).error);
+      });
+      element.addEventListener("change", () => {
+        const parsed = parseJsonInspectorInput(element.value, field);
+        updateInspectorJsonError(parsed.error);
+        if (parsed.error) {
+          setStatus(parsed.error);
+          return;
+        }
+        updateDraftNode(nodeId, (node) => {
+          node.config = buildNodeConfig(node.node_type, cleanString(node?.config?.kind), cleanString(node?.config?.connector_id), node.config);
+          updateNodeConfigField(node.config, field, parsed.value, { allowObject: true });
+        });
+      });
+      return;
+    }
+
+    const eventName = element.tagName === "SELECT" ? "change" : "change";
+    element.addEventListener(eventName, () => {
+      updateDraftNode(nodeId, (node) => {
+        node.config = buildNodeConfig(node.node_type, cleanString(node?.config?.kind), cleanString(node?.config?.connector_id), node.config);
+        updateNodeConfigField(node.config, field, element.value);
+      });
+    });
+  });
+}
+
+function parseJsonInspectorInput(rawValue, field) {
+  const text = cleanString(rawValue);
+  if (!text) {
+    return { value: undefined, error: "" };
+  }
+  try {
+    return { value: JSON.parse(text), error: "" };
+  } catch (_error) {
+    return { value: undefined, error: `${labelForInspectorField(field)} must be valid JSON before it is written into node config.` };
+  }
+}
+
+function updateInspectorJsonError(message) {
+  const errorNode = document.getElementById("flow-draft-node-json-error");
+  if (!errorNode) {
+    return;
+  }
+  errorNode.textContent = message || "";
+  errorNode.classList.toggle("hidden", !message);
+}
+
+function labelForInspectorField(field) {
+  if (field === "mapping") {
+    return "Mapping JSON";
+  }
+  if (field === "condition") {
+    return "Condition JSON";
+  }
+  return field;
 }
 
 function renderGraphIssues(context, validation, emptyMessage) {
@@ -1754,29 +2190,11 @@ function copyStoredFlowToDraft() {
 }
 
 function createConstrainedDraftFromStoredFlow(detail) {
-  const nodes = normalizeNodes(detail?.nodes);
-  const edges = normalizeEdges(detail?.edges);
-  if (nodes.length < 2 || !isLinearGraph(nodes, edges)) {
-    throw new Error("Stored flow cannot be copied into the constrained draft because it is not a single linear chain.");
+  const analysis = analyzeStoredFlowCopyability(detail);
+  if (!analysis.ok) {
+    throw new Error(analysis.message);
   }
-
-  const ordered = topologicalOrder(nodes, edges);
-  const sourceCount = ordered.filter((node) => node.node_type === "source").length;
-  const terminalCount = ordered.filter((node) => node.node_type === "sink" || node.node_type === "dlq").length;
-  if (sourceCount !== 1 || terminalCount !== 1) {
-    throw new Error("Stored flow cannot be copied into the constrained draft because it does not have exactly one source and one terminal sink or DLQ.");
-  }
-
-  for (const node of ordered) {
-    if (!STORED_COPY_ALLOWED_NODE_TYPES.has(node.node_type)) {
-      throw new Error(`Stored flow node type ${node.node_type} is not supported by the constrained draft editor.`);
-    }
-    const supportedKinds = getKindOptionsForNodeType(node.node_type);
-    const kind = cleanString(node?.config?.kind);
-    if (supportedKinds.length > 0 && !supportedKinds.includes(kind)) {
-      throw new Error(`Stored flow kind ${kind || "unknown"} for node ${node.node_id} is not supported by the constrained draft editor.`);
-    }
-  }
+  const ordered = analysis.ordered;
 
   const next = {
     flow_key: `${detail.flow.flow_key}-copy`,
@@ -1793,6 +2211,91 @@ function createConstrainedDraftFromStoredFlow(detail) {
     edges: [],
   };
   return finalizeDraftGraph(next);
+}
+
+function analyzeStoredFlowCopyability(detail) {
+  const nodes = normalizeNodes(detail?.nodes);
+  const edges = normalizeEdges(detail?.edges);
+  if (nodes.length < 2) {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because it is missing the required source and sink or DLQ nodes." };
+  }
+
+  const nodesById = new Map(nodes.map((node) => [node.node_id, node]));
+  const incoming = new Map(nodes.map((node) => [node.node_id, 0]));
+  const outgoing = new Map(nodes.map((node) => [node.node_id, 0]));
+  for (const edge of edges) {
+    if (!nodesById.has(edge.source_node_id) || !nodesById.has(edge.target_node_id)) {
+      return { ok: false, message: "Stored flow cannot be copied into the constrained draft because it references missing nodes in its edge list." };
+    }
+    outgoing.set(edge.source_node_id, outgoing.get(edge.source_node_id) + 1);
+    incoming.set(edge.target_node_id, incoming.get(edge.target_node_id) + 1);
+  }
+
+  const sourceNodes = nodes.filter((node) => node.node_type === "source");
+  const terminalNodes = nodes.filter((node) => node.node_type === "sink" || node.node_type === "dlq");
+  if (sourceNodes.length === 0) {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because it is missing a source node." };
+  }
+  if (sourceNodes.length > 1) {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because it has multiple source nodes." };
+  }
+  if (terminalNodes.length === 0) {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because it is missing a terminal sink or DLQ node." };
+  }
+  if (terminalNodes.length > 1) {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because it has multiple terminal sink or DLQ nodes." };
+  }
+
+  const ordered = topologicalOrder(nodes, edges);
+  if (ordered.length !== nodes.length) {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because it contains a cycle." };
+  }
+
+  const disconnected = nodes.some((node) => {
+    const inCount = incoming.get(node.node_id);
+    const outCount = outgoing.get(node.node_id);
+    return inCount === 0 && outCount === 0;
+  });
+  if (disconnected) {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because it contains disconnected nodes outside the supported linear chain." };
+  }
+
+  const branchingNode = nodes.find((node) => incoming.get(node.node_id) > 1 || outgoing.get(node.node_id) > 1);
+  if (branchingNode) {
+    return { ok: false, message: `Stored flow cannot be copied into the constrained draft because it contains a branching graph at node ${branchingNode.node_id}.` };
+  }
+
+  const roots = nodes.filter((node) => incoming.get(node.node_id) === 0);
+  const leaves = nodes.filter((node) => outgoing.get(node.node_id) === 0);
+  if (roots.length !== 1 || leaves.length !== 1) {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because it is not a single connected source-to-terminal chain." };
+  }
+  if (ordered[0]?.node_type !== "source") {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because its first reachable node is not a source." };
+  }
+  if (!["sink", "dlq"].includes(ordered[ordered.length - 1]?.node_type)) {
+    return { ok: false, message: "Stored flow cannot be copied into the constrained draft because its terminal node is not a sink or DLQ." };
+  }
+
+  for (const [index, node] of ordered.entries()) {
+    if (!STORED_COPY_ALLOWED_NODE_TYPES.has(node.node_type)) {
+      return { ok: false, message: `Stored flow cannot be copied into the constrained draft because node ${node.node_id} uses unsupported node type ${node.node_type}.` };
+    }
+    if (index > 0 && index < ordered.length - 1 && !EDITABLE_CHAIN_NODE_TYPES.has(node.node_type)) {
+      return { ok: false, message: `Stored flow cannot be copied into the constrained draft because node ${node.node_id} is not a supported middle-chain type.` };
+    }
+    const supportedKinds = getKindOptionsForNodeType(node.node_type);
+    const kind = cleanString(node?.config?.kind);
+    if (supportedKinds.length > 0 && !supportedKinds.includes(kind)) {
+      return { ok: false, message: `Stored flow cannot be copied into the constrained draft because node ${node.node_id} uses unsupported kind ${kind || "unknown"}.` };
+    }
+  }
+
+  return {
+    ok: true,
+    ordered,
+    message: "Copy this stored flow into the constrained draft builder.",
+  };
 }
 
 function edgeKey(edge) {

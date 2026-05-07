@@ -201,4 +201,10 @@ Milestone 96 adds constrained visual editing on top of that layer for proposed d
 - edges are regenerated automatically after draft edits
 - stored flows remain read-only unless copied into a draft
 
+Milestone 97 adds typed node inspectors on top of that constrained draft workflow:
+
+- known source, middle-node, sink, and DLQ kinds render specific planning fields instead of generic JSON-only editing
+- `json_map.mapping` and `threshold_rule.condition` must parse as JSON before they are written into node config
+- stored-flow copy-to-draft failures now report concrete reasons such as branching, multiple sources, multiple terminals, cycles, missing endpoints, and unsupported kinds
+
 This visual layer still does not execute flows, introduce arbitrary graph mutation, or introduce any side effects.

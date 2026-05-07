@@ -502,6 +502,23 @@ tbody tr:hover {
   color: var(--ink-muted);
 }
 
+.typed-inspector-panel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(216, 200, 180, 0.78);
+  background: rgba(255, 253, 250, 0.78);
+}
+
+.flow-node-editor-error {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(155, 47, 47, 0.22);
+  background: rgba(155, 47, 47, 0.08);
+  color: var(--danger);
+}
+
 .top-gap {
   margin-top: 12px;
 }

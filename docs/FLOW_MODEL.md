@@ -42,6 +42,8 @@ Milestone 95 adds the first static dashboard visual graph layer for inspection a
 
 Milestone 96 adds constrained visual editing for proposed builder drafts only. It keeps the graph shape limited to `source -> zero or more decoder/transform/filter/rule nodes -> sink or dlq`, regenerates edges automatically, and leaves stored-flow graphs read-only until explicitly copied into a builder draft.
 
+Milestone 97 adds typed node inspectors for known constrained-builder node kinds. The dashboard still writes ordinary flow `config` JSON, but it now does so through safer field-level forms for common source, middle-node, sink, and DLQ conventions while preserving the non-executing planning boundary.
+
 ## Core Types
 
 `Flow`
@@ -203,6 +205,7 @@ This model is the backend contract for later milestones:
 - dashboard flow list and detail views
 - a form-based dashboard builder foundation before graph editing exists
 - a read-only visual graph dashboard layer before graph editing exists
+- typed constrained-builder node inspectors before execution exists
 - Node-RED-like graph editing
 - dashboard-driven validation and dry-run inspection
 - flow execution engine
@@ -238,6 +241,7 @@ That UI:
 - shows a redacted JSON preview before save
 - renders a dependency-free graph preview for stored and proposed flows
 - allows constrained visual editing for proposed drafts only
+- exposes typed inspectors for known `source`, `decoder`, `transform`, `filter`, `rule`, `sink`, and `dlq` node kinds
 - allows an optional advanced JSON override for low-risk manual editing
 - uses `POST /flows/validate` and `POST /flows/dry-run` before create
 - uses `GET /flows/{flow_id}/validation` and `POST /flows/{flow_id}/dry-run` for stored flow inspection

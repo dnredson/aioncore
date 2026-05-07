@@ -56,8 +56,9 @@ It provides:
 - a redacted preview pane
 - a constrained visual graph editor for proposed drafts only
 - an optional advanced JSON override textarea
-- a selected draft node editor for safe name, kind, and connector changes
-- add, remove, and reorder controls for transform, filter, and rule chain nodes
+- a selected draft node inspector for safe name, kind, connector, and typed config changes
+- typed inspectors for known source, decoder, transform, filter, rule, sink, and dlq node kinds
+- add, remove, and reorder controls for decoder, transform, filter, and rule chain nodes
 - explicit proposed-flow validation with `POST /flows/validate`
 - explicit proposed-flow dry-run with `POST /flows/dry-run`
 - explicit create with `POST /flows`
@@ -70,6 +71,21 @@ It provides:
 
 The dashboard does not execute flows. Validation and dry-run remain planning-only and do not perform side effects.
 
+Typed inspector coverage:
+
+- source kinds: `mqtt_subscribe`, `http_input`, `ttn_uplink`, `internal_observation`
+- decoder and transform kinds: `senml_decode`, `ultralight_decode`, `canonical_json`, `json_map`, `filter_condition`
+- rule kind: `threshold_rule`
+- sink and dlq kinds: `internal_observation_store`, `raw_message_store`, `mqtt_publish`, `http_forward`, `event_create`, `command_create`, `dlq`
+
+Typed inspector behavior:
+
+- known node kinds render specific form fields instead of generic JSON-only editing
+- `json_map.mapping` and `threshold_rule.condition` must be valid JSON before they are written into node config
+- source, sink, and middle-node changes update the selected draft, regenerate the linear edges, and refresh the redacted preview
+- advanced JSON override still disables constrained visual editing until it is cleared
+- typed inspectors stay planning-only and do not execute subscriptions, publishes, forwards, observation writes, event creation, command creation, or DLQ writes
+
 Graph behavior:
 
 - stored flow graphs render from `GET /dashboard/flows/{flow_id}`
@@ -80,6 +96,7 @@ Graph behavior:
 - proposed visual editing stays constrained to a single linear chain with regenerated edges
 - advanced JSON override disables constrained graph editing until cleared
 - invalid advanced JSON override content shows a clear graph preview error instead of breaking the page
+- stored-flow copy-to-draft now reports concrete rejection reasons for branching graphs, multiple sources, multiple terminal sinks, cycles, missing endpoints, and unsupported node kinds
 
 ## Time-Series Explorer
 

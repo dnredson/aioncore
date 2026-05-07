@@ -10,9 +10,9 @@
   <div class="app-shell">
     <aside class="sidebar" aria-label="Primary">
       <div class="brand">
-        <p class="eyebrow">Milestone 96</p>
+        <p class="eyebrow">Milestone 97</p>
         <h1>AionCore Dashboard</h1>
-        <p class="lede">Static operator UI for dashboard overview, connector operations, worker inspection, time-series exploration, and form-based plus visual flow planning, packaged as native browser modules.</p>
+        <p class="lede">Static operator UI for dashboard overview, connector operations, worker inspection, time-series exploration, and typed flow planning, packaged as native browser modules.</p>
       </div>
 
       <nav class="nav-tabs" aria-label="Dashboard sections">
@@ -545,7 +545,7 @@
               <div>
                 <p class="eyebrow">Admin area</p>
                 <h3>Guided Builder</h3>
-                <p id="flow-builder-status" class="detail-title">Define a constrained source -&gt; zero or more transform/filter/rule nodes -&gt; sink flow, review the redacted preview, then validate or dry-run before creating it.</p>
+                <p id="flow-builder-status" class="detail-title">Define a constrained source -&gt; zero or more decoder/transform/filter/rule nodes -&gt; sink flow, inspect typed node fields, review the redacted preview, then validate or dry-run before creating it.</p>
               </div>
             </div>
 
@@ -606,9 +606,10 @@
                   <div>
                     <p class="eyebrow">Stage 2</p>
                     <h4>Constrained Chain Nodes</h4>
-                    <p class="detail-title">Add only safe linear transform, filter, or rule nodes between the source and sink. Edges are regenerated automatically.</p>
+                    <p class="detail-title">Add only safe linear decoder, transform, filter, or rule nodes between the source and sink. Edges are regenerated automatically.</p>
                   </div>
                   <div class="button-row">
+                    <button class="button subtle" id="flow-add-decoder-button" type="button">Add Decoder</button>
                     <button class="button subtle" id="flow-add-transform-button" type="button">Add Transform</button>
                     <button class="button subtle" id="flow-add-filter-button" type="button">Add Filter</button>
                     <button class="button subtle" id="flow-add-rule-button" type="button">Add Rule</button>
@@ -681,9 +682,9 @@
 
             <section class="mini-panel">
               <div class="panel-heading compact">
-                <h4>Selected Draft Node Editor</h4>
+                <h4>Selected Draft Node Inspector</h4>
               </div>
-              <div id="flow-proposed-node-detail" class="graph-node-detail">Select a node in the preview graph to inspect or edit the constrained draft node.</div>
+              <div id="flow-proposed-node-detail" class="graph-node-detail">Select a node in the preview graph to inspect or edit the constrained draft node through typed fields.</div>
             </section>
 
             <section class="mini-panel">
