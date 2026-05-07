@@ -114,6 +114,25 @@ Typical sink actions:
 - `POST /flows/dry-run` reports the conceptual path and conceptual sink effects without interpreting node logic.
 - `POST /flows/execute` now interprets supported nodes against explicit input and returns previews, but still performs no external or persistent side effects.
 
+## Dashboard UI
+
+Milestone 99 wires these endpoints into `apps/aion-dashboard/`.
+
+The Flow Builder uses:
+
+- `POST /flows/execute` for unsaved proposed flows
+
+Stored flow detail uses:
+
+- `POST /flows/{flow_id}/execute` for saved flows
+
+The dashboard execute surface is still simulation-only:
+
+- it shows redacted request previews and execution result previews
+- it highlights returned `node_results` statuses on the immutable graph
+- it shows sink conceptual actions such as `would_store_observation`, `would_publish_mqtt`, `would_forward_http`, `would_create_event`, `would_create_command`, `would_write_dlq`, and `no_op`
+- it does not publish MQTT, forward HTTP, create observations, create events, create commands, or write DLQ records
+
 ## Token Mode
 
 Execution routes require:
@@ -134,4 +153,4 @@ Token-mode behavior:
 - no runtime worker integration exists
 - no external sink delivery exists
 - no automatic DLQ handling exists
-- no dashboard execution UI is added in this milestone
+- no real execute UI is added in this milestone; the dashboard only calls simulated execute

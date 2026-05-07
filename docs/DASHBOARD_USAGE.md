@@ -38,6 +38,8 @@ Flow actions used by the dashboard:
 - `POST /flows`
 - `POST /flows/validate`
 - `POST /flows/dry-run`
+- `POST /flows/execute`
+- `POST /flows/{flow_id}/execute`
 - `POST /flows/{flow_id}/dry-run`
 - `PUT /flows/{flow_id}/enable`
 - `PUT /flows/{flow_id}/disable`
@@ -61,15 +63,17 @@ It provides:
 - add, remove, and reorder controls for decoder, transform, filter, and rule chain nodes
 - explicit proposed-flow validation with `POST /flows/validate`
 - explicit proposed-flow dry-run with `POST /flows/dry-run`
+- explicit proposed-flow simulated execute with `POST /flows/execute`
 - explicit create with `POST /flows`
 - explicit stored-flow validation and dry-run against the selected saved flow
+- explicit stored-flow simulated execute against the selected saved flow
 - explicit copy of a stored flow into a proposed draft when it matches the constrained linear pattern
 - explicit enable, disable, and confirm-before-delete controls for stored flows
 - click-to-select node detail panels for both proposed and stored graphs
 - node-level validation markers when issue payloads include `node_id`
 - conceptual dry-run sink highlighting for observation store, MQTT publish, HTTP forward, event create, command create, and DLQ use
 
-The dashboard does not execute flows. Validation and dry-run remain planning-only and do not perform side effects.
+The dashboard does not perform real flow execution. Validation and dry-run remain planning-only, and simulated execute remains preview-only with no side effects.
 
 Typed inspector coverage:
 
@@ -93,6 +97,7 @@ Graph behavior:
 - stored graph issue detail can be enriched with `GET /flows/{flow_id}/validation`
 - proposed graph issue detail can be enriched with `POST /flows/validate`
 - proposed and stored graph effect highlighting can be enriched with `POST /flows/dry-run` or `POST /flows/{flow_id}/dry-run`
+- proposed and stored graph node-status highlighting can be enriched with `POST /flows/execute` or `POST /flows/{flow_id}/execute`
 - proposed visual editing stays constrained to a single linear chain with regenerated edges
 - advanced JSON override disables constrained graph editing until cleared
 - invalid advanced JSON override content shows a clear graph preview error instead of breaking the page
@@ -328,6 +333,7 @@ In `AIONCORE_AUTH_MODE=token`, the dashboard UI requires:
 - `connectors:read` for `GET /ingestion/connectors`, connector detail/status, TTN validation reads, and worker plan/status
 - `connectors:admin` for connector create, patch, enable, disable, and worker reconcile
 - `flows:read` for `POST /flows/validate`, `POST /flows/dry-run`, `GET /flows/{flow_id}/validation`, and `POST /flows/{flow_id}/dry-run`
+- `flows:read` for `POST /flows/execute` and `POST /flows/{flow_id}/execute`
 - `flows:write` for `POST /flows`, `PUT /flows/{flow_id}/enable`, `PUT /flows/{flow_id}/disable`, and `DELETE /flows/{flow_id}`
 
 Example:
@@ -344,6 +350,57 @@ Token-mode behavior surfaced by the UI:
 - valid token without the required scope: `403`, shown as `Token lacks required scope`
 
 The UI never logs token values.
+
+## Simulated Execute In The Dashboard
+
+Milestone 99 adds a static simulated execute surface in the Flow Builder and stored-flow detail views.
+
+The proposed-flow execute button calls:
+
+- `POST /flows/execute`
+
+The stored-flow execute button calls:
+
+- `POST /flows/{flow_id}/execute`
+
+The UI allows operators to provide:
+
+- `sample_payload` JSON
+- optional `payload_format`
+- optional `raw_message_id` for stored flows
+- optional metadata JSON for request preview and future request enrichment
+
+The UI validates JSON fields client-side before sending.
+
+Simulated execute result panels render:
+
+- `execution_id`
+- `simulated`
+- `side_effects_performed`
+- `valid`
+- `validation_issues`
+- `node_results`
+- `sink_results`
+- `observations_preview`
+- `events_preview`
+- `commands_preview`
+- `dlq_preview`
+- `error`
+- `started_at`
+- `completed_at`
+
+The graph remains immutable. The UI only highlights returned node states such as `passed`, `simulated`, `failed`, and `skipped`, plus sink conceptual actions such as `would_store_observation`, `would_publish_mqtt`, `would_forward_http`, `would_create_event`, `would_create_command`, `would_write_dlq`, and `no_op`.
+
+The execute UI keeps the Milestone 98 safety boundary:
+
+- `simulated = true`
+- `side_effects_performed = false`
+- no MQTT publish
+- no HTTP forward
+- no observation writes
+- no event creation
+- no command creation
+- no DLQ writes
 
 ## Static Dashboard App
 

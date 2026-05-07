@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, and 98 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, optional static hosting through `aion-api`, the first read-only visual flow graph layer, constrained visual editing for proposed linear drafts only, typed node inspectors for known draft node kinds, and a backend-only simulated flow execute foundation that the dashboard does not yet consume.
+The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, and 99 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, optional static hosting through `aion-api`, the first read-only visual flow graph layer, constrained visual editing for proposed linear drafts only, typed node inspectors for known draft node kinds, a backend-only simulated flow execute foundation, and static simulated execution UI integration.
 
 ## Current Intent
 
@@ -28,6 +28,8 @@ The AionCore dashboard is currently a static operational surface served from `ap
 - `GET /dashboard/connectors/overview`
 - `GET /flows/{flow_id}/validation`
 - `POST /flows/dry-run`
+- `POST /flows/execute`
+- `POST /flows/{flow_id}/execute`
 - `POST /flows/{flow_id}/dry-run`
 - `POST /flows/validate`
 - `GET /ingestion/connectors`
@@ -70,7 +72,7 @@ The current and future AionCore dashboard is intended to emphasize:
 - form-based flow authoring with redacted preview JSON
 - read-only visual graph inspection for stored flows and constrained visual draft editing for proposed flows
 - node-level validation issue markers and click-to-inspect node detail
-- flow validation and dry-run inspection without execution
+- flow validation, dry-run, and simulated execute inspection without real execution
 - later reliability and provenance visibility for external flow engines such as NiFi and MiNiFi
 
 This is intentionally different from a generic chart-only experience. Grafana can still complement AionCore for richer chart composition later.
@@ -121,9 +123,12 @@ It currently provides:
 - click-to-select node detail panels that show redacted config JSON and node-scoped issues when available
 - proposed-flow validation from `POST /flows/validate`
 - proposed-flow dry-run planning from `POST /flows/dry-run`
+- proposed-flow simulated execute from `POST /flows/execute`
 - explicit flow create, enable, disable, and confirm-before-delete actions using the existing `/flows` write surface
 - explicit stored-flow validation and dry-run actions using the existing planning endpoints
-- no stored-flow execute UI yet even though backend simulated execute endpoints now exist
+- explicit stored-flow simulated execute using `POST /flows/{flow_id}/execute`
+- simulated execute request preview panels with client-side JSON validation and secret redaction
+- graph highlighting for returned node execution states and sink conceptual actions
 
 ## Auth And Safety
 
@@ -138,7 +143,7 @@ In token mode the consumed scopes are:
 - `timeseries:read` for `/timeseries/*` explorer reads
 - `connectors:read` for connector, TTN validation, and worker operational reads
 - `connectors:admin` for connector mutation and worker reconcile
-- `flows:read` for flow validation and dry-run reads
+- `flows:read` for flow validation, dry-run, and simulated execute reads
 - `flows:write` for flow creation and stored-flow mutations
 
 Milestone 90 keeps several safety boundaries:
@@ -150,13 +155,13 @@ Milestone 90 keeps several safety boundaries:
 - redaction of secret-like fields in flow preview JSON and stored flow details
 - redaction of secret-like URL and token fragments in typed inspector fields
 - no automatic TTN live validation
-- no flow execution
-- no dashboard-triggered simulated execute surface yet
+- no real flow execution
 - no drag-and-drop flow editing
 - no arbitrary visual graph editing
 - no direct graph editing for stored flows
 - no graph persistence changes
 - no broker subscriptions or sink side effects initiated by the UI
+- no MQTT publish, HTTP forward, observation write, event creation, command creation, or DLQ write from simulated execute UI actions
 - no external chart library
 - no Grafana integration in the static dashboard milestone
 - no required backend-hosted static asset serving

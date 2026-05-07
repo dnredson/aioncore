@@ -10,7 +10,7 @@
   <div class="app-shell">
     <aside class="sidebar" aria-label="Primary">
       <div class="brand">
-        <p class="eyebrow">Milestone 97</p>
+        <p class="eyebrow">Milestone 99</p>
         <h1>AionCore Dashboard</h1>
         <p class="lede">Static operator UI for dashboard overview, connector operations, worker inspection, time-series exploration, and typed flow planning, packaged as native browser modules.</p>
       </div>
@@ -532,11 +532,11 @@
         </div>
 
         <div class="notice-panel">
-          Constrained visual draft editing only. This milestone does not add arbitrary drag-and-drop, arbitrary edge editing, stored-flow graph mutation, execution, broker subscriptions, MQTT publish, HTTP forward, observation writes, event creation, command creation, or DLQ writes.
+          Constrained visual draft editing only. Simulated execute is preview-only in this milestone. It does not add real execution, arbitrary drag-and-drop, arbitrary edge editing, stored-flow graph mutation, broker subscriptions, MQTT publish, HTTP forward, observation writes, event creation, command creation, or DLQ writes.
         </div>
 
         <div class="notice-panel">
-          Token mode guidance: <code>flows:read</code> for flow reads, validation, and dry-run; <code>flows:write</code> for create, enable, disable, and delete; <code>dashboard:read</code> for <code>/dashboard/flows*</code>; <code>connectors:read</code> for connector selectors.
+          Token mode guidance: <code>flows:read</code> for flow reads, validation, dry-run, and simulated execute; <code>flows:write</code> for create, enable, disable, and delete; <code>dashboard:read</code> for <code>/dashboard/flows*</code>; <code>connectors:read</code> for connector selectors.
         </div>
 
         <div class="panel-grid">
@@ -660,6 +660,7 @@
                 <button class="button subtle" id="flow-builder-preview-button" type="button">Refresh Preview</button>
                 <button class="button subtle" id="flow-builder-validate-button" type="button">Validate Proposed Flow</button>
                 <button class="button subtle" id="flow-builder-dry-run-button" type="button">Dry-Run Proposed Flow</button>
+                <button class="button subtle" id="flow-builder-execute-button" type="button">Execute Proposed Simulation</button>
                 <button class="button primary" id="flow-builder-create-button" type="submit">Create Flow</button>
                 <button class="button subtle" id="flow-builder-reset-button" type="button">Reset Builder</button>
               </div>
@@ -723,6 +724,41 @@
               </label>
               <div id="flow-proposed-dry-run-summary" class="top-gap">Dry-run stays planning-only. No side effects are performed.</div>
             </section>
+
+            <section class="mini-panel">
+              <div class="panel-heading compact">
+                <h4>Proposed Simulated Execute</h4>
+              </div>
+              <div class="simulation-banner">
+                <strong>Simulation only.</strong> No side effects performed. No MQTT, HTTP, command, observation, event, or DLQ writes are executed.
+              </div>
+              <div class="flow-node-editor-grid">
+                <label>
+                  <span>Payload Format</span>
+                  <select id="flow-proposed-payload-format">
+                    <option value="" selected>None</option>
+                    <option value="senml-json">senml-json</option>
+                    <option value="ultralight">ultralight</option>
+                    <option value="canonical-json">canonical-json</option>
+                    <option value="application/json">application/json</option>
+                    <option value="ttn-uplink-json">ttn-uplink-json</option>
+                  </select>
+                </label>
+              </div>
+              <label>
+                <span>Sample Payload JSON</span>
+                <textarea id="flow-proposed-execute-sample-payload" rows="8" placeholder='{"temperature":21.4}'></textarea>
+              </label>
+              <label>
+                <span>Metadata JSON</span>
+                <textarea id="flow-proposed-execute-metadata" rows="6" placeholder='{"source":"dashboard-preview"}'></textarea>
+              </label>
+              <section class="mini-panel inset-panel">
+                <h4>Execution Request Preview</h4>
+                <pre id="flow-proposed-execute-request-preview" class="mono-block">Execute proposed simulation to inspect the redacted request preview.</pre>
+              </section>
+              <div id="flow-proposed-execute-summary" class="top-gap">Simulated execute is manual and preview-only.</div>
+            </section>
           </article>
         </div>
 
@@ -767,6 +803,7 @@
                 <button class="button subtle" id="flow-refresh-detail-button" type="button" disabled>Refresh Detail</button>
                 <button class="button subtle" id="flow-validate-stored-button" type="button" disabled>Validate Stored Flow</button>
                 <button class="button subtle" id="flow-dry-run-stored-button" type="button" disabled>Dry-Run Stored Flow</button>
+                <button class="button subtle" id="flow-execute-stored-button" type="button" disabled>Execute Stored Simulation</button>
                 <button class="button subtle" id="flow-copy-to-draft-button" type="button" disabled>Copy To Draft</button>
                 <button class="button subtle" id="flow-enable-button" type="button" disabled>Enable</button>
                 <button class="button subtle" id="flow-disable-button" type="button" disabled>Disable</button>
@@ -805,6 +842,40 @@
                 </label>
               </section>
 
+              <section class="mini-panel">
+                <div class="panel-heading compact">
+                  <h4>Stored Simulated Execute Input</h4>
+                </div>
+                <div class="simulation-banner">
+                  <strong>Simulation only.</strong> No side effects performed. No MQTT, HTTP, command, observation, event, or DLQ writes are executed.
+                </div>
+                <div class="flow-node-editor-grid">
+                  <label>
+                    <span>Payload Format</span>
+                    <select id="flow-stored-payload-format">
+                      <option value="" selected>None</option>
+                      <option value="senml-json">senml-json</option>
+                      <option value="ultralight">ultralight</option>
+                      <option value="canonical-json">canonical-json</option>
+                      <option value="application/json">application/json</option>
+                      <option value="ttn-uplink-json">ttn-uplink-json</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Raw Message ID</span>
+                    <input id="flow-stored-raw-message-id" type="text" placeholder="Optional existing raw_message_id">
+                  </label>
+                </div>
+                <label>
+                  <span>Sample Payload JSON</span>
+                  <textarea id="flow-stored-execute-sample-payload" rows="8" placeholder='{"temperature":31.2}'></textarea>
+                </label>
+                <label>
+                  <span>Metadata JSON</span>
+                  <textarea id="flow-stored-execute-metadata" rows="6" placeholder='{"source":"dashboard-preview"}'></textarea>
+                </label>
+              </section>
+
               <div class="mini-panels">
                 <section class="mini-panel">
                   <h4>Stored Validation Result</h4>
@@ -813,6 +884,10 @@
                 <section class="mini-panel">
                   <h4>Stored Dry-Run Result</h4>
                   <div id="flow-stored-dry-run-summary">Load dry-run only when explicitly requested.</div>
+                </section>
+                <section class="mini-panel">
+                  <h4>Stored Simulated Execute Result</h4>
+                  <div id="flow-stored-execute-summary">Load simulated execute only when explicitly requested.</div>
                 </section>
               </div>
 
@@ -830,6 +905,11 @@
                   <div id="flow-stored-effects">Dry-run stays planning-only. No side effects are performed.</div>
                 </section>
               </div>
+
+              <section class="mini-panel">
+                <h4>Stored Execution Request Preview</h4>
+                <pre id="flow-stored-execute-request-preview" class="mono-block">Execute stored simulation to inspect the redacted request preview.</pre>
+              </section>
 
               <div class="mini-panels">
                 <section class="mini-panel">

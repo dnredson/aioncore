@@ -1,6 +1,6 @@
 # AionCore Dashboard
 
-This app is the Milestone 97 static frontend for the AionCore dashboard.
+This app is the Milestone 99 static frontend for the AionCore dashboard.
 
 ## Scope
 
@@ -12,7 +12,7 @@ The dashboard remains plain HTML, CSS, and JavaScript:
 - no external CDN dependencies
 - no backend behavior changes
 
-Milestone 97 keeps the static no-build dashboard approach from Milestones 89 through 96, adds typed node inspectors for constrained flow drafting on top of the existing graph layer, and preserves the native ES module structure so it remains easy to maintain and serve locally.
+Milestone 99 keeps the static no-build dashboard approach from Milestones 89 through 98, adds simulated flow execution UI integration on top of the existing graph, draft editor, and typed node inspectors, and preserves the native ES module structure so it remains easy to maintain and serve locally.
 
 ## Files
 
@@ -27,7 +27,7 @@ Milestone 97 keeps the static no-build dashboard approach from Milestones 89 thr
 - `js/connectors.js`
 - `js/flows.js`
 
-`dashboard.js` stays the browser entrypoint. `js/flows.js` now contains the dependency-free SVG graph rendering, constrained proposed-draft editing logic, typed node inspectors, validation markers, dry-run sink highlighting, and stored-flow copy-to-draft behavior. All files remain plain no-build ES modules loaded directly by the browser.
+`dashboard.js` stays the browser entrypoint. `js/flows.js` now contains the dependency-free SVG graph rendering, constrained proposed-draft editing logic, typed node inspectors, validation markers, dry-run sink highlighting, simulated execute request/response rendering, node execution-state highlighting, and stored-flow copy-to-draft behavior. All files remain plain no-build ES modules loaded directly by the browser.
 
 ## APIs Consumed
 
@@ -65,7 +65,9 @@ Flow builder and stored-flow actions:
 - `POST /flows`
 - `POST /flows/validate`
 - `POST /flows/dry-run`
+- `POST /flows/execute`
 - `POST /flows/{flow_id}/dry-run`
+- `POST /flows/{flow_id}/execute`
 - `PUT /flows/{flow_id}/enable`
 - `PUT /flows/{flow_id}/disable`
 - `DELETE /flows/{flow_id}`
@@ -98,15 +100,19 @@ Flow builder and stored-flow actions:
 - Move up, move down, and remove controls for draft chain nodes
 - Manual proposed-flow validation using `POST /flows/validate`
 - Manual proposed-flow dry-run using `POST /flows/dry-run`
+- Manual proposed-flow simulated execute using `POST /flows/execute`
 - Manual flow creation using `POST /flows`
 - Stored flow validation using `GET /flows/{flow_id}/validation`
 - Stored flow dry-run using `POST /flows/{flow_id}/dry-run`
+- Stored flow simulated execute using `POST /flows/{flow_id}/execute`
 - Stored flow enable, disable, and explicit confirm-before-delete actions
 - Read-only visual graph rendering for stored flow detail using `GET /dashboard/flows/{flow_id}` and optional `GET /flows/{flow_id}/validation`
 - Read-only proposed graph preview when advanced JSON override is active
 - Constrained editable proposed graph preview for guided drafts
 - Click-to-select node detail panels with redacted config JSON and node-scoped validation issue display
 - Dry-run sink effect highlighting for conceptual observation store, MQTT publish, HTTP forward, event create, command create, and DLQ use
+- Simulated execute node highlighting for `passed`, `simulated`, `failed`, and `skipped` node states when `node_results` are returned
+- Simulated execute sink-action summaries such as `would_store_observation`, `would_publish_mqtt`, `would_forward_http`, `would_create_event`, `would_create_command`, `would_write_dlq`, and `no_op`
 - Copy stored flow to builder draft for safe linear flows only
 - Clear rejection messages when stored-flow copy is blocked by branching, multiple sources, multiple terminal sinks, cycles, missing endpoints, or unsupported node kinds
 
@@ -118,7 +124,7 @@ In `AIONCORE_AUTH_MODE=token`:
 - `timeseries:read` for `/timeseries/entities/{entity_id}/properties` and `/timeseries/query`
 - `connectors:read` for connector list, detail, status, TTN validation reads, worker plan, and worker status
 - `connectors:admin` for connector create, patch, enable, disable, and worker reconcile
-- `flows:read` for `/flows/validate`, `/flows/dry-run`, `/flows/{flow_id}/validation`, and `/flows/{flow_id}/dry-run`
+- `flows:read` for `/flows/validate`, `/flows/dry-run`, `/flows/execute`, `/flows/{flow_id}/validation`, `/flows/{flow_id}/dry-run`, and `/flows/{flow_id}/execute`
 - `flows:write` for `POST /flows`, `PUT /flows/{flow_id}/enable`, `PUT /flows/{flow_id}/disable`, and `DELETE /flows/{flow_id}`
 
 The UI continues to support development mode with no token. If token mode returns `401` or `403`, the UI shows clear user-facing errors and never logs token values.
@@ -130,7 +136,7 @@ The UI continues to support development mode with no token. If token mode return
 - Secret values are never displayed.
 - Secret values are never stored in `localStorage`.
 - Secret-like keys are redacted in JSON previews.
-- Flow previews and stored flow details also redact secret-like keys such as `password`, `secret`, `token`, `api_key`, `access_key`, `private_key`, and `credential`.
+- Flow previews, execution request previews, execution responses, and stored flow details also redact secret-like keys such as `password`, `secret`, `token`, `api_key`, `access_key`, `private_key`, and `credential`.
 - Visual node detail panels reuse the same recursive redaction before rendering config JSON.
 - Typed inspectors also redact secret-like URL and token fragments before display.
 
@@ -248,9 +254,12 @@ This keeps the dashboard static and low-risk while still supporting InfluxDB/Gra
 - If the advanced JSON override is invalid, the graph panel shows a clear preview error instead of crashing the page.
 - Validation and dry-run never save automatically.
 - Dry-run remains planning-only and surfaces `side_effects_performed = false` and `execution_supported = false`.
+- Simulated execute is still side-effect-free and surfaces `simulated = true` and `side_effects_performed = false`.
+- The dashboard execute buttons call simulated endpoints only. They do not trigger MQTT publish, HTTP forward, observation writes, event creation, command creation, or DLQ writes.
 - Validation issues are shown both in result panels and as node-level markers in the visual graph when node IDs are present.
 - Dry-run results can highlight conceptual sink effects in the graph and in a dedicated summary panel.
-- The UI does not execute flows, subscribe to brokers, publish MQTT, forward HTTP, or create observations, events, commands, or DLQ records.
+- Simulated execute results can also highlight node execution status and sink conceptual actions in the graph and selected-node detail panels.
+- The UI does not perform real execution, subscribe to brokers, publish MQTT, forward HTTP, or create observations, events, commands, or DLQ records.
 
 ## Visual Graph Notes
 
@@ -272,7 +281,7 @@ This milestone does not implement:
 - arbitrary visual graph editing
 - canvas panning or zooming
 - in-place stored-flow graph editing
-- flow execution
+- real flow execution
 - MQTT publish
 - HTTP forwarding
 - live TTN validation triggers

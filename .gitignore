@@ -40,3 +40,6 @@ smoke-*.log
 
 # Local smoke/runtime logs
 smoke-*.log
+target-codex-*/
+target_m*_aion_api_test/
+node_modules/

@@ -123,6 +123,13 @@ Per-sink actions currently include:
 - dry-run reports conceptual path and conceptual sink behavior
 - execute now interprets nodes against explicit input and returns preview artifacts, but still performs no side effects
 
+Milestone 99 adds static dashboard UI integration for this simulated execute surface:
+
+- proposed draft execution from the Flow Builder uses `POST /flows/execute`
+- stored flow execution from the detail view uses `POST /flows/{flow_id}/execute`
+- the dashboard renders redacted request previews, execution result panels, node execution highlighting, and sink conceptual actions
+- the dashboard does not add any real side-effecting execution path
+
 ## Limitations
 
 - execution is opt-in through explicit API calls only
@@ -143,3 +150,4 @@ Later milestones may add:
 - connector-driven execution
 - richer mapping and rule semantics
 - dashboard execution inspection surfaces
+- future real execute authorization, approval, and sink-delivery controls

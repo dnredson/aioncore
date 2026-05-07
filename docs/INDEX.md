@@ -47,6 +47,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 
 Recent dashboard and flow ADRs:
 
+- [ADR 0094: Flow execution UI integration](ADR/0094-flow-execution-ui-integration.md)
 - [ADR 0093: Flow execution engine foundation](ADR/0093-flow-execution-engine-foundation.md)
 - [ADR 0092: Typed flow node inspectors](ADR/0092-typed-flow-node-inspectors.md)
 - [ADR 0091: Constrained visual flow editing](ADR/0091-constrained-visual-flow-editing.md)

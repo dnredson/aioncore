@@ -519,6 +519,19 @@ tbody tr:hover {
   color: var(--danger);
 }
 
+.simulation-banner {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(50, 91, 122, 0.24);
+  background: rgba(50, 91, 122, 0.08);
+  color: #325b7a;
+}
+
+.inset-panel {
+  padding: 14px;
+  background: rgba(255, 253, 250, 0.78);
+}
+
 .top-gap {
   margin-top: 12px;
 }
@@ -679,6 +692,24 @@ tbody tr:hover {
   cursor: pointer;
 }
 
+.graph-node.status-passed .graph-node-box,
+.graph-node.status-simulated .graph-node-box {
+  stroke: var(--success);
+  stroke-width: 2.5;
+}
+
+.graph-node.status-skipped .graph-node-box {
+  stroke: var(--warning);
+  stroke-width: 2.5;
+  stroke-dasharray: 6 5;
+}
+
+.graph-node.status-failed .graph-node-box,
+.graph-node.status-error .graph-node-box {
+  stroke: var(--danger);
+  stroke-width: 3;
+}
+
 .graph-node:focus-visible .graph-node-box {
   stroke: var(--accent-strong);
   stroke-width: 3;
@@ -725,6 +756,20 @@ tbody tr:hover {
 .graph-node.effect-active .graph-node-box {
   stroke: var(--success);
   stroke-width: 2.5;
+}
+
+.graph-node.selected.status-skipped .graph-node-box {
+  stroke: var(--warning);
+}
+
+.graph-node.selected.status-passed .graph-node-box,
+.graph-node.selected.status-simulated .graph-node-box {
+  stroke: var(--success);
+}
+
+.graph-node.selected.status-failed .graph-node-box,
+.graph-node.selected.status-error .graph-node-box {
+  stroke: var(--danger);
 }
 
 .graph-edge {

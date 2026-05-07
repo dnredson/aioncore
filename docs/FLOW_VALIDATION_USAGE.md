@@ -1,6 +1,6 @@
 # Flow Validation And Dry-Run Usage
 
-This guide covers the Milestone 87 flow validation and dry-run API foundation.
+This guide covers the flow validation, dry-run, and simulated execute inspection surfaces.
 
 ## Intent
 
@@ -193,7 +193,7 @@ The UI uses:
 - `GET /flows/{flow_id}/validation` for stored flows
 - `POST /flows/{flow_id}/dry-run` for stored flows with optional `sample_payload`
 
-The builder remains form-based and intentionally does not implement drag-and-drop, arbitrary visual graph editing, or execution. It shows redacted preview JSON and result panels so operators can inspect `validation_issues`, `planned_path`, `planned_sinks`, and connector references before taking any write action.
+The builder remains form-based and intentionally does not implement real execution, drag-and-drop, or arbitrary visual graph editing. It shows redacted preview JSON and result panels so operators can inspect `validation_issues`, `planned_path`, `planned_sinks`, connector references, and simulated execute previews before taking any write action.
 
 Milestone 95 extends that static usage with a read-only visual graph layer:
 
@@ -218,4 +218,14 @@ Milestone 97 adds typed node inspectors on top of that constrained draft workflo
 
 This visual layer still does not execute flows, introduce arbitrary graph mutation, or introduce any side effects.
 
-Milestone 98 adds backend execute endpoints, but the dashboard still does not consume them in this milestone.
+Milestone 99 adds static dashboard consumption of the backend simulated execute endpoints:
+
+- `POST /flows/execute` for proposed drafts
+- `POST /flows/{flow_id}/execute` for stored flows
+
+The UI still preserves the same no-side-effect guarantees:
+
+- validation stays structural only
+- dry-run stays conceptual only
+- execute stays simulated only
+- no MQTT publish, HTTP forward, observation write, event creation, command creation, or DLQ write occurs from dashboard actions

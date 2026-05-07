@@ -302,11 +302,7 @@ export function safeUrlLikeValue(value) {
     const [rawKey, ...rest] = part.split("=");
     const key = rawKey || "";
     const normalized = key.toLowerCase();
-    if (SECRET_LIKE_KEYS.has(normalized)
-      || normalized.endsWith("_token")
-      || normalized.endsWith("_secret")
-      || normalized.endsWith("_key")
-      || normalized.includes("credential")) {
+    if (isSecretLikeKey(normalized)) {
       return `${key}=***REDACTED***`;
     }
     return [key].concat(rest).join("=");
@@ -327,7 +323,7 @@ export function redactSecrets(value, parentKey = "") {
       if ((normalized === "endpoint_url" || normalized === "url" || normalized.endsWith("_url")) && typeof childValue === "string") {
         return [key, safeUrlLikeValue(childValue)];
       }
-      if (SECRET_LIKE_KEYS.has(normalized) || normalized.endsWith("_token") || normalized.endsWith("_secret")) {
+      if (isSecretLikeKey(normalized)) {
         return [key, "***REDACTED***"];
       }
       return [key, redactSecrets(childValue, key)];
@@ -340,6 +336,23 @@ export function redactSecrets(value, parentKey = "") {
     return safeUrlLikeValue(value);
   }
   return value;
+}
+
+function isSecretLikeKey(normalizedKey) {
+  if (!normalizedKey) {
+    return false;
+  }
+  return SECRET_LIKE_KEYS.has(normalizedKey)
+    || normalizedKey.includes("password")
+    || normalizedKey.includes("secret")
+    || normalizedKey.includes("token")
+    || normalizedKey.includes("api_key")
+    || normalizedKey.includes("access_key")
+    || normalizedKey.includes("private_key")
+    || normalizedKey.includes("credential")
+    || normalizedKey.endsWith("_token")
+    || normalizedKey.endsWith("_secret")
+    || normalizedKey.endsWith("_key");
 }
 
 export function escapeHtml(value) {

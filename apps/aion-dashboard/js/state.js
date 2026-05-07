@@ -28,8 +28,10 @@ export const state = {
     flowConnectorOverview: null,
     flowProposedValidation: null,
     flowProposedDryRun: null,
+    flowProposedExecution: null,
     flowStoredValidation: new Map(),
     flowStoredDryRun: new Map(),
+    flowStoredExecution: new Map(),
   },
 };
 
@@ -66,6 +68,8 @@ export function clearCaches() {
   state.cache.flowConnectorOverview = null;
   state.cache.flowProposedValidation = null;
   state.cache.flowProposedDryRun = null;
+  state.cache.flowProposedExecution = null;
   state.cache.flowStoredValidation.clear();
   state.cache.flowStoredDryRun.clear();
+  state.cache.flowStoredExecution.clear();
 }

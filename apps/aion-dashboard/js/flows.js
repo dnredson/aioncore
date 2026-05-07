@@ -56,6 +56,16 @@ const DRY_RUN_EFFECTS = [
   ["would_use_dlq", "Use DLQ"],
 ];
 
+const EXECUTION_SINK_ACTIONS = [
+  ["would_store_observation", "Would Store Observation"],
+  ["would_publish_mqtt", "Would Publish MQTT"],
+  ["would_forward_http", "Would Forward HTTP"],
+  ["would_create_event", "Would Create Event"],
+  ["would_create_command", "Would Create Command"],
+  ["would_write_dlq", "Would Write DLQ"],
+  ["no_op", "No Op"],
+];
+
 const SOURCE_KIND_OPTIONS = [
   "mqtt_subscribe",
   "http_input",
@@ -183,7 +193,9 @@ const STORED_COPY_ALLOWED_NODE_TYPES = new Set(["source", "decoder", "transform"
 
 export function initializeFlowBuilder() {
   document.getElementById("flow-proposed-sample-payload").value = DEFAULT_FLOW_SAMPLE_PAYLOAD;
+  document.getElementById("flow-proposed-execute-sample-payload").value = DEFAULT_FLOW_SAMPLE_PAYLOAD;
   document.getElementById("flow-stored-sample-payload").value = DEFAULT_FLOW_SAMPLE_PAYLOAD;
+  document.getElementById("flow-stored-execute-sample-payload").value = DEFAULT_FLOW_SAMPLE_PAYLOAD;
   populateFlowConnectorSelects([]);
   GRAPH_SELECTION.proposed = null;
   state.flowDraft = createDefaultFlowDraft();
@@ -246,6 +258,21 @@ export function bindFlowEvents() {
       renderProposedFlowDryRun(response);
       renderProposedGraphState();
       setStatus("Proposed flow dry-run completed.");
+    } catch (error) {
+      handleError(error);
+    }
+  });
+
+  document.getElementById("flow-builder-execute-button").addEventListener("click", async () => {
+    try {
+      const flow = getEffectiveFlowDraft();
+      const request = buildFlowExecutionRequest("proposed", flow);
+      setStatus("Running proposed flow simulated execute...");
+      const response = await apiPost("/flows/execute", request);
+      state.cache.flowProposedExecution = { request, response };
+      renderProposedFlowExecution(state.cache.flowProposedExecution);
+      renderProposedGraphState();
+      setStatus("Proposed flow simulated execute completed.");
     } catch (error) {
       handleError(error);
     }
@@ -321,6 +348,22 @@ export function bindFlowEvents() {
       state.cache.flowStoredDryRun.set(String(state.selectedFlowId), response);
       renderStoredFlowOutputs();
       setStatus("Stored flow dry-run completed.");
+    } catch (error) {
+      handleError(error);
+    }
+  });
+
+  document.getElementById("flow-execute-stored-button").addEventListener("click", async () => {
+    if (!state.selectedFlowId) {
+      return;
+    }
+    try {
+      const request = buildFlowExecutionRequest("stored");
+      setStatus("Running stored flow simulated execute...");
+      const response = await apiPost(`/flows/${encodeURIComponent(state.selectedFlowId)}/execute`, request);
+      state.cache.flowStoredExecution.set(String(state.selectedFlowId), { request, response });
+      renderStoredFlowOutputs();
+      setStatus("Stored flow simulated execute completed.");
     } catch (error) {
       handleError(error);
     }
@@ -418,6 +461,7 @@ async function setFlowEnabled(flowId, enabled) {
     state.cache.flowDetail.delete(String(flowId));
     state.cache.flowStoredValidation.delete(String(flowId));
     state.cache.flowStoredDryRun.delete(String(flowId));
+    state.cache.flowStoredExecution.delete(String(flowId));
     await loadFlows(true);
     await loadFlowDetail(flowId, true);
     setStatus(`Flow ${enabled ? "enabled" : "disabled"}.`);
@@ -439,6 +483,7 @@ async function deleteSelectedFlow() {
     state.cache.flowDetail.delete(String(state.selectedFlowId));
     state.cache.flowStoredValidation.delete(String(state.selectedFlowId));
     state.cache.flowStoredDryRun.delete(String(state.selectedFlowId));
+    state.cache.flowStoredExecution.delete(String(state.selectedFlowId));
     state.selectedFlowId = null;
     GRAPH_SELECTION.stored = null;
     await loadFlows(true);
@@ -506,6 +551,7 @@ function resetFlowBuilder() {
   document.getElementById("flow-builder-form").reset();
   document.getElementById("flow-advanced-json").value = "";
   document.getElementById("flow-proposed-sample-payload").value = DEFAULT_FLOW_SAMPLE_PAYLOAD;
+  document.getElementById("flow-proposed-execute-sample-payload").value = DEFAULT_FLOW_SAMPLE_PAYLOAD;
   GRAPH_SELECTION.proposed = null;
   state.flowDraft = createDefaultFlowDraft();
   renderFlowBuilderFormFromDraft();
@@ -844,15 +890,34 @@ function renderProposedFlowDryRun(response) {
   container.innerHTML = renderFlowDryRunResponse(response);
 }
 
+function renderProposedFlowExecution(executionRun) {
+  const requestPreview = document.getElementById("flow-proposed-execute-request-preview");
+  const container = document.getElementById("flow-proposed-execute-summary");
+  if (!executionRun) {
+    requestPreview.textContent = "Execute proposed simulation to inspect the redacted request preview.";
+    container.textContent = "Simulated execute is manual and preview-only.";
+    return;
+  }
+  requestPreview.textContent = JSON.stringify(redactSecrets(executionRun.request), null, 2);
+  container.innerHTML = renderFlowExecutionResponse(executionRun.response);
+}
+
 function renderStoredFlowOutputs() {
   const validation = state.selectedFlowId ? state.cache.flowStoredValidation.get(String(state.selectedFlowId)) : null;
   const dryRun = state.selectedFlowId ? state.cache.flowStoredDryRun.get(String(state.selectedFlowId)) : null;
+  const executionRun = state.selectedFlowId ? state.cache.flowStoredExecution.get(String(state.selectedFlowId)) : null;
   document.getElementById("flow-stored-validation-summary").innerHTML = validation
     ? renderFlowValidationResponse(validation)
     : "Load validation only when explicitly requested.";
   document.getElementById("flow-stored-dry-run-summary").innerHTML = dryRun
     ? renderFlowDryRunResponse(dryRun)
     : "Load dry-run only when explicitly requested.";
+  document.getElementById("flow-stored-execute-summary").innerHTML = executionRun
+    ? renderFlowExecutionResponse(executionRun.response)
+    : "Load simulated execute only when explicitly requested.";
+  document.getElementById("flow-stored-execute-request-preview").textContent = executionRun
+    ? JSON.stringify(redactSecrets(executionRun.request), null, 2)
+    : "Execute stored simulation to inspect the redacted request preview.";
   renderStoredGraphState();
 }
 
@@ -893,6 +958,70 @@ function renderFlowDryRunResponse(response) {
       <p class="preview-note"><strong>Planned Sinks:</strong> ${escapeHtml((response.planned_sinks || []).map(formatPlannedSink).join(" | ") || "None")}</p>
       <p class="preview-note"><strong>Referenced Connectors:</strong> ${escapeHtml((response.referenced_connectors || []).map(formatReferencedConnector).join(" | ") || "None")}</p>
       <div>${renderIssueList(getValidationIssues(response), "No validation issues returned.")}</div>
+    </div>
+  `;
+}
+
+function renderFlowExecutionResponse(response) {
+  const nodeResults = Array.isArray(response?.node_results) ? response.node_results : [];
+  const sinkResults = Array.isArray(response?.sink_results) ? response.sink_results : [];
+  const observationsPreview = Array.isArray(response?.observations_preview) ? response.observations_preview : [];
+  const eventsPreview = Array.isArray(response?.events_preview) ? response.events_preview : [];
+  const commandsPreview = Array.isArray(response?.commands_preview) ? response.commands_preview : [];
+  const dlqPreview = Array.isArray(response?.dlq_preview) ? response.dlq_preview : [];
+  const issues = getValidationIssues(response);
+
+  return `
+    <div class="result-stack">
+      <div class="simulation-banner">
+        <strong>Simulation only.</strong> No side effects performed. No MQTT, HTTP, command, DLQ, event, or observation writes were executed.
+      </div>
+      <div class="detail-grid">
+        ${renderDetailItem("Execution ID", response?.execution_id || "n/a")}
+        ${renderDetailItem("Simulated", String(Boolean(response?.simulated)))}
+        ${renderDetailItem("Side Effects Performed", String(Boolean(response?.side_effects_performed)))}
+        ${renderDetailItem("Valid", String(Boolean(response?.valid)))}
+        ${renderDetailItem("Node Results", formatNumber(nodeResults.length))}
+        ${renderDetailItem("Sink Results", formatNumber(sinkResults.length))}
+        ${renderDetailItem("Observations Preview", formatNumber(observationsPreview.length))}
+        ${renderDetailItem("Events Preview", formatNumber(eventsPreview.length))}
+        ${renderDetailItem("Commands Preview", formatNumber(commandsPreview.length))}
+        ${renderDetailItem("DLQ Preview", formatNumber(dlqPreview.length))}
+        ${renderDetailItem("Started At", formatDateTime(response?.started_at))}
+        ${renderDetailItem("Completed At", formatDateTime(response?.completed_at))}
+      </div>
+      <div>
+        <p class="preview-note"><strong>Error</strong></p>
+        <pre class="mono-block">${escapeHtml(response?.error ? JSON.stringify(redactSecrets(response.error), null, 2) : "None")}</pre>
+      </div>
+      <div>
+        <p class="preview-note"><strong>Validation Issues</strong></p>
+        ${renderIssueList(issues, "No validation issues returned.")}
+      </div>
+      <div>
+        <p class="preview-note"><strong>Node Results</strong></p>
+        <pre class="mono-block">${escapeHtml(JSON.stringify(redactSecrets(nodeResults), null, 2))}</pre>
+      </div>
+      <div>
+        <p class="preview-note"><strong>Sink Results</strong></p>
+        <pre class="mono-block">${escapeHtml(JSON.stringify(redactSecrets(sinkResults), null, 2))}</pre>
+      </div>
+      <div>
+        <p class="preview-note"><strong>Observations Preview</strong></p>
+        <pre class="mono-block">${escapeHtml(JSON.stringify(redactSecrets(observationsPreview), null, 2))}</pre>
+      </div>
+      <div>
+        <p class="preview-note"><strong>Events Preview</strong></p>
+        <pre class="mono-block">${escapeHtml(JSON.stringify(redactSecrets(eventsPreview), null, 2))}</pre>
+      </div>
+      <div>
+        <p class="preview-note"><strong>Commands Preview</strong></p>
+        <pre class="mono-block">${escapeHtml(JSON.stringify(redactSecrets(commandsPreview), null, 2))}</pre>
+      </div>
+      <div>
+        <p class="preview-note"><strong>DLQ Preview</strong></p>
+        <pre class="mono-block">${escapeHtml(JSON.stringify(redactSecrets(dlqPreview), null, 2))}</pre>
+      </div>
     </div>
   `;
 }
@@ -954,6 +1083,7 @@ function renderFlowDetail(data) {
   const refreshButton = document.getElementById("flow-refresh-detail-button");
   const validateButton = document.getElementById("flow-validate-stored-button");
   const dryRunButton = document.getElementById("flow-dry-run-stored-button");
+  const executeButton = document.getElementById("flow-execute-stored-button");
   const copyButton = document.getElementById("flow-copy-to-draft-button");
   const enableButton = document.getElementById("flow-enable-button");
   const disableButton = document.getElementById("flow-disable-button");
@@ -968,6 +1098,8 @@ function renderFlowDetail(data) {
     document.getElementById("flow-execution-summary").innerHTML = "";
     document.getElementById("flow-stored-validation-summary").textContent = "Load validation only when explicitly requested.";
     document.getElementById("flow-stored-dry-run-summary").textContent = "Load dry-run only when explicitly requested.";
+    document.getElementById("flow-stored-execute-summary").textContent = "Load simulated execute only when explicitly requested.";
+    document.getElementById("flow-stored-execute-request-preview").textContent = "Execute stored simulation to inspect the redacted request preview.";
     document.getElementById("flow-nodes-table-body").innerHTML = "";
     document.getElementById("flow-edges-table-body").innerHTML = "";
     renderTokenList("flow-planned-path", [], (item) => item);
@@ -979,6 +1111,7 @@ function renderFlowDetail(data) {
     refreshButton.disabled = true;
     validateButton.disabled = true;
     dryRunButton.disabled = true;
+    executeButton.disabled = true;
     copyButton.disabled = true;
     copyButton.title = "";
     enableButton.disabled = true;
@@ -992,6 +1125,7 @@ function renderFlowDetail(data) {
   refreshButton.disabled = false;
   validateButton.disabled = false;
   dryRunButton.disabled = false;
+  executeButton.disabled = false;
   copyButton.disabled = false;
   copyButton.title = analyzeStoredFlowCopyability(data).message;
   enableButton.disabled = Boolean(data.flow.enabled);
@@ -1098,12 +1232,57 @@ function formatPosition(position) {
   return `x=${position.x ?? "?"}, y=${position.y ?? "?"}`;
 }
 
+function buildFlowExecutionRequest(mode, flow) {
+  const request = {};
+  const samplePayloadId = mode === "stored"
+    ? "flow-stored-execute-sample-payload"
+    : "flow-proposed-execute-sample-payload";
+  const payloadFormatId = mode === "stored" ? "flow-stored-payload-format" : "flow-proposed-payload-format";
+  const metadataId = mode === "stored" ? "flow-stored-execute-metadata" : "flow-proposed-execute-metadata";
+  const rawMessageId = mode === "stored"
+    ? cleanString(document.getElementById("flow-stored-raw-message-id").value)
+    : "";
+
+  if (mode === "proposed") {
+    Object.assign(request, flow || {});
+  }
+
+  const samplePayload = readOptionalJsonTextarea(samplePayloadId, `${mode === "stored" ? "Stored" : "Proposed"} sample payload JSON`);
+  const metadata = readOptionalJsonTextarea(metadataId, `${mode === "stored" ? "Stored" : "Proposed"} execution metadata JSON`);
+  const payloadFormat = cleanString(document.getElementById(payloadFormatId).value);
+
+  if (samplePayload !== undefined) {
+    request.sample_payload = samplePayload;
+  }
+  if (payloadFormat) {
+    request.payload_format = payloadFormat;
+  }
+  if (metadata !== undefined) {
+    if (mode === "proposed") {
+      request.execution_metadata = metadata;
+    } else {
+      request.metadata = metadata;
+    }
+  }
+  if (rawMessageId) {
+    request.raw_message_id = rawMessageId;
+  }
+
+  if (mode === "stored" && request.sample_payload === undefined && !rawMessageId) {
+    throw new Error("Stored simulated execute requires either sample payload JSON or a raw_message_id.");
+  }
+
+  return request;
+}
+
 function invalidateProposedFlowChecks(options = {}) {
   const { preserveGraph = false } = options;
   state.cache.flowProposedValidation = null;
   state.cache.flowProposedDryRun = null;
+  state.cache.flowProposedExecution = null;
   renderProposedFlowValidation(null);
   renderProposedFlowDryRun(null);
+  renderProposedFlowExecution(null);
   renderGraphIssues("proposed", null, "Validate the proposed flow to inspect structured issues before saving.");
   renderGraphEffects("proposed", null);
   if (!preserveGraph) {
@@ -1114,7 +1293,14 @@ function invalidateProposedFlowChecks(options = {}) {
 function renderProposedGraphState(overrideFlow) {
   try {
     const flow = overrideFlow || getCurrentDraftForGraph();
-    renderFlowGraph("proposed", flow, state.cache.flowProposedValidation, state.cache.flowProposedDryRun, "Constrained preview graph from the current draft.");
+    renderFlowGraph(
+      "proposed",
+      flow,
+      state.cache.flowProposedValidation,
+      state.cache.flowProposedDryRun,
+      state.cache.flowProposedExecution?.response || null,
+      "Constrained preview graph from the current draft.",
+    );
   } catch (error) {
     renderGraphEmpty("proposed", error.message, "Preview is unavailable until the draft JSON parses and matches the flow shape.");
   }
@@ -1131,7 +1317,15 @@ function renderStoredGraphState() {
     || detail.validation_summary
     || null;
   const dryRun = state.cache.flowStoredDryRun.get(String(state.selectedFlowId)) || null;
-  renderFlowGraph("stored", detail, validation, dryRun, "Stored graph preview from GET /dashboard/flows/{flow_id}. Read-only until copied into a builder draft.");
+  const execution = state.cache.flowStoredExecution.get(String(state.selectedFlowId))?.response || null;
+  renderFlowGraph(
+    "stored",
+    detail,
+    validation,
+    dryRun,
+    execution,
+    "Stored graph preview from GET /dashboard/flows/{flow_id}. Read-only until copied into a builder draft.",
+  );
 }
 
 function getCurrentDraftForGraph() {
@@ -1143,7 +1337,7 @@ function getCurrentDraftForGraph() {
   return draft;
 }
 
-function renderFlowGraph(context, flowLike, validation, dryRun, statusPrefix) {
+function renderFlowGraph(context, flowLike, validation, dryRun, execution, statusPrefix) {
   const ids = GRAPH_IDS[context];
   const graphContainer = document.getElementById(ids.graph);
   const nodes = normalizeNodes(flowLike?.nodes);
@@ -1156,20 +1350,21 @@ function renderFlowGraph(context, flowLike, validation, dryRun, statusPrefix) {
 
   const issues = getValidationIssues(validation);
   const issueMaps = buildIssueMaps(issues);
-  const effectNodeIds = buildEffectNodeIds(nodes, dryRun);
+  const effectNodeIds = buildEffectNodeIds(nodes, dryRun, execution);
+  const executionNodeStates = buildExecutionNodeStates(execution);
   const layout = computeGraphLayout(nodes, edges);
   const selectedNodeId = resolveSelectedNodeId(context, nodes);
   const edgeLookup = new Map(edges.map((edge) => [edgeKey(edge), edge]));
 
-  graphContainer.innerHTML = buildGraphSvg(context, nodes, edges, layout, issueMaps, selectedNodeId, effectNodeIds);
-  bindGraphNodeEvents(context, nodes, dryRun, issueMaps);
+  graphContainer.innerHTML = buildGraphSvg(context, nodes, edges, layout, issueMaps, selectedNodeId, effectNodeIds, executionNodeStates);
+  bindGraphNodeEvents(context, nodes, dryRun, execution, issueMaps);
 
-  document.getElementById(ids.graphStatus).innerHTML = renderGraphStatus(statusPrefix, nodes, edges, validation);
-  renderNodeDetail(context, nodes.find((node) => node.node_id === GRAPH_SELECTION[context]), issueMaps, dryRun);
+  document.getElementById(ids.graphStatus).innerHTML = renderGraphStatus(statusPrefix, nodes, edges, validation, execution);
+  renderNodeDetail(context, nodes.find((node) => node.node_id === GRAPH_SELECTION[context]), issueMaps, dryRun, execution);
   renderGraphIssues(context, validation, context === "stored"
     ? "Validation issues from the dashboard summary appear here. Load stored validation for the full structured result."
     : "Validate the proposed flow to inspect structured issues before saving.");
-  renderGraphEffects(context, dryRun);
+  renderGraphEffects(context, dryRun, execution, nodes);
 
   Array.from(graphContainer.querySelectorAll("[data-graph-edge-key]")).forEach((element) => {
     const edge = edgeLookup.get(element.getAttribute("data-graph-edge-key"));
@@ -1188,22 +1383,24 @@ function renderGraphEmpty(context, statusMessage, bodyMessage) {
   document.getElementById(ids.nodeDetail).innerHTML = '<div class="graph-node-detail">Select a node in the graph to inspect its redacted config.</div>';
 }
 
-function renderGraphStatus(prefix, nodes, edges, validation) {
+function renderGraphStatus(prefix, nodes, edges, validation, execution) {
   const issues = getValidationIssues(validation);
   const errors = issues.filter((issue) => issue.severity === "error").length;
   const warnings = issues.filter((issue) => issue.severity === "warning").length;
   const status = validation?.status || (validation?.valid === true ? "valid" : (validation ? "invalid" : "preview-only"));
+  const executedNodes = Array.isArray(execution?.node_results) ? execution.node_results.length : 0;
   return [
     escapeHtml(prefix),
     `${badge(status, validation ? validationBadgeTone(status === "preview-only" ? "warning" : status) : "info")}`,
     `Nodes: <strong>${formatNumber(nodes.length)}</strong>`,
     `Edges: <strong>${formatNumber(edges.length)}</strong>`,
+    `Executed Nodes: <strong>${formatNumber(executedNodes)}</strong>`,
     `Errors: <strong>${formatNumber(errors)}</strong>`,
     `Warnings: <strong>${formatNumber(warnings)}</strong>`,
   ].join(" ");
 }
 
-function renderNodeDetail(context, node, issueMaps, dryRun) {
+function renderNodeDetail(context, node, issueMaps, dryRun, execution) {
   const ids = GRAPH_IDS[context];
   const container = document.getElementById(ids.nodeDetail);
   if (!node) {
@@ -1212,14 +1409,16 @@ function renderNodeDetail(context, node, issueMaps, dryRun) {
   }
 
   if (context === "proposed" && !hasAdvancedOverride()) {
-    container.innerHTML = renderEditableDraftNode(node, issueMaps, dryRun);
+    container.innerHTML = renderEditableDraftNode(node, issueMaps, dryRun, execution);
     bindEditableDraftNodeEvents(node.node_id);
     return;
   }
 
   const nodeIssues = issueMaps.nodeIssues.get(node.node_id) || [];
   const redactedConfig = JSON.stringify(redactSecrets(node.config || {}), null, 2) || "{}";
-  const effectActive = buildEffectNodeIds([node], dryRun).has(node.node_id);
+  const effectActive = buildEffectNodeIds([node], dryRun, execution).has(node.node_id);
+  const executionResult = findExecutionNodeResult(execution, node.node_id);
+  const sinkActionSummary = formatExecutionSinkActionsForNode(execution, node);
   container.innerHTML = `
     <div class="result-stack">
       <div class="detail-grid">
@@ -1228,10 +1427,16 @@ function renderNodeDetail(context, node, issueMaps, dryRun) {
         ${renderDetailItem("Name", node.name || "n/a")}
         ${renderDetailItem("Kind", node.config?.kind || "n/a")}
         ${renderDetailItem("Highlighted By Dry-Run", effectActive ? "true" : "false")}
+        ${renderDetailItem("Execution Status", executionResult?.status || "n/a")}
+        ${renderDetailItem("Sink Action", sinkActionSummary || "n/a")}
       </div>
       <div>
         <p class="preview-note"><strong>Redacted Config JSON</strong></p>
         <pre class="mono-block">${escapeHtml(redactedConfig)}</pre>
+      </div>
+      <div>
+        <p class="preview-note"><strong>Node Execution Result</strong></p>
+        <pre class="mono-block">${escapeHtml(JSON.stringify(redactSecrets(executionResult || {}), null, 2))}</pre>
       </div>
       <div>
         <p class="preview-note"><strong>Node Issues</strong></p>
@@ -1241,9 +1446,11 @@ function renderNodeDetail(context, node, issueMaps, dryRun) {
   `;
 }
 
-function renderEditableDraftNode(node, issueMaps, dryRun) {
+function renderEditableDraftNode(node, issueMaps, dryRun, execution) {
   const nodeIssues = issueMaps.nodeIssues.get(node.node_id) || [];
-  const effectActive = buildEffectNodeIds([node], dryRun).has(node.node_id);
+  const effectActive = buildEffectNodeIds([node], dryRun, execution).has(node.node_id);
+  const executionResult = findExecutionNodeResult(execution, node.node_id);
+  const sinkActionSummary = formatExecutionSinkActionsForNode(execution, node);
   const kindOptions = getKindOptionsForNodeType(node.node_type).map((value) => `
     <option value="${escapeHtml(value)}"${value === cleanString(node?.config?.kind) ? " selected" : ""}>${escapeHtml(value)}</option>
   `).join("");
@@ -1266,6 +1473,8 @@ function renderEditableDraftNode(node, issueMaps, dryRun) {
         ${renderDetailItem("Node ID", node.node_id)}
         ${renderDetailItem("Node Type", node.node_type || "n/a")}
         ${renderDetailItem("Highlighted By Dry-Run", effectActive ? "true" : "false")}
+        ${renderDetailItem("Execution Status", executionResult?.status || "n/a")}
+        ${renderDetailItem("Sink Action", sinkActionSummary || "n/a")}
       </div>
       <div class="flow-node-editor-grid">
         <label>
@@ -1301,6 +1510,10 @@ function renderEditableDraftNode(node, issueMaps, dryRun) {
       <div>
         <p class="preview-note"><strong>Redacted Config JSON</strong></p>
         <pre class="mono-block">${escapeHtml(redactedConfig)}</pre>
+      </div>
+      <div>
+        <p class="preview-note"><strong>Node Execution Result</strong></p>
+        <pre class="mono-block">${escapeHtml(JSON.stringify(redactSecrets(executionResult || {}), null, 2))}</pre>
       </div>
       <div>
         <p class="preview-note"><strong>Node Issues</strong></p>
@@ -1623,9 +1836,33 @@ function renderGraphIssues(context, validation, emptyMessage) {
   document.getElementById(ids.issues).innerHTML = renderIssueList(issues, emptyMessage);
 }
 
-function renderGraphEffects(context, dryRun) {
+function renderGraphEffects(context, dryRun, execution, nodes = []) {
   const ids = GRAPH_IDS[context];
   const container = document.getElementById(ids.effects);
+  if (execution) {
+    const sinkCards = nodes
+      .filter((node) => node.node_type === "sink" || node.node_type === "dlq")
+      .map((node) => {
+        const actions = formatExecutionSinkActionsForNode(execution, node) || "n/a";
+        return `
+          <div class="flow-effect-card ${actions !== "n/a" && actions !== "no_op" ? "active" : "inactive"}">
+            <strong>${escapeHtml(node.name || node.node_id)}</strong>
+            <span>${escapeHtml(actions)}</span>
+          </div>
+        `;
+      }).join("");
+    container.innerHTML = `
+      <div class="result-stack">
+        <div class="simulation-banner">
+          <strong>Simulation only.</strong> No side effects performed. No MQTT, HTTP, command, DLQ, event, or observation writes were executed.
+        </div>
+        <div class="flow-effect-grid">
+          ${sinkCards || '<div class="flow-effect-card inactive"><strong>No sink actions</strong><span>None</span></div>'}
+        </div>
+      </div>
+    `;
+    return;
+  }
   if (!dryRun) {
     container.textContent = "Dry-run stays planning-only. No side effects are performed.";
     return;
@@ -1823,7 +2060,7 @@ function topologicalOrder(nodes, edges) {
   return ordered.length === nodes.length ? ordered : nodes;
 }
 
-function buildGraphSvg(context, nodes, edges, layout, issueMaps, selectedNodeId, effectNodeIds) {
+function buildGraphSvg(context, nodes, edges, layout, issueMaps, selectedNodeId, effectNodeIds, executionNodeStates) {
   const positionById = new Map((layout.nodes || []).map((item) => [item.node_id, item]));
   const markerId = `flow-graph-arrow-${context}`;
   return `
@@ -1834,7 +2071,7 @@ function buildGraphSvg(context, nodes, edges, layout, issueMaps, selectedNodeId,
         </marker>
       </defs>
       ${edges.map((edge) => renderGraphEdge(edge, positionById, layout, markerId, issueMaps)).join("")}
-      ${nodes.map((node) => renderGraphNode(node, positionById.get(node.node_id), layout, issueMaps, selectedNodeId, effectNodeIds)).join("")}
+      ${nodes.map((node) => renderGraphNode(node, positionById.get(node.node_id), layout, issueMaps, selectedNodeId, effectNodeIds, executionNodeStates)).join("")}
     </svg>
   `;
 }
@@ -1862,19 +2099,22 @@ function renderGraphEdge(edge, positionById, layout, markerId, issueMaps) {
   `;
 }
 
-function renderGraphNode(node, position, layout, issueMaps, selectedNodeId, effectNodeIds) {
+function renderGraphNode(node, position, layout, issueMaps, selectedNodeId, effectNodeIds, executionNodeStates) {
   if (!position) {
     return "";
   }
   const nodeIssues = issueMaps.nodeIssues.get(node.node_id) || [];
   const selected = selectedNodeId === node.node_id;
   const effectActive = effectNodeIds.has(node.node_id);
+  const executionStatus = executionNodeStates.get(node.node_id) || "";
   const line1 = node.name || node.node_id;
   const line2 = `${node.node_id} | ${node.node_type || "n/a"}`;
-  const line3 = node.config?.kind ? `kind: ${node.config.kind}` : "kind: n/a";
+  const line3 = executionStatus
+    ? `status: ${executionStatus}`
+    : (node.config?.kind ? `kind: ${node.config.kind}` : "kind: n/a");
   return `
     <g
-      class="graph-node${selected ? " selected" : ""}${nodeIssues.length ? " has-issues" : ""}${effectActive ? " effect-active" : ""}"
+      class="graph-node${selected ? " selected" : ""}${nodeIssues.length ? " has-issues" : ""}${effectActive ? " effect-active" : ""}${executionStatus ? ` status-${escapeHtml(executionStatus)}` : ""}"
       data-graph-node-id="${escapeHtml(node.node_id)}"
       tabindex="0"
       role="button"
@@ -1901,13 +2141,13 @@ function renderGraphNode(node, position, layout, issueMaps, selectedNodeId, effe
   `;
 }
 
-function bindGraphNodeEvents(context, nodes, dryRun, issueMaps) {
+function bindGraphNodeEvents(context, nodes, dryRun, execution, issueMaps) {
   const ids = GRAPH_IDS[context];
   document.getElementById(ids.graph).querySelectorAll("[data-graph-node-id]").forEach((element) => {
     const selectNode = () => {
       GRAPH_SELECTION[context] = element.getAttribute("data-graph-node-id");
       const node = nodes.find((candidate) => candidate.node_id === GRAPH_SELECTION[context]) || null;
-      renderNodeDetail(context, node, issueMaps, dryRun);
+      renderNodeDetail(context, node, issueMaps, dryRun, execution);
       if (context === "proposed") {
         renderDraftChain();
       }
@@ -1925,8 +2165,15 @@ function bindGraphNodeEvents(context, nodes, dryRun, issueMaps) {
   });
 }
 
-function buildEffectNodeIds(nodes, dryRun) {
+function buildEffectNodeIds(nodes, dryRun, execution) {
   const active = new Set();
+  if (execution) {
+    for (const result of Array.isArray(execution?.node_results) ? execution.node_results : []) {
+      if (result?.node_id && ["passed", "simulated", "failed", "skipped", "error"].includes(cleanString(result.status))) {
+        active.add(result.node_id);
+      }
+    }
+  }
   if (!dryRun) {
     return active;
   }
@@ -1942,6 +2189,63 @@ function buildEffectNodeIds(nodes, dryRun) {
     }
   }
   return active;
+}
+
+function buildExecutionNodeStates(execution) {
+  const states = new Map();
+  for (const result of Array.isArray(execution?.node_results) ? execution.node_results : []) {
+    const nodeId = cleanString(result?.node_id);
+    const status = cleanString(result?.status);
+    if (nodeId && status) {
+      states.set(nodeId, status);
+    }
+  }
+  return states;
+}
+
+function findExecutionNodeResult(execution, nodeId) {
+  return (Array.isArray(execution?.node_results) ? execution.node_results : []).find((item) => item?.node_id === nodeId) || null;
+}
+
+function findExecutionSinkResult(execution, nodeId) {
+  return (Array.isArray(execution?.sink_results) ? execution.sink_results : []).find((item) => item?.node_id === nodeId) || null;
+}
+
+function formatExecutionSinkActionsForNode(execution, node) {
+  const sinkResult = findExecutionSinkResult(execution, node?.node_id);
+  if (sinkResult) {
+    const active = EXECUTION_SINK_ACTIONS
+      .filter(([field]) => Boolean(sinkResult?.[field]))
+      .map(([field]) => field);
+    return active.join(" | ") || "no_op";
+  }
+  const fallback = inferExecutionActionsFromKind(cleanString(node?.config?.kind), execution);
+  return fallback.join(" | ");
+}
+
+function inferExecutionActionsFromKind(kind, execution) {
+  if (!execution) {
+    return [];
+  }
+  if (kind === "internal_observation_store" && execution.would_store_observation) {
+    return ["would_store_observation"];
+  }
+  if (kind === "mqtt_publish" && execution.would_publish_mqtt) {
+    return ["would_publish_mqtt"];
+  }
+  if (kind === "http_forward" && execution.would_forward_http) {
+    return ["would_forward_http"];
+  }
+  if (kind === "event_create" && execution.would_create_event) {
+    return ["would_create_event"];
+  }
+  if (kind === "command_create" && execution.would_create_command) {
+    return ["would_create_command"];
+  }
+  if (kind === "dlq" && (execution.would_write_dlq || execution.would_use_dlq)) {
+    return ["would_write_dlq"];
+  }
+  return [];
 }
 
 function addDraftChainNode(nodeType) {
