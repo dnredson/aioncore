@@ -1,6 +1,6 @@
 # AionCore Dashboard
 
-This app is the Milestone 92 static frontend for the AionCore dashboard.
+This app is the Milestone 93 static frontend for the AionCore dashboard.
 
 ## Scope
 
@@ -12,13 +12,22 @@ The dashboard remains plain HTML, CSS, and JavaScript:
 - no external CDN dependencies
 - no backend behavior changes
 
-Milestone 92 extends the Milestone 89, 90, and 91 dashboard with a static form-based Flow Builder foundation backed only by existing AionCore APIs.
+Milestone 93 keeps the static no-build dashboard approach from Milestones 89 through 92, but refactors the frontend into smaller native ES modules so it is easier to maintain and easier to serve locally.
 
 ## Files
 
 - `index.html`
 - `styles.css`
 - `dashboard.js`
+- `js/constants.js`
+- `js/state.js`
+- `js/utils.js`
+- `js/api.js`
+- `js/timeseries.js`
+- `js/connectors.js`
+- `js/flows.js`
+
+`dashboard.js` stays the browser entrypoint. All other files remain plain no-build ES modules loaded directly by the browser.
 
 ## APIs Consumed
 
@@ -130,6 +139,42 @@ http://127.0.0.1:8080
 ```
 
 The UI supports an optional bearer token for local development. The API base URL and token are stored in browser `localStorage`.
+
+Because the frontend is still no-build, any simple static file server is sufficient for local demos:
+
+- `python -m http.server 5173 --directory apps/aion-dashboard`
+- `npx` is intentionally not required
+- no bundled assets or `node_modules`
+
+## Optional API Static Serving
+
+Milestone 93 defers optional static serving from `aion-api`.
+
+Reason:
+
+- the maintainability split was low risk and self-contained
+- backend behavior and validation scope remain unchanged
+- the dashboard is already easy to serve with a one-line local static server
+
+If a later milestone adds `AIONCORE_DASHBOARD_STATIC_DIR`, it should remain optional and should not change existing API route behavior.
+
+## Why No Build Step Still Fits
+
+The dashboard is still intentionally plain HTML, CSS, and JavaScript because the current operator surface is:
+
+- small enough to ship directly as browser modules
+- easier to inspect during backend iteration
+- easier to demo locally without frontend package management
+- lower risk while flow execution and richer runtime features are still deferred
+
+## When To Consider A Full Frontend Toolchain
+
+Revisit the no-build approach only if one or more of these become true:
+
+- the static modules become hard to reason about even after modularization
+- shared UI state or routing becomes substantially more complex
+- asset compilation, typed templates, or component testing become necessary
+- dashboard scope expands into a larger product surface beyond the current operator UI
 
 ## Time-Series Explorer Notes
 

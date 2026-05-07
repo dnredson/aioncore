@@ -317,6 +317,13 @@ The current dashboard frontend remains a no-build static app:
 - `apps/aion-dashboard/index.html`
 - `apps/aion-dashboard/styles.css`
 - `apps/aion-dashboard/dashboard.js`
+- `apps/aion-dashboard/js/constants.js`
+- `apps/aion-dashboard/js/state.js`
+- `apps/aion-dashboard/js/utils.js`
+- `apps/aion-dashboard/js/api.js`
+- `apps/aion-dashboard/js/timeseries.js`
+- `apps/aion-dashboard/js/connectors.js`
+- `apps/aion-dashboard/js/flows.js`
 
 Run it locally from the repository root:
 
@@ -364,3 +371,26 @@ The app intentionally still does not implement:
 - HTTP forwarding
 - charting libraries
 - Grafana integration
+
+## Static Packaging Notes
+
+- `index.html` loads `dashboard.js` with `type="module"`.
+- `dashboard.js` is the app bootstrap and section switcher only.
+- section-specific behavior lives in `js/timeseries.js`, `js/connectors.js`, and `js/flows.js`.
+- shared request logic lives in `js/api.js`.
+- shared state and constants live in `js/state.js` and `js/constants.js`.
+- shared redaction, formatting, and status/error helpers live in `js/utils.js`.
+
+This keeps the current browser compatibility story simple: any modern browser that supports native ES modules can run the dashboard directly from a static file server.
+
+## Optional Static Serving From `aion-api`
+
+Milestone 93 does not add optional static serving from `aion-api`.
+
+Use a standalone static file server for now:
+
+```powershell
+python -m http.server 5173 --directory apps/aion-dashboard
+```
+
+This avoids any Rust API behavior change while keeping the dashboard easy to demo locally.

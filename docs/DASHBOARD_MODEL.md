@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, and 92 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, and a form-based flow builder foundation so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
+The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, and 93 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, and a native-ES-module maintainability pass so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
 
 ## Current Intent
 
@@ -10,6 +10,7 @@ The AionCore dashboard is currently a static operational surface served from `ap
 - Support operational views for connectors, brokers, and workers.
 - Provide a no-build UI that can safely consume existing APIs during backend iteration.
 - Provide a safe flow-definition authoring path before any future visual graph editor exists.
+- Keep the frontend split into browser-native modules before introducing runtime-heavy features.
 - Preserve Grafana as a valid future option for advanced charting and long-range analytics.
 
 ## Current Read Surface
@@ -70,13 +71,22 @@ This is intentionally different from a generic chart-only experience. Grafana ca
 
 ## Frontend Skeleton And Management UI
 
-The current frontend remains a first lightweight static dashboard app:
+The current frontend remains a lightweight static dashboard app:
 
 - `apps/aion-dashboard/index.html`
 - `apps/aion-dashboard/styles.css`
 - `apps/aion-dashboard/dashboard.js`
+- `apps/aion-dashboard/js/constants.js`
+- `apps/aion-dashboard/js/state.js`
+- `apps/aion-dashboard/js/utils.js`
+- `apps/aion-dashboard/js/api.js`
+- `apps/aion-dashboard/js/timeseries.js`
+- `apps/aion-dashboard/js/connectors.js`
+- `apps/aion-dashboard/js/flows.js`
 
 The frontend intentionally avoids React, Vite, Next, `node_modules`, external CDNs, and charting libraries.
+
+`dashboard.js` is the only HTML entrypoint script. The rest of the code is loaded as native browser ES modules with no bundler.
 
 It currently provides:
 
@@ -131,12 +141,14 @@ Milestone 90 keeps several safety boundaries:
 - no visual graph editing
 - no external chart library
 - no Grafana integration in the static dashboard milestone
+- no required backend-hosted static asset serving
 
 ## Deferred Work
 
 The following are still explicitly out of scope for the current dashboard phase:
 
 - heavy frontend build tooling
+- optional `aion-api` static hosting for the dashboard, unless later justified as a low-risk packaging convenience
 - drag-and-drop graph canvas
 - drag-and-drop flow editor
 - arbitrary graph editing
