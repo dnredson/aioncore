@@ -545,6 +545,151 @@ tbody tr:hover {
   font-size: 12px;
 }
 
+.flow-graph-shell {
+  min-height: 320px;
+  border: 1px solid rgba(216, 200, 180, 0.75);
+  border-radius: var(--radius-sm);
+  background:
+    linear-gradient(180deg, rgba(255, 253, 250, 0.98) 0%, rgba(247, 242, 235, 0.95) 100%);
+  overflow: hidden;
+}
+
+.flow-graph-shell svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.flow-graph-empty,
+.graph-node-detail {
+  padding: 16px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  color: var(--ink-muted);
+}
+
+.flow-effect-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+}
+
+.flow-effect-card {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(216, 200, 180, 0.75);
+  background: var(--surface-muted);
+}
+
+.flow-effect-card strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.flow-effect-card.active {
+  border-color: rgba(45, 107, 68, 0.28);
+  background: rgba(45, 107, 68, 0.09);
+}
+
+.flow-effect-card.inactive {
+  opacity: 0.8;
+}
+
+.graph-node {
+  cursor: pointer;
+}
+
+.graph-node:focus-visible .graph-node-box {
+  stroke: var(--accent-strong);
+  stroke-width: 3;
+}
+
+.graph-node-box {
+  fill: rgba(255, 253, 250, 0.98);
+  stroke: rgba(216, 200, 180, 0.95);
+  stroke-width: 1.5;
+}
+
+.graph-node-box.type-source {
+  fill: rgba(50, 91, 122, 0.1);
+  stroke: rgba(50, 91, 122, 0.36);
+}
+
+.graph-node-box.type-decoder,
+.graph-node-box.type-transform,
+.graph-node-box.type-filter,
+.graph-node-box.type-rule {
+  fill: rgba(142, 75, 38, 0.09);
+  stroke: rgba(142, 75, 38, 0.34);
+}
+
+.graph-node-box.type-sink {
+  fill: rgba(45, 107, 68, 0.09);
+  stroke: rgba(45, 107, 68, 0.34);
+}
+
+.graph-node-box.type-dlq {
+  fill: rgba(155, 47, 47, 0.08);
+  stroke: rgba(155, 47, 47, 0.36);
+}
+
+.graph-node.selected .graph-node-box {
+  stroke: var(--accent-strong);
+  stroke-width: 3;
+}
+
+.graph-node.has-issues .graph-node-box {
+  stroke: var(--danger);
+}
+
+.graph-node.effect-active .graph-node-box {
+  stroke: var(--success);
+  stroke-width: 2.5;
+}
+
+.graph-edge {
+  stroke: rgba(95, 103, 95, 0.7);
+  stroke-width: 2;
+  fill: none;
+}
+
+.graph-edge.has-issues {
+  stroke: var(--danger);
+}
+
+.graph-edge-label,
+.graph-node-text,
+.graph-node-subtext,
+.graph-issue-count {
+  font-family: var(--font-ui);
+}
+
+.graph-edge-label,
+.graph-node-subtext {
+  fill: var(--ink-muted);
+  font-size: 11px;
+}
+
+.graph-node-text {
+  fill: var(--ink);
+  font-size: 12px;
+}
+
+.graph-node-title {
+  font-weight: 700;
+}
+
+.graph-issue-dot {
+  fill: var(--danger);
+}
+
+.graph-issue-count {
+  fill: #fff6ef;
+  font-size: 10px;
+  font-weight: 700;
+}
+
 .hidden {
   display: none !important;
 }

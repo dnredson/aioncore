@@ -10,9 +10,9 @@
   <div class="app-shell">
     <aside class="sidebar" aria-label="Primary">
       <div class="brand">
-        <p class="eyebrow">Milestone 93</p>
+        <p class="eyebrow">Milestone 95</p>
         <h1>AionCore Dashboard</h1>
-        <p class="lede">Static operator UI for dashboard overview, connector operations, worker inspection, time-series exploration, and form-based flow planning, now packaged as native browser modules.</p>
+        <p class="lede">Static operator UI for dashboard overview, connector operations, worker inspection, time-series exploration, and form-based plus visual flow planning, packaged as native browser modules.</p>
       </div>
 
       <nav class="nav-tabs" aria-label="Dashboard sections">
@@ -692,6 +692,29 @@
 
             <section class="mini-panel">
               <div class="panel-heading compact">
+                <h4>Proposed Visual Graph</h4>
+                <div id="flow-proposed-graph-status" class="status-meta">Preview-only graph layer from the current draft.</div>
+              </div>
+              <div id="flow-proposed-graph" class="flow-graph-shell"></div>
+            </section>
+
+            <div class="mini-panels">
+              <section class="mini-panel">
+                <h4>Selected Proposed Node</h4>
+                <div id="flow-proposed-node-detail" class="graph-node-detail">Select a node in the preview graph to inspect its redacted config.</div>
+              </section>
+              <section class="mini-panel">
+                <h4>Proposed Validation Issues</h4>
+                <div id="flow-proposed-issues">Validate the proposed flow to inspect structured issues before saving.</div>
+              </section>
+              <section class="mini-panel">
+                <h4>Proposed Dry-Run Effects</h4>
+                <div id="flow-proposed-effects">Dry-run stays planning-only. No side effects are performed.</div>
+              </section>
+            </div>
+
+            <section class="mini-panel">
+              <div class="panel-heading compact">
                 <h4>Proposed Validation</h4>
               </div>
               <div id="flow-proposed-validation-summary">Validate the proposed flow to inspect structured issues before saving.</div>
@@ -707,7 +730,7 @@
               </label>
               <div id="flow-proposed-dry-run-summary" class="top-gap">Dry-run stays planning-only. No side effects are performed.</div>
             </section>
-          </div>
+          </article>
         </div>
 
         <div class="flows-layout">
@@ -774,6 +797,14 @@
               </div>
 
               <section class="mini-panel">
+                <div class="panel-heading compact">
+                  <h4>Stored Visual Graph</h4>
+                  <div id="flow-stored-graph-status" class="status-meta">Select a stored flow to render its read-only graph.</div>
+                </div>
+                <div id="flow-stored-graph" class="flow-graph-shell"></div>
+              </section>
+
+              <section class="mini-panel">
                 <label>
                   <span>Stored Flow Dry-Run Sample Payload JSON</span>
                   <textarea id="flow-stored-sample-payload" rows="8" placeholder='{"temperature":31.2}'></textarea>
@@ -788,6 +819,21 @@
                 <section class="mini-panel">
                   <h4>Stored Dry-Run Result</h4>
                   <div id="flow-stored-dry-run-summary">Load dry-run only when explicitly requested.</div>
+                </section>
+              </div>
+
+              <div class="mini-panels">
+                <section class="mini-panel">
+                  <h4>Selected Stored Node</h4>
+                  <div id="flow-stored-node-detail" class="graph-node-detail">Select a node in the graph to inspect its redacted config.</div>
+                </section>
+                <section class="mini-panel">
+                  <h4>Stored Validation Issues</h4>
+                  <div id="flow-stored-issues">Validation issues from the dashboard summary appear here. Load stored validation for the full structured result.</div>
+                </section>
+                <section class="mini-panel">
+                  <h4>Stored Dry-Run Effects</h4>
+                  <div id="flow-stored-effects">Dry-run stays planning-only. No side effects are performed.</div>
                 </section>
               </div>
 

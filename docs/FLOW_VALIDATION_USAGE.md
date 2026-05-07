@@ -185,3 +185,12 @@ The UI uses:
 - `POST /flows/{flow_id}/dry-run` for stored flows with optional `sample_payload`
 
 The builder remains form-based and intentionally does not implement drag-and-drop, arbitrary visual graph editing, or execution. It shows redacted preview JSON and result panels so operators can inspect `validation_issues`, `planned_path`, `planned_sinks`, and connector references before taking any write action.
+
+Milestone 95 extends that static usage with a read-only visual graph layer:
+
+- proposed drafts can render as a dependency-free SVG graph before validation
+- stored flows can render from `GET /dashboard/flows/{flow_id}` and be enriched by `GET /flows/{flow_id}/validation`
+- `validation_issues` with `node_id` can be surfaced as node-level issue markers and node detail warnings
+- dry-run sink flags can be surfaced as graph highlights for conceptual effect inspection only
+
+This visual layer does not execute flows, edit graph structure, or introduce any side effects.

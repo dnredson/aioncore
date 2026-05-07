@@ -1,6 +1,6 @@
 # AionCore Dashboard
 
-This app is the Milestone 93 static frontend for the AionCore dashboard.
+This app is the Milestone 95 static frontend for the AionCore dashboard.
 
 ## Scope
 
@@ -12,7 +12,7 @@ The dashboard remains plain HTML, CSS, and JavaScript:
 - no external CDN dependencies
 - no backend behavior changes
 
-Milestone 93 keeps the static no-build dashboard approach from Milestones 89 through 92, but refactors the frontend into smaller native ES modules so it is easier to maintain and easier to serve locally.
+Milestone 95 keeps the static no-build dashboard approach from Milestones 89 through 94, adds the first read-only visual flow graph layer, and preserves the native ES module structure so it remains easy to maintain and serve locally.
 
 ## Files
 
@@ -27,7 +27,7 @@ Milestone 93 keeps the static no-build dashboard approach from Milestones 89 thr
 - `js/connectors.js`
 - `js/flows.js`
 
-`dashboard.js` stays the browser entrypoint. All other files remain plain no-build ES modules loaded directly by the browser.
+`dashboard.js` stays the browser entrypoint. `js/flows.js` now contains the dependency-free SVG graph rendering, node selection handling, validation markers, and dry-run sink highlighting for flow previews and stored flow inspection. All files remain plain no-build ES modules loaded directly by the browser.
 
 ## APIs Consumed
 
@@ -95,6 +95,10 @@ Flow builder and stored-flow actions:
 - Stored flow validation using `GET /flows/{flow_id}/validation`
 - Stored flow dry-run using `POST /flows/{flow_id}/dry-run`
 - Stored flow enable, disable, and explicit confirm-before-delete actions
+- Read-only visual graph rendering for stored flow detail using `GET /dashboard/flows/{flow_id}` and optional `GET /flows/{flow_id}/validation`
+- Read-only proposed graph preview for guided drafts and advanced JSON override output
+- Click-to-select node detail panels with redacted config JSON and node-scoped validation issue display
+- Dry-run sink effect highlighting for conceptual observation store, MQTT publish, HTTP forward, event create, command create, and DLQ use
 
 ## Auth Scopes
 
@@ -117,6 +121,7 @@ The UI continues to support development mode with no token. If token mode return
 - Secret values are never stored in `localStorage`.
 - Secret-like keys are redacted in JSON previews.
 - Flow previews and stored flow details also redact secret-like keys such as `password`, `secret`, `token`, `api_key`, `access_key`, `private_key`, and `credential`.
+- Visual node detail panels reuse the same recursive redaction before rendering config JSON.
 
 ## Local Run
 
@@ -221,9 +226,22 @@ This keeps the dashboard static and low-risk while still supporting InfluxDB/Gra
 - The builder is guided and linear: source -> transform -> sink.
 - Generated previews include `nodes`, `edges`, and `metadata`.
 - An optional advanced JSON override can replace the guided output for low-risk editing.
+- The preview pane now also renders a dependency-free SVG graph for the current draft when it can be parsed safely.
+- If the advanced JSON override is invalid, the graph panel shows a clear preview error instead of crashing the page.
 - Validation and dry-run never save automatically.
 - Dry-run remains planning-only and surfaces `side_effects_performed = false` and `execution_supported = false`.
+- Validation issues are shown both in result panels and as node-level markers in the visual graph when node IDs are present.
+- Dry-run results can highlight conceptual sink effects in the graph and in a dedicated summary panel.
 - The UI does not execute flows, subscribe to brokers, publish MQTT, forward HTTP, or create observations, events, commands, or DLQ records.
+
+## Visual Graph Notes
+
+- The graph layer is inspection-only and preview-only.
+- Rendering uses inline SVG and existing browser APIs only.
+- Layout is intentionally simple: linear left-to-right for straightforward source -> transform -> sink graphs, with a fallback grid for more complex shapes.
+- Clicking a node opens a read-only node detail panel with `node_id`, `node_type`, `name`, `config.kind`, redacted config JSON, and node-specific validation issues when available.
+- Stored-flow graph rendering uses `GET /dashboard/flows/{flow_id}` data and can be enriched by `GET /flows/{flow_id}/validation` and `POST /flows/{flow_id}/dry-run`.
+- Proposed-flow graph rendering uses the current form draft or advanced JSON override and can be enriched by `POST /flows/validate` and `POST /flows/dry-run`.
 
 ## Deliberate Deferrals
 
@@ -233,6 +251,7 @@ This milestone does not implement:
 - secret inspection UI
 - drag-and-drop flow editing
 - visual graph editing
+- canvas panning or zooming
 - flow execution
 - MQTT publish
 - HTTP forwarding

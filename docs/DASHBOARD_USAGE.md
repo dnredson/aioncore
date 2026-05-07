@@ -54,14 +54,26 @@ It provides:
 - a guided source -> transform -> sink builder
 - generated flow JSON with `nodes`, `edges`, and `metadata`
 - a redacted preview pane
+- a read-only visual graph preview for the current draft
 - an optional advanced JSON override textarea
 - explicit proposed-flow validation with `POST /flows/validate`
 - explicit proposed-flow dry-run with `POST /flows/dry-run`
 - explicit create with `POST /flows`
 - explicit stored-flow validation and dry-run against the selected saved flow
 - explicit enable, disable, and confirm-before-delete controls for stored flows
+- click-to-select node detail panels for both proposed and stored graphs
+- node-level validation markers when issue payloads include `node_id`
+- conceptual dry-run sink highlighting for observation store, MQTT publish, HTTP forward, event create, command create, and DLQ use
 
 The dashboard does not execute flows. Validation and dry-run remain planning-only and do not perform side effects.
+
+Graph behavior:
+
+- stored flow graphs render from `GET /dashboard/flows/{flow_id}`
+- stored graph issue detail can be enriched with `GET /flows/{flow_id}/validation`
+- proposed graph issue detail can be enriched with `POST /flows/validate`
+- proposed and stored graph effect highlighting can be enriched with `POST /flows/dry-run` or `POST /flows/{flow_id}/dry-run`
+- invalid advanced JSON override content shows a clear graph preview error instead of breaking the page
 
 ## Time-Series Explorer
 
@@ -358,6 +370,7 @@ The UI supports:
 - worker plan and runtime inspection
 - manual TTN validation and dry-run readiness reads
 - guided flow creation, validation, dry-run, and stored-flow lifecycle operations
+- read-only visual flow graph rendering and node inspection
 
 The app intentionally still does not implement:
 
@@ -365,6 +378,7 @@ The app intentionally still does not implement:
 - form-free arbitrary flow editing
 - drag-and-drop flow building
 - visual graph editing
+- graph panning or zooming
 - secret creation
 - live TTN validation triggers
 - MQTT publish

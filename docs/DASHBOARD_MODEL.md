@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, and 94 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, and optional static hosting through `aion-api` so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
+The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, 94, and 95 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, optional static hosting through `aion-api`, and the first read-only visual flow graph layer so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
 
 ## Current Intent
 
@@ -12,6 +12,7 @@ The AionCore dashboard is currently a static operational surface served from `ap
 - Allow optional backend-hosted static serving for local demos when a separate static server is unavailable.
 - Provide a safe flow-definition authoring path before any future visual graph editor exists.
 - Keep the frontend split into browser-native modules before introducing runtime-heavy features.
+- Add a Node-RED-like inspection and preview layer before any drag-and-drop or execution surface exists.
 - Preserve Grafana as a valid future option for advanced charting and long-range analytics.
 
 ## Current Read Surface
@@ -65,6 +66,8 @@ The current and future AionCore dashboard is intended to emphasize:
 - later pipeline and flow visibility
 - flow list, detail, and graph rendering from dashboard-friendly read models
 - form-based flow authoring with redacted preview JSON
+- read-only visual graph inspection for stored and proposed flows
+- node-level validation issue markers and click-to-inspect node detail
 - flow validation and dry-run inspection without execution
 - later reliability and provenance visibility for external flow engines such as NiFi and MiNiFi
 
@@ -110,6 +113,8 @@ It currently provides:
 - flow inventory table from `GET /dashboard/flows`
 - flow detail inspection panel from `GET /dashboard/flows/{flow_id}`
 - a guided source -> transform -> sink builder that generates a flow definition with linear edges
+- a dependency-free SVG visual graph panel for the current builder draft and stored flow detail
+- click-to-select node detail panels that show redacted config JSON and node-scoped issues when available
 - proposed-flow validation from `POST /flows/validate`
 - proposed-flow dry-run planning from `POST /flows/dry-run`
 - explicit flow create, enable, disable, and confirm-before-delete actions using the existing `/flows` write surface
@@ -142,6 +147,8 @@ Milestone 90 keeps several safety boundaries:
 - no flow execution
 - no drag-and-drop flow editing
 - no visual graph editing
+- no graph persistence changes
+- no broker subscriptions or sink side effects initiated by the UI
 - no external chart library
 - no Grafana integration in the static dashboard milestone
 - no required backend-hosted static asset serving
@@ -155,6 +162,7 @@ The following are still explicitly out of scope for the current dashboard phase:
 - drag-and-drop graph canvas
 - drag-and-drop flow editor
 - arbitrary graph editing
+- graph panning or zooming
 - flow execution
 - broker subscription changes outside connector config
 - MQTT publish

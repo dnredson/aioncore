@@ -143,6 +143,7 @@ Validation returns:
 Validation is read-only. It does not enable, execute, publish, write observations, or create DLQ records.
 
 The static dashboard Flow Builder uses this endpoint before create and shows structured issue detail without auto-saving.
+The visual graph layer can also show node-level validation markers when returned issues include `node_id`.
 
 ## Dry-Run
 
@@ -178,6 +179,7 @@ Dry-run returns planning-oriented fields such as:
 Dry-run does not execute the flow or perform any side effects.
 
 The static dashboard Flow Builder uses this endpoint for both proposed drafts and stored flows. It surfaces planning fields such as `planned_path`, `planned_sinks`, `referenced_connectors`, and the conceptual sink flags while keeping `execution_supported = false`.
+Milestone 95 also lets the static dashboard highlight conceptual sink nodes in its read-only graph when these flags are present.
 
 ## List And Get
 
@@ -260,9 +262,10 @@ It supports:
 
 - guided source -> transform -> sink draft creation
 - redacted preview JSON
+- read-only SVG graph preview for the current draft and selected stored flow
 - optional advanced JSON override
 - proposed validation and dry-run
 - stored-flow validation and dry-run
 - explicit create, enable, disable, and delete operations
 
-It still does not support drag-and-drop, arbitrary graph editing, or flow execution.
+It still does not support drag-and-drop, arbitrary graph editing, graph panning/zooming, or flow execution.

@@ -38,6 +38,8 @@ The current flow milestones still do not add:
 - external flow-engine execution, including NiFi or MiNiFi execution
 - any side effects from validation or dry-run
 
+Milestone 95 adds the first static dashboard visual graph layer for inspection and preview only. It renders existing node and edge data, validation markers, and dry-run effect hints, but it does not change the flow model, persist graph layout edits, or introduce runtime behavior.
+
 ## Core Types
 
 `Flow`
@@ -198,6 +200,7 @@ This model is the backend contract for later milestones:
 
 - dashboard flow list and detail views
 - a form-based dashboard builder foundation before graph editing exists
+- a read-only visual graph dashboard layer before graph editing exists
 - Node-RED-like graph editing
 - dashboard-driven validation and dry-run inspection
 - flow execution engine
@@ -231,6 +234,7 @@ That UI:
 - uses a guided source -> transform -> sink form rather than arbitrary graph editing
 - generates linear edges from the form
 - shows a redacted JSON preview before save
+- renders a dependency-free read-only graph preview for stored and proposed flows
 - allows an optional advanced JSON override for low-risk manual editing
 - uses `POST /flows/validate` and `POST /flows/dry-run` before create
 - uses `GET /flows/{flow_id}/validation` and `POST /flows/{flow_id}/dry-run` for stored flow inspection
