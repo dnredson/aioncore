@@ -1,5 +1,0 @@
-warn: could not canonicalize path C:\Users\dnred
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
-     Running `target\debug\aion-api.exe`
-startup storage backend=memory, database_url_provided=false, migrations_applied=n/a, auth_mode=dev, auth_enforcement_level=none, auth_dev_bypass=true, bootstrap_admin_configured=false
-warning: authentication is not enforced; development-mode bypass is active

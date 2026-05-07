@@ -37,3 +37,6 @@
 
 # Local smoke/runtime logs
 smoke-*.log
+
+# Local smoke/runtime logs
+smoke-*.log
