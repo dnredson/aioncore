@@ -25,6 +25,7 @@ The current flow foundation now adds:
 - dashboard inventory and detail read APIs
 - token-mode auth scopes and tenant filtering
 - lifecycle audit events
+- internal simulated execute APIs with preview-only node and sink interpretation
 
 The current flow milestones still do not add:
 
@@ -36,7 +37,7 @@ The current flow milestones still do not add:
 - broker subscriptions driven by flows
 - DLQ runtime processing
 - external flow-engine execution, including NiFi or MiNiFi execution
-- any side effects from validation or dry-run
+- any side effects from validation, dry-run, or execute
 
 Milestone 95 adds the first static dashboard visual graph layer for inspection and preview only. It renders existing node and edge data, validation markers, and dry-run effect hints, but it does not change the flow model, persist graph layout edits, or introduce runtime behavior.
 
@@ -198,6 +199,33 @@ Dry-run does not:
 - create DLQ records
 - change stored flow state
 
+## Execute Model
+
+Milestone 98 adds a separate simulated execute surface:
+
+- `POST /flows/execute`
+- `POST /flows/{flow_id}/execute`
+
+Execute differs from dry-run because it now interprets supported node kinds against explicit input and can return preview artifacts such as:
+
+- `node_results`
+- `sink_results`
+- `observations_preview`
+- `events_preview`
+- `commands_preview`
+- `dlq_preview`
+
+Execute still does not:
+
+- subscribe to brokers
+- publish MQTT
+- forward HTTP
+- create observations
+- create events
+- create commands
+- create DLQ records
+- change stored flow state
+
 ## Future Direction
 
 This model is the backend contract for later milestones:
@@ -208,6 +236,7 @@ This model is the backend contract for later milestones:
 - typed constrained-builder node inspectors before execution exists
 - Node-RED-like graph editing
 - dashboard-driven validation and dry-run inspection
+- internal simulated execution inspection
 - flow execution engine
 - runtime source binding and sink dispatch
 - deeper operational validation and simulation

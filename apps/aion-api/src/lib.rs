@@ -42,6 +42,7 @@ mod auth;
 mod command_support;
 mod connector_support;
 mod error;
+mod flow_execution;
 mod flow_support;
 mod mqtt_ingest;
 mod query_filters;
@@ -2298,7 +2299,8 @@ mod tests {
     use super::*;
     use aion_relationship::Relationship;
     use aion_storage::{
-        ApiTokenStore, IngestionConnector, IngestionConnectorType, RelationshipStore,
+        ApiTokenStore, CommandStore, DlqStore, EventStore, IngestionConnector,
+        IngestionConnectorType, ObservationStore, RawMessageStore, RelationshipStore,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -15206,6 +15208,339 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admin_dry_run.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn flow_execute_supports_proposed_and_stored_simulation_without_side_effects() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage.clone());
+
+        let proposed = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows/execute",
+                    json!({
+                        "flow_key": "execute-proposed",
+                        "name": "Execute Proposed",
+                        "nodes": [
+                            {
+                                "node_id": "source-1",
+                                "node_type": "source",
+                                "config": { "kind": "http_input" }
+                            },
+                            {
+                                "node_id": "decoder-1",
+                                "node_type": "decoder",
+                                "config": { "kind": "senml_decode" }
+                            },
+                            {
+                                "node_id": "sink-1",
+                                "node_type": "sink",
+                                "config": { "kind": "internal_observation_store" }
+                            }
+                        ],
+                        "edges": [
+                            { "source_node_id": "source-1", "target_node_id": "decoder-1" },
+                            { "source_node_id": "decoder-1", "target_node_id": "sink-1" }
+                        ],
+                        "sample_payload": [
+                            { "n": "temperature", "v": 21.4, "u": "Cel" }
+                        ],
+                        "payload_format": "senml-json"
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(proposed["simulated"], true);
+        assert_eq!(proposed["side_effects_performed"], false);
+        assert_eq!(proposed["valid"], true);
+        assert_eq!(
+            proposed["observations_preview"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(storage.list_all_observations().unwrap().len(), 0);
+
+        let stored = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows",
+                    json!(sample_flow_body_with_nodes(
+                        "execute-stored",
+                        "Execute Stored",
+                        json!([
+                            {
+                                "node_id": "source-1",
+                                "node_type": "source",
+                                "config": { "kind": "http_input" }
+                            },
+                            {
+                                "node_id": "event-1",
+                                "node_type": "sink",
+                                "config": { "kind": "event_create", "event_type": "aion:FlowAlert", "severity": "warning" }
+                            },
+                            {
+                                "node_id": "command-1",
+                                "node_type": "sink",
+                                "config": { "kind": "command_create", "command_type": "StartPump", "target_entity_id": "target-01" }
+                            },
+                            {
+                                "node_id": "mqtt-1",
+                                "node_type": "sink",
+                                "config": { "kind": "mqtt_publish", "topic_template": "alerts/{device_id}" }
+                            },
+                            {
+                                "node_id": "http-1",
+                                "node_type": "sink",
+                                "config": { "kind": "http_forward", "endpoint_url": "https://example.invalid/hook", "method": "POST" }
+                            },
+                            {
+                                "node_id": "dlq-1",
+                                "node_type": "dlq",
+                                "config": { "kind": "dlq", "failure_stage": "flow_processing", "failure_reason": "preview only" }
+                            }
+                        ]),
+                        json!([
+                            { "edge_id": "edge-1", "source_node_id": "source-1", "target_node_id": "event-1" },
+                            { "edge_id": "edge-2", "source_node_id": "source-1", "target_node_id": "command-1" },
+                            { "edge_id": "edge-3", "source_node_id": "source-1", "target_node_id": "mqtt-1" },
+                            { "edge_id": "edge-4", "source_node_id": "source-1", "target_node_id": "http-1" },
+                            { "edge_id": "edge-5", "source_node_id": "source-1", "target_node_id": "dlq-1" }
+                        ])
+                    )),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let flow_id = stored["id"].as_str().unwrap();
+        let events_before_execute = storage.list_all_events().unwrap().len();
+
+        let executed = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/flows/{flow_id}/execute"),
+                    json!({
+                        "sample_payload": { "temperature": 29.1, "device_id": "sensor-01" },
+                        "payload_format": "application/json"
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let actions = executed["sink_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["action"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"would_create_event"));
+        assert!(actions.contains(&"would_create_command"));
+        assert!(actions.contains(&"would_publish_mqtt"));
+        assert!(actions.contains(&"would_forward_http"));
+        assert!(actions.contains(&"would_write_dlq"));
+        assert_eq!(executed["events_preview"].as_array().unwrap().len(), 1);
+        assert_eq!(executed["commands_preview"].as_array().unwrap().len(), 1);
+        assert_eq!(executed["dlq_preview"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            storage.list_all_events().unwrap().len(),
+            events_before_execute
+        );
+        assert_eq!(storage.list_all_commands().unwrap().len(), 0);
+        assert_eq!(
+            storage
+                .list_all_dlq_records(aion_storage::DlqRecordFilter::default())
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn flow_execute_filter_controls_downstream_execution() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let app = dev_mode_app_with_storage(storage.clone());
+        let created = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/flows",
+                    json!(sample_flow_body_with_nodes(
+                        "execute-filter",
+                        "Execute Filter",
+                        json!([
+                            {
+                                "node_id": "source-1",
+                                "node_type": "source",
+                                "config": { "kind": "http_input" }
+                            },
+                            {
+                                "node_id": "filter-1",
+                                "node_type": "filter",
+                                "config": { "kind": "filter_condition", "field": "temperature", "operator": "gt", "value": 30 }
+                            },
+                            {
+                                "node_id": "sink-1",
+                                "node_type": "sink",
+                                "config": { "kind": "internal_observation_store", "observed_property": "temperature", "unit": "Cel" }
+                            }
+                        ]),
+                        json!([
+                            { "edge_id": "edge-1", "source_node_id": "source-1", "target_node_id": "filter-1" },
+                            { "edge_id": "edge-2", "source_node_id": "filter-1", "target_node_id": "sink-1" }
+                        ])
+                    )),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let flow_id = created["id"].as_str().unwrap();
+
+        let passes = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/flows/{flow_id}/execute"),
+                    json!({ "sample_payload": { "temperature": 31 } }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            passes["sink_results"][0]["action"],
+            "would_store_observation"
+        );
+        assert_eq!(passes["observations_preview"].as_array().unwrap().len(), 1);
+
+        let filtered = to_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/flows/{flow_id}/execute"),
+                    json!({ "sample_payload": { "temperature": 12 } }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(filtered["sink_results"][0]["action"], "no_op");
+        assert_eq!(
+            filtered["sink_results"][0]["preview"]["reason"],
+            "upstream execution did not continue"
+        );
+        assert_eq!(
+            filtered["observations_preview"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(storage.list_all_observations().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn token_mode_protects_flow_execute_and_enforces_tenants() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let tenant_b_app = dev_mode_app_with_storage_for_tenant(storage.clone(), tenant_b);
+        let token_app = token_mode_app_with_storage(storage.clone());
+        let flow_b = create_test_flow(&tenant_b_app, "tenant-b-execute", "Tenant B Execute").await;
+        let flow_b_id = flow_b["id"].as_str().unwrap();
+
+        let raw_message = RawMessage::new(
+            tenant_b,
+            RawMessageSource::Http,
+            Some("/ingest/http".to_string()),
+            Some("device-01".to_string()),
+            Some("senml-json".to_string()),
+            Some("application/json".to_string()),
+            None,
+            None,
+            Some("senml-json".to_string()),
+            json!({"connector_key": "test"}),
+            br#"[{"n":"temperature","v":22.6,"u":"Cel"}]"#.to_vec(),
+            Utc::now(),
+        )
+        .unwrap();
+        let raw_message_id = raw_message.id;
+        storage.store_raw_message(raw_message).unwrap();
+
+        let no_token = token_app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/flows/{flow_b_id}/execute"),
+                json!({"sample_payload": {"x": 1}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_scope_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("flow-execute-wrong-scope"),
+            &["dashboard:read"],
+        );
+        let wrong_scope = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/flows/{flow_b_id}/execute"),
+                json!({"sample_payload": {"x": 1}}),
+                &wrong_scope_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+        let tenant_b_token = store_api_token_for_tenant(
+            &storage,
+            tenant_b,
+            ApiTokenPrincipalType::Service,
+            Some("flow-execute-reader"),
+            &["flows:read"],
+        );
+        let ok = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/flows/{flow_b_id}/execute"),
+                json!({ "raw_message_id": raw_message_id }),
+                &tenant_b_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let ok_body = to_json(ok).await;
+        assert_eq!(ok_body["simulated"], true);
+        assert_eq!(ok_body["side_effects_performed"], false);
+        assert_eq!(ok_body["flow_id"], flow_b["id"]);
+
+        let tenant_a_token = store_api_token_for_tenant(
+            &storage,
+            tenant_a,
+            ApiTokenPrincipalType::Service,
+            Some("flow-execute-tenant-a"),
+            &["flows:read"],
+        );
+        let cross_tenant = token_app
+            .clone()
+            .oneshot(auth_json_request(
+                "POST",
+                &format!("/flows/{flow_b_id}/execute"),
+                json!({ "sample_payload": { "x": 1 } }),
+                &tenant_a_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant.status(), StatusCode::FORBIDDEN);
     }
 
     async fn create_test_entity(app: &Router, key: &str, entity_type: &str) -> String {

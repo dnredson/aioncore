@@ -1,6 +1,6 @@
 # Flow Usage
 
-This guide covers the Milestone 82 flow and pipeline model foundation.
+This guide covers the current flow foundation, including CRUD, validation, dry-run, and simulated execute APIs.
 
 ## Endpoints
 
@@ -12,6 +12,8 @@ This guide covers the Milestone 82 flow and pipeline model foundation.
 - `GET /flows/{flow_id}/validation`
 - `POST /flows/dry-run`
 - `POST /flows/{flow_id}/dry-run`
+- `POST /flows/execute`
+- `POST /flows/{flow_id}/execute`
 - `PUT /flows/{flow_id}/enable`
 - `PUT /flows/{flow_id}/disable`
 - `DELETE /flows/{flow_id}`
@@ -179,6 +181,37 @@ Dry-run returns planning-oriented fields such as:
 
 Dry-run does not execute the flow or perform any side effects.
 
+## Execute
+
+Use `POST /flows/execute` for a proposed flow or `POST /flows/{flow_id}/execute` for a stored flow.
+
+```powershell
+$execute = @'
+{
+  "sample_payload": [
+    { "n": "temperature", "v": 21.4, "u": "Cel" }
+  ],
+  "payload_format": "senml-json"
+}
+'@
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/flows/<flow-id>/execute" -ContentType "application/json" -Body $execute
+```
+
+Execute returns input-driven preview fields such as:
+
+- `execution_id`
+- `node_results`
+- `sink_results`
+- `observations_preview`
+- `events_preview`
+- `commands_preview`
+- `dlq_preview`
+- `simulated = true`
+- `side_effects_performed = false`
+
+Execute is still side-effect-free in this milestone. It does not publish MQTT, call HTTP, create observations, create commands, create events, or write DLQ records.
+
 The static dashboard Flow Builder uses this endpoint for both proposed drafts and stored flows. It surfaces planning fields such as `planned_path`, `planned_sinks`, `referenced_connectors`, and the conceptual sink flags while keeping `execution_supported = false`.
 Milestone 95 also lets the static dashboard highlight conceptual sink nodes in its graph layer when these flags are present.
 Milestone 97 keeps that same API usage but improves the draft authoring surface with typed inspectors for known source, middle-node, sink, and DLQ kinds.
@@ -253,6 +286,8 @@ Validation and dry-run scope rules:
 - `GET /flows/{flow_id}/validation`: `flows:read`
 - `POST /flows/dry-run`: `flows:read`
 - `POST /flows/{flow_id}/dry-run`: `flows:read`
+- `POST /flows/execute`: `flows:read`
+- `POST /flows/{flow_id}/execute`: `flows:read`
 
 Validation and dry-run also preserve tenant-aware flow ownership checks for stored flows in token mode.
 

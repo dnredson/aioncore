@@ -17,6 +17,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [Dashboard Model](DASHBOARD_MODEL.md)
 - [DLQ Model](DLQ_MODEL.md)
 - [Flow Model](FLOW_MODEL.md)
+- [Flow Execution Model](FLOW_EXECUTION_MODEL.md)
 - [NiFi Integration Model](NIFI_INTEGRATION_MODEL.md)
 
 ## Usage Guides
@@ -31,6 +32,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [Batch Ingestion Usage](BATCH_INGESTION_USAGE.md)
 - [Flow Usage](FLOW_USAGE.md)
 - [Flow Validation Usage](FLOW_VALIDATION_USAGE.md)
+- [Flow Execution Usage](FLOW_EXECUTION_USAGE.md)
 - [TTN Usage](TTN_USAGE.md)
 - [SmartSentinel Usage](SMARTSENTINEL_USAGE.md)
 - [MCP Usage](MCP_USAGE.md)
@@ -45,6 +47,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 
 Recent dashboard and flow ADRs:
 
+- [ADR 0093: Flow execution engine foundation](ADR/0093-flow-execution-engine-foundation.md)
 - [ADR 0092: Typed flow node inspectors](ADR/0092-typed-flow-node-inspectors.md)
 - [ADR 0091: Constrained visual flow editing](ADR/0091-constrained-visual-flow-editing.md)
 - [ADR 0090: Visual flow graph layer](ADR/0090-visual-flow-graph-layer.md)

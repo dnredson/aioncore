@@ -31,7 +31,7 @@ Milestone 60 adds selected tenant-aware write authorization on top of the Milest
   - `/observations` requires `observations:read`
   - `POST /observations` requires `observations:write`
   - `/dashboard/overview`, `/dashboard/timeseries/entities`, and `/dashboard/connectors/overview` require `dashboard:read`
-  - `/flows`, `/flows/{flow_id}`, `/flows/validate`, `/flows/dry-run`, `/flows/{flow_id}/validation`, and `/flows/{flow_id}/dry-run` require `flows:read` except `POST /flows/validate`, which also accepts `flows:write`
+  - `/flows`, `/flows/{flow_id}`, `/flows/validate`, `/flows/dry-run`, `/flows/execute`, `/flows/{flow_id}/validation`, `/flows/{flow_id}/dry-run`, and `/flows/{flow_id}/execute` require `flows:read` except `POST /flows/validate`, which also accepts `flows:write`
   - `POST /flows`, `PATCH /flows/{flow_id}`, `PUT /flows/{flow_id}/enable`, `PUT /flows/{flow_id}/disable`, and `DELETE /flows/{flow_id}` require `flows:write`
   - `/commands` and `/commands/{command_id}` require `commands:read`
   - selected generic command writes require `commands:create`, `commands:approve`, `commands:write`, `commands:claim`, or `commands:lease`
@@ -378,7 +378,7 @@ Scopes are additive. Principals should receive the minimum set required for thei
 - `connectors:admin` covers connector lifecycle mutation, TTN device-mapping administration, worker reconciliation, TTN live validation preflight, validation-related operator actions, enable/disable, and configuration updates.
 - `dashboard:read` covers read-only dashboard aggregation routes that summarize entities, time-series discovery, connectors, brokers, and worker health.
 - `dlq:read` covers DLQ list and detail inspection.
-- `flows:read` covers flow list and detail inspection plus validation and dry-run inspection.
+- `flows:read` covers flow list and detail inspection plus validation, dry-run, and simulated execute inspection.
 - `flows:write` covers flow creation, update, enable, disable, and deletion.
 - `provenance:read` covers provenance-oriented aggregate search and future provenance-heavy operational APIs.
 - `events:read` covers `/events` list and detail reads without broadening command, observation, or provenance access.
@@ -641,7 +641,7 @@ The table below describes the intended future protection model. It does not chan
 - Selected protected routes in this milestone return:
   - `401` for missing or invalid bearer tokens
   - `403` for valid authenticated principals missing the required scope
-- Stored flow validation and dry-run also return `403` for known cross-tenant access in `token` mode unless `admin:all` is present.
+- Stored flow validation, dry-run, and simulated execute also return `403` for known cross-tenant access in `token` mode unless `admin:all` is present.
 - Selected protected routes also emit:
   - `aion:AuthTokenAccepted`
   - `aion:AuthAccessDenied`

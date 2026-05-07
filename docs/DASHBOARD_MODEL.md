@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, and 97 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, optional static hosting through `aion-api`, the first read-only visual flow graph layer, constrained visual editing for proposed linear drafts only, and typed node inspectors for known draft node kinds so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
+The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, and 98 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, optional static hosting through `aion-api`, the first read-only visual flow graph layer, constrained visual editing for proposed linear drafts only, typed node inspectors for known draft node kinds, and a backend-only simulated flow execute foundation that the dashboard does not yet consume.
 
 ## Current Intent
 
@@ -123,6 +123,7 @@ It currently provides:
 - proposed-flow dry-run planning from `POST /flows/dry-run`
 - explicit flow create, enable, disable, and confirm-before-delete actions using the existing `/flows` write surface
 - explicit stored-flow validation and dry-run actions using the existing planning endpoints
+- no stored-flow execute UI yet even though backend simulated execute endpoints now exist
 
 ## Auth And Safety
 
@@ -150,6 +151,7 @@ Milestone 90 keeps several safety boundaries:
 - redaction of secret-like URL and token fragments in typed inspector fields
 - no automatic TTN live validation
 - no flow execution
+- no dashboard-triggered simulated execute surface yet
 - no drag-and-drop flow editing
 - no arbitrary visual graph editing
 - no direct graph editing for stored flows

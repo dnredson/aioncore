@@ -14,19 +14,23 @@ They are read-only and planning-oriented.
 - `GET /flows/{flow_id}/validation`
 - `POST /flows/dry-run`
 - `POST /flows/{flow_id}/dry-run`
+- `POST /flows/execute`
+- `POST /flows/{flow_id}/execute`
 
 Related dashboard read-only endpoints:
 
 - `GET /dashboard/flows`
 - `GET /dashboard/flows/{flow_id}`
 
-## Validation Vs Dry-Run
+## Validation Vs Dry-Run Vs Execute
 
 Validation answers: is the graph structurally usable?
 
 Dry-run answers: what path, sinks, and side effects would this flow conceptually imply if execution existed?
 
-Neither endpoint executes the flow.
+Execute answers: what do supported nodes preview when the flow is interpreted against explicit input?
+
+Validation and dry-run remain non-executing planning surfaces. Execute is still simulated and side-effect-free, but it now interprets supported node logic.
 
 ## No Side Effects
 
@@ -44,6 +48,11 @@ Validation and dry-run do not:
 Dry-run always returns:
 
 - `execution_supported = false`
+- `simulated = true`
+- `side_effects_performed = false`
+
+Execute in Milestone 98 also always returns:
+
 - `simulated = true`
 - `side_effects_performed = false`
 
@@ -208,3 +217,5 @@ Milestone 97 adds typed node inspectors on top of that constrained draft workflo
 - stored-flow copy-to-draft failures now report concrete reasons such as branching, multiple sources, multiple terminals, cycles, missing endpoints, and unsupported kinds
 
 This visual layer still does not execute flows, introduce arbitrary graph mutation, or introduce any side effects.
+
+Milestone 98 adds backend execute endpoints, but the dashboard still does not consume them in this milestone.

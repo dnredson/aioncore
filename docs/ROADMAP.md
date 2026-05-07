@@ -59,10 +59,11 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 95 visual flow graph layer in the static dashboard: `apps/aion-dashboard/` now adds the first Node-RED-like read-only visual graph layer for proposed and stored flows using dependency-free SVG; reuses existing `GET /dashboard/flows/{flow_id}`, `POST /flows/validate`, `GET /flows/{flow_id}/validation`, `POST /flows/dry-run`, and `POST /flows/{flow_id}/dry-run` responses for graph rendering, node detail inspection, validation markers, and conceptual sink highlighting; keeps the form-based builder foundation, optional `/ui/*` hosting, and secret redaction; and intentionally defers drag-and-drop editing, graph persistence, execution, broker subscriptions, MQTT/HTTP side effects, and any backend API changes.
 - Milestone 96 constrained visual flow editing in the static dashboard: `apps/aion-dashboard/` now adds safe proposed-draft graph editing for known linear patterns only, including selected-node edits, add/remove/reorder of transform/filter/rule chain nodes, automatic edge regeneration, and optional stored-flow copy-to-draft; keeps stored flows read-only in place; reuses the existing `/flows`, `/flows/validate`, `/flows/dry-run`, `/dashboard/flows`, and `/ingestion/connectors` APIs only; preserves secret redaction and optional `/ui/*` hosting; and intentionally defers arbitrary graph editing, drag-and-drop, execution, broker subscriptions, MQTT/HTTP side effects, and backend API changes.
 - Milestone 97 typed flow node inspectors in the static dashboard: `apps/aion-dashboard/` now adds typed inspectors for known constrained builder node kinds across sources, decoders, transforms, filters, rules, sinks, and DLQ planning; keeps the draft shape linear and static frontend-only; reuses the existing `/flows`, `/flows/validate`, `/flows/dry-run`, `/dashboard/flows`, and `/ingestion/connectors` APIs only; improves stored-flow copy rejection messages for unsupported shapes such as branching, cycles, multiple sources, multiple terminals, missing endpoints, and unsupported node kinds; preserves secret redaction and optional `/ui/*` hosting; and intentionally defers execution, arbitrary graph editing, broker subscriptions, MQTT/HTTP side effects, and backend API changes.
+- Milestone 98 flow execution engine foundation: `aion-api` now adds `POST /flows/execute` and `POST /flows/{flow_id}/execute`; a dedicated internal flow execution module; tenant-aware stored-flow and raw-message-backed simulated execution on `flows:read`; preview-only interpretation for supported source, decoder, transform, filter, rule, sink, and DLQ node kinds; and per-node plus per-sink preview responses while intentionally deferring broker subscriptions, MQTT publish, HTTP forward, observation/event/command/DLQ persistence, worker integration, and dashboard execution UI.
 
 ## Next
 
-1. Extend the constrained builder with richer typed validation hints, especially around mapping JSON and rule conditions, without introducing execution.
+1. Extend the simulated execution engine with richer mapping, rule, and branching semantics while keeping real side effects disabled.
 2. Review whether the optional `/ui/*` hosting should gain small readiness diagnostics or packaging helpers without changing its optional nature.
 3. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
 4. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
@@ -72,7 +73,7 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 
 - Cassandra telemetry adapter.
 - richer dashboard exploration UI and optional Grafana interoperability.
-- Node-RED-like visual flow editor and flow execution model.
+- Node-RED-like visual flow editor and real side-effecting flow execution model.
 - deeper flow simulation and typed node-kind validation.
 - MCP time-series query tools.
 - Production MCP transport.

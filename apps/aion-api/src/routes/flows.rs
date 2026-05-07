@@ -4,6 +4,7 @@ use crate::{
         require_scope, require_scope_for_write, tenant_for_created_resource, AuthContext,
     },
     error::ApiError,
+    flow_execution::{execute_flow, FlowExecutionRequest, FlowExecutionResponse},
     flow_support::{
         analyze_flow, FlowAnalysis, FlowEdgeDraft, FlowNodeDraft, FlowNodePlan, FlowPlannedSink,
         FlowReferencedConnector, FlowValidationIssue,
@@ -32,12 +33,14 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/flows", post(create_flow).get(list_flows))
         .route("/flows/validate", post(validate_proposed_flow))
         .route("/flows/dry-run", post(dry_run_proposed_flow))
+        .route("/flows/execute", post(execute_proposed_flow))
         .route(
             "/flows/:flow_id",
             get(get_flow).patch(update_flow).delete(delete_flow),
         )
         .route("/flows/:flow_id/validation", get(validate_stored_flow))
         .route("/flows/:flow_id/dry-run", post(dry_run_stored_flow))
+        .route("/flows/:flow_id/execute", post(execute_stored_flow))
         .route("/flows/:flow_id/enable", put(enable_flow))
         .route("/flows/:flow_id/disable", put(disable_flow))
 }
@@ -148,6 +151,21 @@ pub(crate) struct StoredDryRunRequest {
     pub payload_format: Option<String>,
     pub source_node_id: Option<String>,
     pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProposedFlowExecutionRequest {
+    pub flow_key: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub nodes: Vec<ProposedFlowNodeRequest>,
+    #[serde(default)]
+    pub edges: Vec<ProposedFlowEdgeRequest>,
+    #[serde(flatten)]
+    pub execution: FlowExecutionRequest,
 }
 
 #[derive(Debug, Serialize)]
@@ -277,6 +295,30 @@ async fn dry_run_proposed_flow(
     )))
 }
 
+async fn execute_proposed_flow(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<ProposedFlowExecutionRequest>,
+) -> Result<Json<FlowExecutionResponse>, ApiError> {
+    require_scope(&state, &auth, "/flows/execute", "flows:read")?;
+    let tenant_id = principal_tenant_or_default(&state, &auth)?;
+    let _ = (
+        request.name.as_ref(),
+        request.description.as_ref(),
+        request.enabled,
+    );
+
+    Ok(Json(execute_flow(
+        &state_for_tenant(&state, tenant_id),
+        tenant_id,
+        None,
+        request.flow_key,
+        &draft_nodes_from_requests(&request.nodes),
+        &draft_edges_from_requests(&request.edges),
+        &request.execution,
+    )?))
+}
+
 async fn list_flows(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -355,6 +397,26 @@ async fn dry_run_stored_flow(
         request.source_node_id,
         analysis,
     )))
+}
+
+async fn execute_stored_flow(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(flow_id): Path<Uuid>,
+    Json(request): Json<FlowExecutionRequest>,
+) -> Result<Json<FlowExecutionResponse>, ApiError> {
+    require_scope(&state, &auth, "/flows/:flow_id/execute", "flows:read")?;
+    let flow = resolve_flow_for_read(&state, &auth, "/flows/:flow_id/execute", flow_id)?;
+
+    Ok(Json(execute_flow(
+        &state_for_tenant(&state, flow.tenant_id),
+        flow.tenant_id,
+        Some(flow.id),
+        Some(flow.flow_key.clone()),
+        &draft_nodes_from_flow(&flow),
+        &draft_edges_from_flow(&flow),
+        &request,
+    )?))
 }
 
 async fn update_flow(
