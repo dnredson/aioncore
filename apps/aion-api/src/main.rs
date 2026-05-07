@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() {
-    let (state, diagnostics) = match aion_api::AppState::from_env_with_diagnostics() {
+    let (state, mut diagnostics) = match aion_api::AppState::from_env_with_diagnostics() {
         Ok(value) => value,
         Err(error) => {
             eprintln!("{error}");
@@ -10,10 +10,19 @@ async fn main() {
         }
     };
 
-    let app = aion_api::app_with_state(state.clone());
+    let dashboard_static = match aion_api::DashboardStaticConfig::from_env() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+    diagnostics.dashboard_static = dashboard_static.diagnostics();
+
+    let app = aion_api::app_with_state_and_dashboard_static(state.clone(), dashboard_static);
 
     eprintln!(
-        "startup storage backend={}, database_url_provided={}, migrations_applied={}, auth_mode={}, auth_enforcement_level={}, auth_dev_bypass={}, bootstrap_admin_configured={}",
+        "startup storage backend={}, database_url_provided={}, migrations_applied={}, auth_mode={}, auth_enforcement_level={}, auth_dev_bypass={}, bootstrap_admin_configured={}, dashboard_static_enabled={}, dashboard_static_path_configured={}, dashboard_static_available={}",
         diagnostics.storage_backend.as_str(),
         diagnostics.database_url_provided,
         diagnostics
@@ -27,7 +36,10 @@ async fn main() {
             aion_api::AuthEnforcementLevel::Full => "full",
         },
         diagnostics.auth_dev_bypass,
-        diagnostics.auth_bootstrap_admin_configured
+        diagnostics.auth_bootstrap_admin_configured,
+        diagnostics.dashboard_static.enabled,
+        diagnostics.dashboard_static.path_configured,
+        diagnostics.dashboard_static.available
     );
 
     match diagnostics.auth_mode {

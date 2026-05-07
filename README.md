@@ -45,6 +45,15 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8080/ready"
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/auth/whoami"
 ```
 
+Optional local dashboard hosting through `aion-api` is available when you set:
+
+```powershell
+$env:AIONCORE_DASHBOARD_STATIC_DIR = "apps/aion-dashboard"
+cargo run -p aion-api
+```
+
+Then open `http://localhost:8080/ui/`.
+
 PostgreSQL mode is available when you explicitly set:
 
 - `AIONCORE_STORAGE_BACKEND=postgres`
@@ -58,7 +67,7 @@ Detailed runtime validation and PostgreSQL testing notes live in [Runtime Valida
 - SQL migrations and PostgreSQL/TimescaleDB persistence foundations exist, but in-memory remains the reference development behavior.
 - Authentication and authorization are still incremental.
 - Connector, TTN, SmartSentinel, MCP, and command/executor flows have usage examples in focused guides under `docs/`.
-- A lightweight static dashboard skeleton now exists under [apps/aion-dashboard](apps/aion-dashboard/README.md) for read-only overview, connector, time-series, and flow inspection.
+- A lightweight static dashboard now exists under [apps/aion-dashboard](apps/aion-dashboard/README.md) for overview, connector, time-series, and flow inspection, and `aion-api` can optionally serve it from `/ui/` for local demos.
 - A storage-only flow API foundation exists for future dashboard and execution work, but no visual editor or flow runtime is implemented yet.
 - A storage-only DLQ API foundation exists for future replay, quarantine, and reliable-ingestion workflows, but no automatic routing or replay runtime is implemented yet.
 

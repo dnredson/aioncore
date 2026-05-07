@@ -385,12 +385,37 @@ This keeps the current browser compatibility story simple: any modern browser th
 
 ## Optional Static Serving From `aion-api`
 
-Milestone 93 does not add optional static serving from `aion-api`.
+Milestone 94 adds optional static serving from `aion-api`.
 
-Use a standalone static file server for now:
+Enable it by setting:
+
+```powershell
+$env:AIONCORE_DASHBOARD_STATIC_DIR = "apps/aion-dashboard"
+cargo run -p aion-api
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8080/ui/
+```
+
+Behavior:
+
+- if `AIONCORE_DASHBOARD_STATIC_DIR` is unset or empty, `/ui` is not served and all existing API behavior remains unchanged
+- `GET /ui` and `GET /ui/` serve `index.html`
+- `GET /ui/dashboard.js`, `GET /ui/styles.css`, and `GET /ui/js/*.js` serve the existing static assets directly from the configured directory
+- `/dashboard/*` remains the dashboard API namespace and is never used for static hosting
+
+If you prefer a separate static server, the previous local option still works:
 
 ```powershell
 python -m http.server 5173 --directory apps/aion-dashboard
 ```
 
-This avoids any Rust API behavior change while keeping the dashboard easy to demo locally.
+Deliberate limits for this milestone:
+
+- static assets are served only from the configured directory
+- assets are not embedded into the `aion-api` binary
+- static `/ui/*` assets are not auth-protected in this milestone
+- no frontend build tooling, `node_modules`, or external CDNs are introduced

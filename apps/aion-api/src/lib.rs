@@ -20,7 +20,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::Response,
-    routing::{get, post, put},
+    routing::{get, get_service, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -29,10 +29,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    env,
+    env, fs,
+    path::{Path as FsPath, PathBuf},
     str::FromStr,
     sync::{Arc, RwLock},
 };
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 mod ai_context;
@@ -154,6 +156,9 @@ pub struct StartupError {
     message: String,
 }
 
+pub const DASHBOARD_STATIC_ENV_VAR: &str = "AIONCORE_DASHBOARD_STATIC_DIR";
+pub const DASHBOARD_STATIC_MOUNT_PATH: &str = "/ui";
+
 impl StartupError {
     fn new(message: impl Into<String>) -> Self {
         Self {
@@ -186,6 +191,12 @@ impl StartupError {
     fn backend_initialization(message: impl Into<String>) -> Self {
         Self::new(message)
     }
+
+    fn invalid_dashboard_static_dir(path: &str, reason: &str) -> Self {
+        Self::new(format!(
+            "{DASHBOARD_STATIC_ENV_VAR} must point to an existing directory; got '{path}': {reason}"
+        ))
+    }
 }
 
 impl std::fmt::Display for StartupError {
@@ -217,6 +228,77 @@ pub struct StartupDiagnostics {
     pub auth_enforcement_level: AuthEnforcementLevel,
     pub auth_dev_bypass: bool,
     pub auth_bootstrap_admin_configured: bool,
+    pub dashboard_static: DashboardStaticDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardStaticConfig {
+    directory: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DashboardStaticDiagnostics {
+    pub enabled: bool,
+    pub path_configured: bool,
+    pub available: bool,
+}
+
+impl DashboardStaticConfig {
+    pub fn disabled() -> Self {
+        Self { directory: None }
+    }
+
+    pub fn from_env() -> Result<Self, StartupError> {
+        Self::from_env_var(env::var(DASHBOARD_STATIC_ENV_VAR).ok())
+    }
+
+    pub fn from_env_var(value: Option<String>) -> Result<Self, StartupError> {
+        let Some(path) = value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(Self::disabled());
+        };
+
+        let directory = PathBuf::from(path);
+        validate_dashboard_static_dir(&directory, path)?;
+
+        Ok(Self {
+            directory: Some(directory),
+        })
+    }
+
+    pub fn diagnostics(&self) -> DashboardStaticDiagnostics {
+        let enabled = self.directory.is_some();
+        DashboardStaticDiagnostics {
+            enabled,
+            path_configured: enabled,
+            available: enabled,
+        }
+    }
+
+    fn into_router(self) -> Option<Router> {
+        let directory = self.directory?;
+        let service = get_service(ServeDir::new(directory).append_index_html_on_directories(true))
+            .handle_error(|_| async { StatusCode::INTERNAL_SERVER_ERROR });
+
+        Some(Router::new().nest_service(DASHBOARD_STATIC_MOUNT_PATH, service))
+    }
+}
+
+fn validate_dashboard_static_dir(directory: &FsPath, raw_value: &str) -> Result<(), StartupError> {
+    let metadata = fs::metadata(directory)
+        .map_err(|err| StartupError::invalid_dashboard_static_dir(raw_value, &err.to_string()))?;
+
+    if !metadata.is_dir() {
+        return Err(StartupError::invalid_dashboard_static_dir(
+            raw_value,
+            "path is not a directory",
+        ));
+    }
+
+    Ok(())
 }
 
 impl AppState {
@@ -307,6 +389,7 @@ impl AppState {
                     auth_enforcement_level: auth.enforcement_level(),
                     auth_dev_bypass: auth.dev_bypass(),
                     auth_bootstrap_admin_configured: auth.bootstrap_admin_configured(),
+                    dashboard_static: DashboardStaticConfig::disabled().diagnostics(),
                 },
             )),
             StorageBackendConfig::Postgres { database_url } => {
@@ -336,6 +419,7 @@ impl AppState {
                         auth_enforcement_level: auth.enforcement_level(),
                         auth_dev_bypass: auth.dev_bypass(),
                         auth_bootstrap_admin_configured: auth.bootstrap_admin_configured(),
+                        dashboard_static: DashboardStaticConfig::disabled().diagnostics(),
                     },
                 ))
             }
@@ -471,12 +555,20 @@ pub fn app() -> Router {
 }
 
 pub fn app_from_env() -> Result<Router, StartupError> {
-    Ok(app_with_state(AppState::from_env()?))
+    Ok(app_with_state_and_dashboard_static(
+        AppState::from_env()?,
+        DashboardStaticConfig::from_env()?,
+    ))
 }
 
 pub fn app_from_env_with_diagnostics() -> Result<(Router, StartupDiagnostics), StartupError> {
-    let (state, diagnostics) = AppState::from_env_with_diagnostics()?;
-    Ok((app_with_state(state), diagnostics))
+    let (state, mut diagnostics) = AppState::from_env_with_diagnostics()?;
+    let dashboard_static = DashboardStaticConfig::from_env()?;
+    diagnostics.dashboard_static = dashboard_static.diagnostics();
+    Ok((
+        app_with_state_and_dashboard_static(state, dashboard_static),
+        diagnostics,
+    ))
 }
 
 pub async fn start_mqtt_ingest_if_enabled(state: AppState) -> Result<(), StartupError> {
@@ -489,7 +581,14 @@ pub async fn start_connector_workers_if_enabled(state: AppState) -> Result<(), S
 }
 
 pub fn app_with_state(state: AppState) -> Router {
-    Router::new()
+    app_with_state_and_dashboard_static(state, DashboardStaticConfig::disabled())
+}
+
+pub fn app_with_state_and_dashboard_static(
+    state: AppState,
+    dashboard_static: DashboardStaticConfig,
+) -> Router {
+    let router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .merge(routes::auth::router())
@@ -530,7 +629,13 @@ pub fn app_with_state(state: AppState) -> Router {
             state.clone(),
             auth_context_middleware,
         ))
-        .with_state(state)
+        .with_state(state);
+
+    if let Some(static_router) = dashboard_static.into_router() {
+        router.merge(static_router)
+    } else {
+        router
+    }
 }
 
 async fn auth_context_middleware(
@@ -2201,6 +2306,10 @@ mod tests {
     };
     use chrono::Duration;
     use serde_json::json;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -2246,6 +2355,126 @@ mod tests {
         assert_eq!(body["auth"]["bootstrap_admin_configured"], false);
         assert_eq!(body["mqtt"]["enabled"], false);
         assert_eq!(body["migrations_ready"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn dashboard_static_serving_is_disabled_by_default() {
+        let app = app();
+
+        let static_response = app
+            .clone()
+            .oneshot(Request::builder().uri("/ui/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(static_response.status(), StatusCode::NOT_FOUND);
+
+        let dashboard_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dashboard_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dashboard_static_serving_returns_index_for_ui_root() {
+        let temp_dir = create_temp_dashboard_dir();
+        fs::write(
+            temp_dir.join("index.html"),
+            "<!doctype html><html><body>Aion Dashboard</body></html>",
+        )
+        .unwrap();
+        fs::write(temp_dir.join("dashboard.js"), "console.log('entry');").unwrap();
+
+        let app = app_with_state_and_dashboard_static(
+            AppState::local(),
+            DashboardStaticConfig::from_env_var(Some(temp_dir.to_string_lossy().into_owned()))
+                .unwrap(),
+        );
+
+        let ui_root = app
+            .clone()
+            .oneshot(Request::builder().uri("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                ui_root.status(),
+                StatusCode::OK | StatusCode::PERMANENT_REDIRECT | StatusCode::TEMPORARY_REDIRECT
+            ),
+            "unexpected /ui status {}",
+            ui_root.status()
+        );
+        if ui_root.status().is_redirection() {
+            assert_eq!(ui_root.headers()["location"], "/ui/");
+        } else {
+            assert!(response_text(ui_root).await.contains("Aion Dashboard"));
+        }
+
+        let index = app
+            .clone()
+            .oneshot(Request::builder().uri("/ui/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(index.status(), StatusCode::OK);
+        assert!(response_text(index).await.contains("Aion Dashboard"));
+
+        let entrypoint = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/dashboard.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entrypoint.status(), StatusCode::OK);
+        assert!(response_text(entrypoint)
+            .await
+            .contains("console.log('entry');"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_static_serving_does_not_shadow_dashboard_api_routes() {
+        let temp_dir = create_temp_dashboard_dir();
+        fs::write(temp_dir.join("index.html"), "static root").unwrap();
+        fs::create_dir_all(temp_dir.join("dashboard")).unwrap();
+        fs::write(temp_dir.join("dashboard").join("overview"), "not api").unwrap();
+
+        let app = app_with_state_and_dashboard_static(
+            AppState::local(),
+            DashboardStaticConfig::from_env_var(Some(temp_dir.to_string_lossy().into_owned()))
+                .unwrap(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert!(body["generated_at"].is_string());
+        assert!(body["entities_count"].is_number());
+    }
+
+    #[test]
+    fn dashboard_static_config_rejects_invalid_directory() {
+        let missing_dir = create_temp_dashboard_dir().join("missing");
+        let error =
+            DashboardStaticConfig::from_env_var(Some(missing_dir.to_string_lossy().into_owned()))
+                .unwrap_err();
+
+        assert!(error.to_string().contains(DASHBOARD_STATIC_ENV_VAR));
     }
 
     #[tokio::test]
@@ -17063,5 +17292,20 @@ mod tests {
     async fn to_json(response: axum::response::Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn response_text(response: axum::response::Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn create_temp_dashboard_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("aioncore-dashboard-static-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }

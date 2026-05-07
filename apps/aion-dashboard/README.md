@@ -148,13 +148,40 @@ Because the frontend is still no-build, any simple static file server is suffici
 
 ## Optional API Static Serving
 
-Milestone 93 defers optional static serving from `aion-api`.
+Milestone 94 adds optional static serving from `aion-api` for local demos and Windows environments where `python -m http.server` is not available.
 
-Reason:
+Enable it by setting:
+
+```powershell
+$env:AIONCORE_DASHBOARD_STATIC_DIR = "apps/aion-dashboard"
+cargo run -p aion-api
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8080/ui/
+```
+
+Behavior:
+
+- if `AIONCORE_DASHBOARD_STATIC_DIR` is unset or empty, `aion-api` behavior is unchanged and `/ui` is not served
+- `GET /ui` and `GET /ui/` serve `index.html`
+- `GET /ui/dashboard.js`, `GET /ui/styles.css`, and `GET /ui/js/*.js` serve the existing no-build assets directly
+- the existing `/dashboard/*` routes remain API routes and are not shadowed by static files
+
+This hosting remains intentionally optional because:
 
 - the maintainability split was low risk and self-contained
-- backend behavior and validation scope remain unchanged
-- the dashboard is already easy to serve with a one-line local static server
+- backend API behavior must remain unchanged when the feature is off
+- local operators may still prefer a separate static server
+- embedding assets into the Rust binary would make small frontend edits and asset replacement less operationally convenient
+
+Static assets are not auth-protected in this milestone:
+
+- the goal is low-friction local serving for demos and development
+- existing API auth behavior stays where it already exists
+- stricter browser-facing auth and transport controls remain future work
 
 If a later milestone adds `AIONCORE_DASHBOARD_STATIC_DIR`, it should remain optional and should not change existing API route behavior.
 
