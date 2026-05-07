@@ -55,22 +55,56 @@ const DRY_RUN_EFFECTS = [
   ["would_use_dlq", "Use DLQ"],
 ];
 
+const SOURCE_KIND_OPTIONS = [
+  "mqtt_subscribe",
+  "http_input",
+  "ttn_uplink",
+  "internal_observation",
+];
+
+const DECODER_KIND_OPTIONS = [
+  "senml_decode",
+  "ultralight_decode",
+];
+
+const TRANSFORM_KIND_OPTIONS = [
+  "canonical_json",
+  "json_map",
+];
+
+const FILTER_KIND_OPTIONS = [
+  "filter_condition",
+];
+
+const RULE_KIND_OPTIONS = [
+  "threshold_rule",
+];
+
+const SINK_KIND_OPTIONS = [
+  "internal_observation_store",
+  "raw_message_store",
+  "mqtt_publish",
+  "http_forward",
+  "event_create",
+  "command_create",
+];
+
+const DLQ_KIND_OPTIONS = [
+  "dlq",
+];
+
+const EDITABLE_CHAIN_NODE_TYPES = new Set(["decoder", "transform", "filter", "rule"]);
+const STORED_COPY_ALLOWED_NODE_TYPES = new Set(["source", "decoder", "transform", "filter", "rule", "sink", "dlq"]);
+
 export function initializeFlowBuilder() {
-  const form = document.getElementById("flow-builder-form");
-  form.elements.flow_key.value = "mqtt-normalize-store";
-  form.elements.name.value = "MQTT Normalize Store";
-  form.elements.description.value = "MQTT uplink to canonical observation planning";
-  form.elements.source_node_id.value = "source-1";
-  form.elements.source_name.value = "MQTT Source";
-  form.elements.transform_node_id.value = "decoder-1";
-  form.elements.transform_name.value = "SenML Decode";
-  form.elements.sink_node_id.value = "sink-1";
-  form.elements.sink_name.value = "Observation Store";
-  form.elements.metadata.value = '{\n  "category": "ingestion",\n  "notes": "execution not implemented"\n}';
   document.getElementById("flow-proposed-sample-payload").value = DEFAULT_FLOW_SAMPLE_PAYLOAD;
   document.getElementById("flow-stored-sample-payload").value = DEFAULT_FLOW_SAMPLE_PAYLOAD;
   populateFlowConnectorSelects([]);
-  syncFlowDraftFromForm({ resetAdvancedOverride: false, invalidateChecks: true });
+  GRAPH_SELECTION.proposed = null;
+  state.flowDraft = createDefaultFlowDraft();
+  renderFlowBuilderFormFromDraft();
+  invalidateProposedFlowChecks({ preserveGraph: true });
+  renderFlowDraftPreview();
 }
 
 export function bindFlowEvents() {
@@ -82,17 +116,11 @@ export function bindFlowEvents() {
     loadFlowBuilderConnectors(true);
   });
 
-  document.getElementById("flow-source-kind").addEventListener("change", () => {
-    syncFlowConnectorFieldState();
-    syncFlowDraftFromForm({ resetAdvancedOverride: false, invalidateChecks: true });
-  });
-
-  document.getElementById("flow-sink-kind").addEventListener("change", () => {
-    syncFlowConnectorFieldState();
-    syncFlowDraftFromForm({ resetAdvancedOverride: false, invalidateChecks: true });
-  });
-
   document.getElementById("flow-builder-form").addEventListener("input", () => {
+    syncFlowDraftFromForm({ resetAdvancedOverride: false, invalidateChecks: true });
+  });
+
+  document.getElementById("flow-builder-form").addEventListener("change", () => {
     syncFlowDraftFromForm({ resetAdvancedOverride: false, invalidateChecks: true });
   });
 
@@ -156,6 +184,18 @@ export function bindFlowEvents() {
     }
   });
 
+  document.getElementById("flow-add-transform-button").addEventListener("click", () => {
+    addDraftChainNode("transform");
+  });
+
+  document.getElementById("flow-add-filter-button").addEventListener("click", () => {
+    addDraftChainNode("filter");
+  });
+
+  document.getElementById("flow-add-rule-button").addEventListener("click", () => {
+    addDraftChainNode("rule");
+  });
+
   document.getElementById("flow-refresh-detail-button").addEventListener("click", () => {
     if (state.selectedFlowId) {
       loadFlowDetail(state.selectedFlowId, true);
@@ -195,6 +235,10 @@ export function bindFlowEvents() {
     } catch (error) {
       handleError(error);
     }
+  });
+
+  document.getElementById("flow-copy-to-draft-button").addEventListener("click", () => {
+    copyStoredFlowToDraft();
   });
 
   document.getElementById("flow-enable-button").addEventListener("click", () => {
@@ -322,7 +366,20 @@ function populateFlowConnectorSelects(connectors, overview) {
   const selectedSource = sourceSelect.value;
   const selectedSink = sinkSelect.value;
   const overviewById = new Map((overview?.connectors || []).map((item) => [item.connector_id, item]));
-  const options = (connectors || []).map((connector) => {
+  const options = buildConnectorOptionList(connectors, overviewById);
+  const html = renderConnectorOptions(options);
+
+  sourceSelect.innerHTML = html;
+  sinkSelect.innerHTML = html;
+  sourceSelect.value = options.some((item) => item.value === selectedSource) ? selectedSource : "";
+  sinkSelect.value = options.some((item) => item.value === selectedSink) ? selectedSink : "";
+  syncFlowConnectorFieldState();
+  renderDraftChain();
+  renderProposedGraphState();
+}
+
+function buildConnectorOptionList(connectors, overviewById) {
+  return (connectors || []).map((connector) => {
     const summary = overviewById.get(connector.id);
     const label = connector.display_name || connector.connector_key || connector.id;
     const suffix = [connector.connector_type, summary?.payload_format].filter(Boolean).join(" / ");
@@ -331,14 +388,12 @@ function populateFlowConnectorSelects(connectors, overview) {
       label: suffix ? `${label} (${suffix})` : label,
     };
   });
-  const html = ['<option value="">None</option>'].concat(options.map((option) => `
-    <option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>
+}
+
+function renderConnectorOptions(options, selectedValue = "") {
+  return ['<option value="">None</option>'].concat(options.map((option) => `
+    <option value="${escapeHtml(option.value)}"${option.value === selectedValue ? " selected" : ""}>${escapeHtml(option.label)}</option>
   `)).join("");
-  sourceSelect.innerHTML = html;
-  sinkSelect.innerHTML = html;
-  sourceSelect.value = options.some((item) => item.value === selectedSource) ? selectedSource : "";
-  sinkSelect.value = options.some((item) => item.value === selectedSink) ? selectedSink : "";
-  syncFlowConnectorFieldState();
 }
 
 function syncFlowConnectorFieldState() {
@@ -346,8 +401,10 @@ function syncFlowConnectorFieldState() {
   const sinkKind = cleanString(document.getElementById("flow-sink-kind").value);
   const sourceConnector = document.getElementById("flow-source-connector");
   const sinkConnector = document.getElementById("flow-sink-connector");
+
   sourceConnector.disabled = !FLOW_SOURCE_KINDS_WITH_CONNECTOR.has(sourceKind);
   sinkConnector.disabled = !FLOW_SINK_KINDS_WITH_CONNECTOR.has(sinkKind);
+
   if (sourceConnector.disabled) {
     sourceConnector.value = "";
   }
@@ -361,9 +418,46 @@ function resetFlowBuilder() {
   document.getElementById("flow-advanced-json").value = "";
   document.getElementById("flow-proposed-sample-payload").value = DEFAULT_FLOW_SAMPLE_PAYLOAD;
   GRAPH_SELECTION.proposed = null;
-  initializeFlowBuilder();
-  invalidateProposedFlowChecks();
+  state.flowDraft = createDefaultFlowDraft();
+  renderFlowBuilderFormFromDraft();
+  invalidateProposedFlowChecks({ preserveGraph: true });
+  renderFlowDraftPreview();
   setStatus("Flow builder reset.");
+}
+
+function createDefaultFlowDraft() {
+  const draft = {
+    flow_key: "mqtt-normalize-store",
+    name: "MQTT Normalize Store",
+    description: "MQTT uplink to canonical observation planning",
+    enabled: false,
+    metadata: {
+      category: "ingestion",
+      notes: "execution not implemented",
+    },
+    nodes: [
+      {
+        node_id: "source-1",
+        node_type: "source",
+        name: "MQTT Source",
+        config: { kind: "mqtt_subscribe" },
+      },
+      {
+        node_id: "transform-1",
+        node_type: "transform",
+        name: "Canonical Map",
+        config: { kind: "canonical_json" },
+      },
+      {
+        node_id: "sink-1",
+        node_type: "sink",
+        name: "Observation Store",
+        config: { kind: "internal_observation_store" },
+      },
+    ],
+    edges: [],
+  };
+  return finalizeDraftGraph(draft);
 }
 
 function syncFlowDraftFromForm(options = {}) {
@@ -371,81 +465,91 @@ function syncFlowDraftFromForm(options = {}) {
   if (resetAdvancedOverride) {
     document.getElementById("flow-advanced-json").value = "";
   }
-  state.flowDraft = buildFlowDraftFromForm();
-  if (invalidateChecks) {
-    invalidateProposedFlowChecks({ preserveGraph: true });
+
+  try {
+    if (!state.flowDraft) {
+      state.flowDraft = createDefaultFlowDraft();
+    }
+
+    state.flowDraft = finalizeDraftGraph(applyFormFieldsToDraft(state.flowDraft));
+    if (invalidateChecks) {
+      invalidateProposedFlowChecks({ preserveGraph: true });
+    }
+  } catch (_error) {
+    if (invalidateChecks) {
+      invalidateProposedFlowChecks({ preserveGraph: true });
+    }
   }
   renderFlowDraftPreview();
 }
 
-function buildFlowDraftFromForm() {
+function applyFormFieldsToDraft(draft) {
   const form = document.getElementById("flow-builder-form");
-  const flowKey = requireNonEmpty(form.elements.flow_key.value, "Flow key");
-  const name = requireNonEmpty(form.elements.name.value, "Name");
-  const sourceNodeId = requireNonEmpty(form.elements.source_node_id.value, "Source node ID");
-  const transformNodeId = requireNonEmpty(form.elements.transform_node_id.value, "Transform node ID");
-  const sinkNodeId = requireNonEmpty(form.elements.sink_node_id.value, "Sink node ID");
-  const sourceKind = requireNonEmpty(form.elements.source_kind.value, "Source kind");
-  const transformKind = requireNonEmpty(form.elements.transform_kind.value, "Transform kind");
-  const sinkKind = requireNonEmpty(form.elements.sink_kind.value, "Sink kind");
+  const next = cloneJson(draft);
+  const sourceNode = getSourceNode(next);
+  const terminalNode = getTerminalNode(next);
   const metadata = readOptionalJsonText(form.elements.metadata.value, "Metadata JSON");
 
-  const sourceConnectorId = cleanString(form.elements.source_connector_id.value);
-  const sinkConnectorId = cleanString(form.elements.sink_connector_id.value);
+  next.flow_key = requireNonEmpty(form.elements.flow_key.value, "Flow key");
+  next.name = requireNonEmpty(form.elements.name.value, "Name");
+  next.description = cleanString(form.elements.description.value) || undefined;
+  next.enabled = Boolean(form.elements.enabled.checked);
+  next.metadata = metadata;
 
-  const sourceConfig = { kind: sourceKind };
-  if (FLOW_SOURCE_KINDS_WITH_CONNECTOR.has(sourceKind) && sourceConnectorId) {
-    sourceConfig.connector_id = sourceConnectorId;
+  sourceNode.node_id = requireNonEmpty(form.elements.source_node_id.value, "Source node ID");
+  sourceNode.name = cleanString(form.elements.source_name.value) || undefined;
+  sourceNode.node_type = "source";
+  sourceNode.config = buildNodeConfig("source", requireNonEmpty(form.elements.source_kind.value, "Source kind"), cleanString(form.elements.source_connector_id.value));
+
+  terminalNode.node_id = requireNonEmpty(form.elements.sink_node_id.value, "Sink node ID");
+  terminalNode.name = cleanString(form.elements.sink_name.value) || undefined;
+  const sinkKind = requireNonEmpty(form.elements.sink_kind.value, "Sink kind");
+  terminalNode.node_type = sinkKind === "dlq" ? "dlq" : "sink";
+  terminalNode.config = buildNodeConfig(terminalNode.node_type, sinkKind, cleanString(form.elements.sink_connector_id.value));
+
+  return next;
+}
+
+function renderFlowBuilderFormFromDraft() {
+  const form = document.getElementById("flow-builder-form");
+  const draft = state.flowDraft || createDefaultFlowDraft();
+  const sourceNode = getSourceNode(draft);
+  const terminalNode = getTerminalNode(draft);
+  const sourceKind = cleanString(sourceNode?.config?.kind) || SOURCE_KIND_OPTIONS[0];
+  const sinkKind = cleanString(terminalNode?.config?.kind) || SINK_KIND_OPTIONS[0];
+
+  form.elements.flow_key.value = draft.flow_key || "";
+  form.elements.name.value = draft.name || "";
+  form.elements.description.value = draft.description || "";
+  form.elements.enabled.checked = Boolean(draft.enabled);
+  form.elements.metadata.value = draft.metadata ? JSON.stringify(redactSecrets(draft.metadata), null, 2) : "";
+
+  form.elements.source_node_id.value = sourceNode?.node_id || "";
+  form.elements.source_name.value = sourceNode?.name || "";
+  form.elements.source_kind.value = SOURCE_KIND_OPTIONS.includes(sourceKind) ? sourceKind : SOURCE_KIND_OPTIONS[0];
+  form.elements.source_connector_id.value = FLOW_SOURCE_KINDS_WITH_CONNECTOR.has(sourceKind)
+    ? cleanString(sourceNode?.config?.connector_id)
+    : "";
+
+  form.elements.sink_node_id.value = terminalNode?.node_id || "";
+  form.elements.sink_name.value = terminalNode?.name || "";
+  form.elements.sink_kind.value = sinkKind === "dlq" || SINK_KIND_OPTIONS.includes(sinkKind) ? sinkKind : SINK_KIND_OPTIONS[0];
+  form.elements.sink_connector_id.value = FLOW_SINK_KINDS_WITH_CONNECTOR.has(sinkKind)
+    ? cleanString(terminalNode?.config?.connector_id)
+    : "";
+
+  syncFlowConnectorFieldState();
+}
+
+function buildNodeConfig(nodeType, kind, connectorId) {
+  const config = { kind };
+  if (nodeType === "source" && FLOW_SOURCE_KINDS_WITH_CONNECTOR.has(kind) && connectorId) {
+    config.connector_id = connectorId;
   }
-
-  const transformConfig = { kind: transformKind };
-  const sinkConfig = { kind: sinkKind };
-  if (FLOW_SINK_KINDS_WITH_CONNECTOR.has(sinkKind) && sinkConnectorId) {
-    sinkConfig.connector_id = sinkConnectorId;
+  if ((nodeType === "sink" || nodeType === "dlq") && FLOW_SINK_KINDS_WITH_CONNECTOR.has(kind) && connectorId) {
+    config.connector_id = connectorId;
   }
-
-  return {
-    flow_key: flowKey,
-    name,
-    description: cleanString(form.elements.description.value) || undefined,
-    enabled: Boolean(form.elements.enabled.checked),
-    nodes: [
-      {
-        node_id: sourceNodeId,
-        node_type: "source",
-        name: cleanString(form.elements.source_name.value) || undefined,
-        config: sourceConfig,
-        position: { x: 60, y: 120 },
-      },
-      {
-        node_id: transformNodeId,
-        node_type: transformKind === "filter_condition" ? "filter" : "decoder",
-        name: cleanString(form.elements.transform_name.value) || undefined,
-        config: transformConfig,
-        position: { x: 300, y: 120 },
-      },
-      {
-        node_id: sinkNodeId,
-        node_type: sinkKind === "dlq" ? "dlq" : "sink",
-        name: cleanString(form.elements.sink_name.value) || undefined,
-        config: sinkConfig,
-        position: { x: 540, y: 120 },
-      },
-    ],
-    edges: [
-      {
-        edge_id: `${sourceNodeId}-to-${transformNodeId}`,
-        source_node_id: sourceNodeId,
-        target_node_id: transformNodeId,
-      },
-      {
-        edge_id: `${transformNodeId}-to-${sinkNodeId}`,
-        source_node_id: transformNodeId,
-        target_node_id: sinkNodeId,
-      },
-    ],
-    metadata,
-  };
+  return config;
 }
 
 function getEffectiveFlowDraft() {
@@ -453,13 +557,13 @@ function getEffectiveFlowDraft() {
   if (advanced) {
     const parsed = parseJson(advanced, "Advanced JSON override");
     validateFlowDraftShape(parsed);
-    state.flowDraft = parsed;
+    state.flowDraft = state.flowDraft || createDefaultFlowDraft();
     renderFlowDraftPreview();
     return parsed;
   }
 
   if (!state.flowDraft) {
-    syncFlowDraftFromForm({ resetAdvancedOverride: false, invalidateChecks: false });
+    state.flowDraft = createDefaultFlowDraft();
   }
   validateFlowDraftShape(state.flowDraft);
   return state.flowDraft;
@@ -475,8 +579,8 @@ function validateFlowDraftShape(draft) {
   if (!cleanString(draft.name)) {
     throw new Error("Flow draft requires name.");
   }
-  if (!Array.isArray(draft.nodes) || draft.nodes.length === 0) {
-    throw new Error("Flow draft requires nodes.");
+  if (!Array.isArray(draft.nodes) || draft.nodes.length < 2) {
+    throw new Error("Flow draft requires at least source and sink nodes.");
   }
   if (!Array.isArray(draft.edges) || draft.edges.length === 0) {
     throw new Error("Flow draft requires edges.");
@@ -486,22 +590,67 @@ function validateFlowDraftShape(draft) {
 function renderFlowDraftPreview() {
   const preview = document.getElementById("flow-preview-json");
   const builderStatus = document.getElementById("flow-builder-status");
+
   try {
-    const draft = cleanString(document.getElementById("flow-advanced-json").value)
+    const advanced = cleanString(document.getElementById("flow-advanced-json").value);
+    const draft = advanced
       ? parseJson(document.getElementById("flow-advanced-json").value, "Advanced JSON override")
-      : state.flowDraft || buildFlowDraftFromForm();
+      : finalizeDraftGraph(state.flowDraft || createDefaultFlowDraft());
+
     preview.textContent = JSON.stringify(redactSecrets(draft), null, 2);
-    builderStatus.textContent = cleanString(document.getElementById("flow-advanced-json").value)
-      ? "Advanced JSON override is active. Preview stays redacted for display."
-      : "Guided builder output is active. Preview stays redacted for display.";
+    builderStatus.textContent = advanced
+      ? "Advanced JSON override is active. Constrained visual editing is disabled until the override is cleared. Preview stays redacted for display."
+      : "Guided builder output is active. Constrained visual editing is limited to a linear source -> chain -> sink draft. Preview stays redacted for display.";
+
+    renderDraftChain();
     renderProposedGraphState(draft);
   } catch (error) {
     preview.textContent = error.message;
     builderStatus.textContent = "Fix the builder fields or advanced JSON before validating, dry-running, or creating the flow.";
+    renderDraftChain(error.message);
     renderGraphEmpty("proposed", error.message, "Preview is unavailable until the draft JSON parses and matches the flow shape.");
     renderGraphIssues("proposed", null, "Fix the draft JSON before validation issues can be shown.");
     renderGraphEffects("proposed", null);
   }
+}
+
+function renderDraftChain(errorMessage = "") {
+  const container = document.getElementById("flow-draft-chain");
+  const advancedActive = hasAdvancedOverride();
+  if (errorMessage) {
+    container.innerHTML = `<div class="flow-graph-empty">${escapeHtml(errorMessage)}</div>`;
+    return;
+  }
+  if (advancedActive) {
+    container.innerHTML = '<div class="flow-graph-empty">Clear the advanced JSON override to use constrained visual draft editing.</div>';
+    return;
+  }
+
+  const draft = state.flowDraft || createDefaultFlowDraft();
+  const chain = orderedLinearNodes(draft.nodes);
+  container.innerHTML = chain.map((node) => {
+    const selected = GRAPH_SELECTION.proposed === node.node_id;
+    const connectorId = cleanString(node?.config?.connector_id);
+    return `
+      <div class="flow-chain-card${selected ? " selected" : ""}">
+        <div>
+          <strong>${escapeHtml(node.name || node.node_id)}</strong>
+          <span>${escapeHtml(`${node.node_id} | ${node.node_type || "n/a"} | ${node.config?.kind || "n/a"}`)}</span>
+          <span>${escapeHtml(connectorId ? `connector=${connectorId}` : "connector=none")}</span>
+        </div>
+        <div class="flow-chain-actions">
+          <button class="button subtle" type="button" data-select-proposed-node="${escapeHtml(node.node_id)}">Select</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  container.querySelectorAll("[data-select-proposed-node]").forEach((button) => {
+    button.addEventListener("click", () => {
+      GRAPH_SELECTION.proposed = button.getAttribute("data-select-proposed-node");
+      renderFlowDraftPreview();
+    });
+  });
 }
 
 function renderProposedFlowValidation(response) {
@@ -632,6 +781,7 @@ function renderFlowDetail(data) {
   const refreshButton = document.getElementById("flow-refresh-detail-button");
   const validateButton = document.getElementById("flow-validate-stored-button");
   const dryRunButton = document.getElementById("flow-dry-run-stored-button");
+  const copyButton = document.getElementById("flow-copy-to-draft-button");
   const enableButton = document.getElementById("flow-enable-button");
   const disableButton = document.getElementById("flow-disable-button");
   const deleteButton = document.getElementById("flow-delete-button");
@@ -656,6 +806,7 @@ function renderFlowDetail(data) {
     refreshButton.disabled = true;
     validateButton.disabled = true;
     dryRunButton.disabled = true;
+    copyButton.disabled = true;
     enableButton.disabled = true;
     disableButton.disabled = true;
     deleteButton.disabled = true;
@@ -667,6 +818,7 @@ function renderFlowDetail(data) {
   refreshButton.disabled = false;
   validateButton.disabled = false;
   dryRunButton.disabled = false;
+  copyButton.disabled = false;
   enableButton.disabled = Boolean(data.flow.enabled);
   disableButton.disabled = !data.flow.enabled;
   deleteButton.disabled = false;
@@ -787,7 +939,7 @@ function invalidateProposedFlowChecks(options = {}) {
 function renderProposedGraphState(overrideFlow) {
   try {
     const flow = overrideFlow || getCurrentDraftForGraph();
-    renderFlowGraph("proposed", flow, state.cache.flowProposedValidation, state.cache.flowProposedDryRun, "Preview-only graph layer from the current draft.");
+    renderFlowGraph("proposed", flow, state.cache.flowProposedValidation, state.cache.flowProposedDryRun, "Constrained preview graph from the current draft.");
   } catch (error) {
     renderGraphEmpty("proposed", error.message, "Preview is unavailable until the draft JSON parses and matches the flow shape.");
   }
@@ -804,12 +956,14 @@ function renderStoredGraphState() {
     || detail.validation_summary
     || null;
   const dryRun = state.cache.flowStoredDryRun.get(String(state.selectedFlowId)) || null;
-  renderFlowGraph("stored", detail, validation, dryRun, "Stored graph preview from GET /dashboard/flows/{flow_id}.");
+  renderFlowGraph("stored", detail, validation, dryRun, "Stored graph preview from GET /dashboard/flows/{flow_id}. Read-only until copied into a builder draft.");
 }
 
 function getCurrentDraftForGraph() {
   const advanced = cleanString(document.getElementById("flow-advanced-json").value);
-  const draft = advanced ? parseJson(advanced, "Advanced JSON override") : (state.flowDraft || buildFlowDraftFromForm());
+  const draft = advanced
+    ? parseJson(advanced, "Advanced JSON override")
+    : finalizeDraftGraph(state.flowDraft || createDefaultFlowDraft());
   validateFlowDraftShape(draft);
   return draft;
 }
@@ -833,7 +987,7 @@ function renderFlowGraph(context, flowLike, validation, dryRun, statusPrefix) {
   const edgeLookup = new Map(edges.map((edge) => [edgeKey(edge), edge]));
 
   graphContainer.innerHTML = buildGraphSvg(context, nodes, edges, layout, issueMaps, selectedNodeId, effectNodeIds);
-  bindGraphNodeEvents(context, nodes, validation, dryRun, issueMaps);
+  bindGraphNodeEvents(context, nodes, dryRun, issueMaps);
 
   document.getElementById(ids.graphStatus).innerHTML = renderGraphStatus(statusPrefix, nodes, edges, validation);
   renderNodeDetail(context, nodes.find((node) => node.node_id === GRAPH_SELECTION[context]), issueMaps, dryRun);
@@ -882,6 +1036,12 @@ function renderNodeDetail(context, node, issueMaps, dryRun) {
     return;
   }
 
+  if (context === "proposed" && !hasAdvancedOverride()) {
+    container.innerHTML = renderEditableDraftNode(node, issueMaps, dryRun);
+    bindEditableDraftNodeEvents(node.node_id);
+    return;
+  }
+
   const nodeIssues = issueMaps.nodeIssues.get(node.node_id) || [];
   const redactedConfig = JSON.stringify(redactSecrets(node.config || {}), null, 2) || "{}";
   const effectActive = buildEffectNodeIds([node], dryRun).has(node.node_id);
@@ -904,6 +1064,121 @@ function renderNodeDetail(context, node, issueMaps, dryRun) {
       </div>
     </div>
   `;
+}
+
+function renderEditableDraftNode(node, issueMaps, dryRun) {
+  const nodeIssues = issueMaps.nodeIssues.get(node.node_id) || [];
+  const effectActive = buildEffectNodeIds([node], dryRun).has(node.node_id);
+  const kindOptions = getKindOptionsForNodeType(node.node_type).map((value) => `
+    <option value="${escapeHtml(value)}"${value === cleanString(node?.config?.kind) ? " selected" : ""}>${escapeHtml(value)}</option>
+  `).join("");
+  const showConnector = nodeSupportsConnector(node);
+  const connectorOptions = renderConnectorOptions(
+    buildConnectorOptionList(
+      state.cache.flowConnectors || [],
+      new Map((state.cache.flowConnectorOverview?.connectors || []).map((item) => [item.connector_id, item])),
+    ),
+    cleanString(node?.config?.connector_id),
+  );
+  const canMoveUp = canMoveDraftNode(node.node_id, -1);
+  const canMoveDown = canMoveDraftNode(node.node_id, 1);
+  const canRemove = canRemoveDraftNode(node.node_id);
+  const redactedConfig = JSON.stringify(redactSecrets(node.config || {}), null, 2) || "{}";
+
+  return `
+    <div class="flow-node-editor">
+      <div class="detail-grid">
+        ${renderDetailItem("Node ID", node.node_id)}
+        ${renderDetailItem("Node Type", node.node_type || "n/a")}
+        ${renderDetailItem("Highlighted By Dry-Run", effectActive ? "true" : "false")}
+      </div>
+      <div class="flow-node-editor-grid">
+        <label>
+          <span>Name</span>
+          <input id="flow-draft-node-name" type="text" value="${escapeHtml(node.name || "")}" ${hasAdvancedOverride() ? "disabled" : ""}>
+        </label>
+        <label>
+          <span>Kind</span>
+          <select id="flow-draft-node-kind" ${kindOptions ? "" : "disabled"}>
+            ${kindOptions}
+          </select>
+        </label>
+        <label>
+          <span>Connector</span>
+          <select id="flow-draft-node-connector" ${showConnector ? "" : "disabled"}>
+            ${connectorOptions}
+          </select>
+        </label>
+      </div>
+      <div class="flow-node-editor-actions">
+        <button class="button subtle" type="button" id="flow-draft-node-move-up"${canMoveUp ? "" : " disabled"}>Move Up</button>
+        <button class="button subtle" type="button" id="flow-draft-node-move-down"${canMoveDown ? "" : " disabled"}>Move Down</button>
+        <button class="button subtle danger-button" type="button" id="flow-draft-node-remove"${canRemove ? "" : " disabled"}>Remove Node</button>
+      </div>
+      <p class="flow-node-editor-note">Editing stays constrained to the current linear draft. Stored flows remain read-only until copied to the builder draft.</p>
+      <div>
+        <p class="preview-note"><strong>Redacted Config JSON</strong></p>
+        <pre class="mono-block">${escapeHtml(redactedConfig)}</pre>
+      </div>
+      <div>
+        <p class="preview-note"><strong>Node Issues</strong></p>
+        ${renderIssueList(nodeIssues, "No node-specific validation issues.")}
+      </div>
+    </div>
+  `;
+}
+
+function bindEditableDraftNodeEvents(nodeId) {
+  const nameInput = document.getElementById("flow-draft-node-name");
+  const kindSelect = document.getElementById("flow-draft-node-kind");
+  const connectorSelect = document.getElementById("flow-draft-node-connector");
+  const moveUpButton = document.getElementById("flow-draft-node-move-up");
+  const moveDownButton = document.getElementById("flow-draft-node-move-down");
+  const removeButton = document.getElementById("flow-draft-node-remove");
+
+  if (nameInput) {
+    nameInput.addEventListener("input", () => {
+      updateDraftNode(nodeId, (node) => {
+        node.name = cleanString(nameInput.value) || undefined;
+      });
+    });
+  }
+
+  if (kindSelect) {
+    kindSelect.addEventListener("change", () => {
+      updateDraftNode(nodeId, (node) => {
+        const kind = requireNonEmpty(kindSelect.value, "Node kind");
+        node.config = buildNodeConfig(node.node_type, kind, cleanString(node?.config?.connector_id));
+      });
+    });
+  }
+
+  if (connectorSelect) {
+    connectorSelect.addEventListener("change", () => {
+      updateDraftNode(nodeId, (node) => {
+        const kind = cleanString(node?.config?.kind);
+        node.config = buildNodeConfig(node.node_type, kind, cleanString(connectorSelect.value));
+      });
+    });
+  }
+
+  if (moveUpButton) {
+    moveUpButton.addEventListener("click", () => {
+      moveDraftChainNode(nodeId, -1);
+    });
+  }
+
+  if (moveDownButton) {
+    moveDownButton.addEventListener("click", () => {
+      moveDraftChainNode(nodeId, 1);
+    });
+  }
+
+  if (removeButton) {
+    removeButton.addEventListener("click", () => {
+      removeDraftChainNode(nodeId);
+    });
+  }
 }
 
 function renderGraphIssues(context, validation, emptyMessage) {
@@ -1113,10 +1388,10 @@ function topologicalOrder(nodes, edges) {
 }
 
 function buildGraphSvg(context, nodes, edges, layout, issueMaps, selectedNodeId, effectNodeIds) {
-  const positionById = new Map((layout.nodes || []).map((item) => [item.node_id || nodes.find((node) => node.node_id === item.node_id)?.node_id || item.node_id, item]));
+  const positionById = new Map((layout.nodes || []).map((item) => [item.node_id, item]));
   const markerId = `flow-graph-arrow-${context}`;
   return `
-    <svg viewBox="0 0 ${layout.width} ${layout.height}" role="img" aria-label="${escapeHtml(`${context} flow graph`)}}">
+    <svg viewBox="0 0 ${layout.width} ${layout.height}" role="img" aria-label="${escapeHtml(`${context} flow graph`)}">
       <defs>
         <marker id="${markerId}" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
           <path d="M0,0 L10,5 L0,10 z" fill="rgba(95, 103, 95, 0.7)"></path>
@@ -1190,13 +1465,16 @@ function renderGraphNode(node, position, layout, issueMaps, selectedNodeId, effe
   `;
 }
 
-function bindGraphNodeEvents(context, nodes, validation, dryRun, issueMaps) {
+function bindGraphNodeEvents(context, nodes, dryRun, issueMaps) {
   const ids = GRAPH_IDS[context];
   document.getElementById(ids.graph).querySelectorAll("[data-graph-node-id]").forEach((element) => {
     const selectNode = () => {
       GRAPH_SELECTION[context] = element.getAttribute("data-graph-node-id");
       const node = nodes.find((candidate) => candidate.node_id === GRAPH_SELECTION[context]) || null;
       renderNodeDetail(context, node, issueMaps, dryRun);
+      if (context === "proposed") {
+        renderDraftChain();
+      }
       document.getElementById(ids.graph).querySelectorAll("[data-graph-node-id]").forEach((candidate) => {
         candidate.classList.toggle("selected", candidate.getAttribute("data-graph-node-id") === GRAPH_SELECTION[context]);
       });
@@ -1230,6 +1508,293 @@ function buildEffectNodeIds(nodes, dryRun) {
   return active;
 }
 
+function addDraftChainNode(nodeType) {
+  if (hasAdvancedOverride()) {
+    setStatus("Clear the advanced JSON override before using constrained visual draft editing.");
+    return;
+  }
+
+  const draft = finalizeDraftGraph(state.flowDraft || createDefaultFlowDraft());
+  const intermediates = getIntermediateNodes(draft);
+  const targetIndex = resolveDraftInsertionIndex(draft);
+  const node = buildNewDraftNode(nodeType, intermediates.length + 1);
+  intermediates.splice(targetIndex, 0, node);
+  draft.nodes = [getSourceNode(draft), ...intermediates, getTerminalNode(draft)];
+  state.flowDraft = finalizeDraftGraph(draft);
+  GRAPH_SELECTION.proposed = node.node_id;
+  invalidateProposedFlowChecks({ preserveGraph: true });
+  renderFlowBuilderFormFromDraft();
+  renderFlowDraftPreview();
+  setStatus(`${capitalize(nodeType)} node added to the constrained draft.`);
+}
+
+function buildNewDraftNode(nodeType, sequence) {
+  const normalizedType = nodeType === "transform" ? "transform" : nodeType;
+  const defaultKind = getKindOptionsForNodeType(normalizedType)[0];
+  return {
+    node_id: `${normalizedType}-${sequence}`,
+    node_type: normalizedType,
+    name: buildDefaultNodeName(normalizedType, sequence),
+    config: { kind: defaultKind },
+  };
+}
+
+function buildDefaultNodeName(nodeType, sequence) {
+  if (nodeType === "filter") {
+    return `Filter ${sequence}`;
+  }
+  if (nodeType === "rule") {
+    return `Rule ${sequence}`;
+  }
+  if (nodeType === "decoder") {
+    return `Decoder ${sequence}`;
+  }
+  return `Transform ${sequence}`;
+}
+
+function resolveDraftInsertionIndex(draft) {
+  const intermediates = getIntermediateNodes(draft);
+  const selectedId = GRAPH_SELECTION.proposed;
+  const selectedIndex = intermediates.findIndex((node) => node.node_id === selectedId);
+  if (selectedIndex >= 0) {
+    return selectedIndex + 1;
+  }
+  const sourceSelected = getSourceNode(draft)?.node_id === selectedId;
+  if (sourceSelected) {
+    return 0;
+  }
+  return intermediates.length;
+}
+
+function updateDraftNode(nodeId, updater) {
+  if (hasAdvancedOverride()) {
+    setStatus("Clear the advanced JSON override before editing the constrained draft.");
+    return;
+  }
+
+  const draft = finalizeDraftGraph(state.flowDraft || createDefaultFlowDraft());
+  const node = draft.nodes.find((candidate) => candidate.node_id === nodeId);
+  if (!node) {
+    return;
+  }
+
+  updater(node);
+  if (node.node_type === "source" || node.node_type === "sink" || node.node_type === "dlq") {
+    renderFlowBuilderFormFromDraft();
+  }
+  state.flowDraft = finalizeDraftGraph(draft);
+  GRAPH_SELECTION.proposed = node.node_id;
+  invalidateProposedFlowChecks({ preserveGraph: true });
+  renderFlowBuilderFormFromDraft();
+  renderFlowDraftPreview();
+}
+
+function moveDraftChainNode(nodeId, direction) {
+  if (hasAdvancedOverride()) {
+    setStatus("Clear the advanced JSON override before reordering the constrained draft.");
+    return;
+  }
+  if (!canMoveDraftNode(nodeId, direction)) {
+    return;
+  }
+
+  const draft = finalizeDraftGraph(state.flowDraft || createDefaultFlowDraft());
+  const intermediates = getIntermediateNodes(draft);
+  const index = intermediates.findIndex((node) => node.node_id === nodeId);
+  const targetIndex = index + direction;
+  const [node] = intermediates.splice(index, 1);
+  intermediates.splice(targetIndex, 0, node);
+  draft.nodes = [getSourceNode(draft), ...intermediates, getTerminalNode(draft)];
+  state.flowDraft = finalizeDraftGraph(draft);
+  GRAPH_SELECTION.proposed = nodeId;
+  invalidateProposedFlowChecks({ preserveGraph: true });
+  renderFlowDraftPreview();
+}
+
+function removeDraftChainNode(nodeId) {
+  if (hasAdvancedOverride()) {
+    setStatus("Clear the advanced JSON override before removing nodes from the constrained draft.");
+    return;
+  }
+  if (!canRemoveDraftNode(nodeId)) {
+    return;
+  }
+
+  const draft = finalizeDraftGraph(state.flowDraft || createDefaultFlowDraft());
+  draft.nodes = draft.nodes.filter((node) => node.node_id !== nodeId);
+  state.flowDraft = finalizeDraftGraph(draft);
+  GRAPH_SELECTION.proposed = getSourceNode(state.flowDraft)?.node_id || null;
+  invalidateProposedFlowChecks({ preserveGraph: true });
+  renderFlowDraftPreview();
+  setStatus(`Removed node ${nodeId} from the constrained draft.`);
+}
+
+function canMoveDraftNode(nodeId, direction) {
+  const draft = state.flowDraft || createDefaultFlowDraft();
+  const intermediates = getIntermediateNodes(draft);
+  const index = intermediates.findIndex((node) => node.node_id === nodeId);
+  if (index < 0) {
+    return false;
+  }
+  const targetIndex = index + direction;
+  return targetIndex >= 0 && targetIndex < intermediates.length;
+}
+
+function canRemoveDraftNode(nodeId) {
+  const draft = state.flowDraft || createDefaultFlowDraft();
+  const node = draft.nodes.find((candidate) => candidate.node_id === nodeId);
+  return Boolean(node && EDITABLE_CHAIN_NODE_TYPES.has(node.node_type));
+}
+
+function nodeSupportsConnector(node) {
+  const kind = cleanString(node?.config?.kind);
+  return (node?.node_type === "source" && FLOW_SOURCE_KINDS_WITH_CONNECTOR.has(kind))
+    || ((node?.node_type === "sink" || node?.node_type === "dlq") && FLOW_SINK_KINDS_WITH_CONNECTOR.has(kind));
+}
+
+function getKindOptionsForNodeType(nodeType) {
+  if (nodeType === "source") {
+    return SOURCE_KIND_OPTIONS;
+  }
+  if (nodeType === "decoder") {
+    return DECODER_KIND_OPTIONS;
+  }
+  if (nodeType === "transform") {
+    return TRANSFORM_KIND_OPTIONS;
+  }
+  if (nodeType === "filter") {
+    return FILTER_KIND_OPTIONS;
+  }
+  if (nodeType === "rule") {
+    return RULE_KIND_OPTIONS;
+  }
+  if (nodeType === "dlq") {
+    return DLQ_KIND_OPTIONS;
+  }
+  if (nodeType === "sink") {
+    return SINK_KIND_OPTIONS;
+  }
+  return [];
+}
+
+function finalizeDraftGraph(draft) {
+  const next = cloneJson(draft);
+  const orderedNodes = orderedLinearNodes(next.nodes);
+  next.nodes = assignLinearPositions(orderedNodes);
+  next.edges = buildLinearEdges(next.nodes);
+  return next;
+}
+
+function orderedLinearNodes(nodes) {
+  const normalizedNodes = normalizeNodes(nodes);
+  const source = normalizedNodes.find((node) => node.node_type === "source") || normalizedNodes[0];
+  const terminal = normalizedNodes.find((node) => node.node_type === "sink" || node.node_type === "dlq") || normalizedNodes[normalizedNodes.length - 1];
+  const intermediates = normalizedNodes.filter((node) => node.node_id !== source?.node_id && node.node_id !== terminal?.node_id);
+  return [source, ...intermediates, terminal].filter(Boolean);
+}
+
+function assignLinearPositions(nodes) {
+  return nodes.map((node, index) => ({
+    ...node,
+    position: {
+      x: 60 + (index * 240),
+      y: 120,
+    },
+  }));
+}
+
+function buildLinearEdges(nodes) {
+  const edges = [];
+  for (let index = 0; index < nodes.length - 1; index += 1) {
+    const source = nodes[index];
+    const target = nodes[index + 1];
+    edges.push({
+      edge_id: `${source.node_id}-to-${target.node_id}`,
+      source_node_id: source.node_id,
+      target_node_id: target.node_id,
+    });
+  }
+  return edges;
+}
+
+function getSourceNode(draft) {
+  return normalizeNodes(draft.nodes).find((node) => node.node_type === "source");
+}
+
+function getTerminalNode(draft) {
+  const nodes = normalizeNodes(draft.nodes);
+  return nodes.find((node) => node.node_type === "sink" || node.node_type === "dlq");
+}
+
+function getIntermediateNodes(draft) {
+  return orderedLinearNodes(draft.nodes).filter((node) => EDITABLE_CHAIN_NODE_TYPES.has(node.node_type));
+}
+
+function hasAdvancedOverride() {
+  return Boolean(cleanString(document.getElementById("flow-advanced-json").value));
+}
+
+function copyStoredFlowToDraft() {
+  try {
+    const detail = state.selectedFlowId ? state.cache.flowDetail.get(String(state.selectedFlowId)) : null;
+    if (!detail) {
+      return;
+    }
+    const draft = createConstrainedDraftFromStoredFlow(detail);
+    document.getElementById("flow-advanced-json").value = "";
+    state.flowDraft = draft;
+    GRAPH_SELECTION.proposed = getSourceNode(draft)?.node_id || draft.nodes[0]?.node_id || null;
+    invalidateProposedFlowChecks({ preserveGraph: true });
+    renderFlowBuilderFormFromDraft();
+    renderFlowDraftPreview();
+    setStatus(`Copied stored flow ${detail.flow.flow_key} into the constrained builder draft.`);
+  } catch (error) {
+    handleError(error);
+  }
+}
+
+function createConstrainedDraftFromStoredFlow(detail) {
+  const nodes = normalizeNodes(detail?.nodes);
+  const edges = normalizeEdges(detail?.edges);
+  if (nodes.length < 2 || !isLinearGraph(nodes, edges)) {
+    throw new Error("Stored flow cannot be copied into the constrained draft because it is not a single linear chain.");
+  }
+
+  const ordered = topologicalOrder(nodes, edges);
+  const sourceCount = ordered.filter((node) => node.node_type === "source").length;
+  const terminalCount = ordered.filter((node) => node.node_type === "sink" || node.node_type === "dlq").length;
+  if (sourceCount !== 1 || terminalCount !== 1) {
+    throw new Error("Stored flow cannot be copied into the constrained draft because it does not have exactly one source and one terminal sink or DLQ.");
+  }
+
+  for (const node of ordered) {
+    if (!STORED_COPY_ALLOWED_NODE_TYPES.has(node.node_type)) {
+      throw new Error(`Stored flow node type ${node.node_type} is not supported by the constrained draft editor.`);
+    }
+    const supportedKinds = getKindOptionsForNodeType(node.node_type);
+    const kind = cleanString(node?.config?.kind);
+    if (supportedKinds.length > 0 && !supportedKinds.includes(kind)) {
+      throw new Error(`Stored flow kind ${kind || "unknown"} for node ${node.node_id} is not supported by the constrained draft editor.`);
+    }
+  }
+
+  const next = {
+    flow_key: `${detail.flow.flow_key}-copy`,
+    name: `${detail.flow.name || detail.flow.flow_key} Copy`,
+    description: detail.flow.description || undefined,
+    enabled: false,
+    metadata: cloneJson(detail.flow.metadata || detail.metadata),
+    nodes: ordered.map((node) => ({
+      node_id: node.node_id,
+      node_type: node.node_type,
+      name: node.name || undefined,
+      config: cloneJson(node.config || {}),
+    })),
+    edges: [],
+  };
+  return finalizeDraftGraph(next);
+}
+
 function edgeKey(edge) {
   return edge.edge_id || `${edge.source_node_id}->${edge.target_node_id}`;
 }
@@ -1237,4 +1802,12 @@ function edgeKey(edge) {
 function truncateText(value, maxLength) {
   const text = String(value || "");
   return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 3))}...` : text;
+}
+
+function cloneJson(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function capitalize(value) {
+  return value ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : "";
 }

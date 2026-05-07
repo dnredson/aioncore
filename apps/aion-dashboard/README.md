@@ -1,6 +1,6 @@
 # AionCore Dashboard
 
-This app is the Milestone 95 static frontend for the AionCore dashboard.
+This app is the Milestone 96 static frontend for the AionCore dashboard.
 
 ## Scope
 
@@ -12,7 +12,7 @@ The dashboard remains plain HTML, CSS, and JavaScript:
 - no external CDN dependencies
 - no backend behavior changes
 
-Milestone 95 keeps the static no-build dashboard approach from Milestones 89 through 94, adds the first read-only visual flow graph layer, and preserves the native ES module structure so it remains easy to maintain and serve locally.
+Milestone 96 keeps the static no-build dashboard approach from Milestones 89 through 95, adds constrained visual editing for proposed flow drafts on top of the existing graph layer, and preserves the native ES module structure so it remains easy to maintain and serve locally.
 
 ## Files
 
@@ -27,7 +27,7 @@ Milestone 95 keeps the static no-build dashboard approach from Milestones 89 thr
 - `js/connectors.js`
 - `js/flows.js`
 
-`dashboard.js` stays the browser entrypoint. `js/flows.js` now contains the dependency-free SVG graph rendering, node selection handling, validation markers, and dry-run sink highlighting for flow previews and stored flow inspection. All files remain plain no-build ES modules loaded directly by the browser.
+`dashboard.js` stays the browser entrypoint. `js/flows.js` now contains the dependency-free SVG graph rendering, constrained proposed-draft editing logic, node selection handling, validation markers, dry-run sink highlighting, and stored-flow copy-to-draft behavior. All files remain plain no-build ES modules loaded directly by the browser.
 
 ## APIs Consumed
 
@@ -87,8 +87,12 @@ Flow builder and stored-flow actions:
 - Manual reconcile action using `POST /ingestion/workers/reconcile`
 - Manual TTN validation and dry-run readiness loading only when explicitly triggered
 - Flow inventory and detail views from `GET /dashboard/flows` and `GET /dashboard/flows/{flow_id}`
-- Guided source -> transform -> sink flow builder with generated linear edges
+- Guided source -> constrained middle chain -> sink or dlq flow builder with generated linear edges
 - Redacted flow JSON preview and optional advanced JSON override
+- Constrained visual editing for proposed draft graphs only
+- Selected draft node editor for safe name, kind, and connector updates
+- Add transform, filter, and rule nodes into a linear draft chain
+- Move up, move down, and remove controls for draft chain nodes
 - Manual proposed-flow validation using `POST /flows/validate`
 - Manual proposed-flow dry-run using `POST /flows/dry-run`
 - Manual flow creation using `POST /flows`
@@ -96,9 +100,11 @@ Flow builder and stored-flow actions:
 - Stored flow dry-run using `POST /flows/{flow_id}/dry-run`
 - Stored flow enable, disable, and explicit confirm-before-delete actions
 - Read-only visual graph rendering for stored flow detail using `GET /dashboard/flows/{flow_id}` and optional `GET /flows/{flow_id}/validation`
-- Read-only proposed graph preview for guided drafts and advanced JSON override output
+- Read-only proposed graph preview when advanced JSON override is active
+- Constrained editable proposed graph preview for guided drafts
 - Click-to-select node detail panels with redacted config JSON and node-scoped validation issue display
 - Dry-run sink effect highlighting for conceptual observation store, MQTT publish, HTTP forward, event create, command create, and DLQ use
+- Copy stored flow to builder draft for safe linear flows only
 
 ## Auth Scopes
 
@@ -223,10 +229,14 @@ This keeps the dashboard static and low-risk while still supporting InfluxDB/Gra
 
 ## Flow Builder Notes
 
-- The builder is guided and linear: source -> transform -> sink.
+- The builder is guided and linear: source -> zero or more constrained middle nodes -> sink or dlq.
 - Generated previews include `nodes`, `edges`, and `metadata`.
 - An optional advanced JSON override can replace the guided output for low-risk editing.
 - The preview pane now also renders a dependency-free SVG graph for the current draft when it can be parsed safely.
+- Proposed visual editing remains constrained to `source -> zero or more decoder/transform/filter/rule nodes -> sink or dlq`.
+- Draft edges are always regenerated automatically from the current constrained node order.
+- Stored flow graphs remain read-only. Operators must use `Copy To Draft` before any graph-side edits are possible.
+- The advanced JSON override remains available, but it disables constrained visual editing until cleared.
 - If the advanced JSON override is invalid, the graph panel shows a clear preview error instead of crashing the page.
 - Validation and dry-run never save automatically.
 - Dry-run remains planning-only and surfaces `side_effects_performed = false` and `execution_supported = false`.
@@ -236,10 +246,11 @@ This keeps the dashboard static and low-risk while still supporting InfluxDB/Gra
 
 ## Visual Graph Notes
 
-- The graph layer is inspection-only and preview-only.
+- Stored graph rendering stays inspection-only and preview-only.
 - Rendering uses inline SVG and existing browser APIs only.
-- Layout is intentionally simple: linear left-to-right for straightforward source -> transform -> sink graphs, with a fallback grid for more complex shapes.
-- Clicking a node opens a read-only node detail panel with `node_id`, `node_type`, `name`, `config.kind`, redacted config JSON, and node-specific validation issues when available.
+- Layout is intentionally simple: linear left-to-right for straightforward chain graphs, with a fallback grid for more complex shapes.
+- Clicking a stored node opens a read-only node detail panel with `node_id`, `node_type`, `name`, `config.kind`, redacted config JSON, and node-specific validation issues when available.
+- Clicking a proposed draft node in guided mode opens a constrained node editor instead of a free-form graph editor.
 - Stored-flow graph rendering uses `GET /dashboard/flows/{flow_id}` data and can be enriched by `GET /flows/{flow_id}/validation` and `POST /flows/{flow_id}/dry-run`.
 - Proposed-flow graph rendering uses the current form draft or advanced JSON override and can be enriched by `POST /flows/validate` and `POST /flows/dry-run`.
 
@@ -250,7 +261,7 @@ This milestone does not implement:
 - secret creation UI
 - secret inspection UI
 - drag-and-drop flow editing
-- visual graph editing
+- arbitrary visual graph editing
 - canvas panning or zooming
 - flow execution
 - MQTT publish

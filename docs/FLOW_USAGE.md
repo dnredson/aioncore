@@ -179,7 +179,7 @@ Dry-run returns planning-oriented fields such as:
 Dry-run does not execute the flow or perform any side effects.
 
 The static dashboard Flow Builder uses this endpoint for both proposed drafts and stored flows. It surfaces planning fields such as `planned_path`, `planned_sinks`, `referenced_connectors`, and the conceptual sink flags while keeping `execution_supported = false`.
-Milestone 95 also lets the static dashboard highlight conceptual sink nodes in its read-only graph when these flags are present.
+Milestone 95 also lets the static dashboard highlight conceptual sink nodes in its graph layer when these flags are present.
 
 ## List And Get
 
@@ -260,12 +260,14 @@ Milestone 92 adds a form-based builder in `apps/aion-dashboard/` that consumes t
 
 It supports:
 
-- guided source -> transform -> sink draft creation
+- guided source -> zero or more constrained middle nodes -> sink or dlq draft creation
 - redacted preview JSON
-- read-only SVG graph preview for the current draft and selected stored flow
+- constrained SVG graph editing for the current draft
+- read-only SVG graph preview for the selected stored flow
 - optional advanced JSON override
 - proposed validation and dry-run
 - stored-flow validation and dry-run
+- copy stored flow to a constrained draft when the stored graph is a safe linear chain
 - explicit create, enable, disable, and delete operations
 
-It still does not support drag-and-drop, arbitrary graph editing, graph panning/zooming, or flow execution.
+It still does not support drag-and-drop, arbitrary graph editing, graph panning/zooming, in-place stored-flow graph editing, or flow execution.

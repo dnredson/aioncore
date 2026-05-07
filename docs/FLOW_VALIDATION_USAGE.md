@@ -193,4 +193,12 @@ Milestone 95 extends that static usage with a read-only visual graph layer:
 - `validation_issues` with `node_id` can be surfaced as node-level issue markers and node detail warnings
 - dry-run sink flags can be surfaced as graph highlights for conceptual effect inspection only
 
-This visual layer does not execute flows, edit graph structure, or introduce any side effects.
+Milestone 96 adds constrained visual editing on top of that layer for proposed drafts only:
+
+- the draft shape remains a single linear chain
+- operators can edit selected node name, kind, and connector where supported
+- operators can add, remove, and reorder safe middle nodes
+- edges are regenerated automatically after draft edits
+- stored flows remain read-only unless copied into a draft
+
+This visual layer still does not execute flows, introduce arbitrary graph mutation, or introduce any side effects.

@@ -51,15 +51,18 @@ The Flow Builder section in `apps/aion-dashboard/` is deliberately form-based in
 
 It provides:
 
-- a guided source -> transform -> sink builder
+- a guided source -> zero or more constrained middle nodes -> sink or dlq builder
 - generated flow JSON with `nodes`, `edges`, and `metadata`
 - a redacted preview pane
-- a read-only visual graph preview for the current draft
+- a constrained visual graph editor for proposed drafts only
 - an optional advanced JSON override textarea
+- a selected draft node editor for safe name, kind, and connector changes
+- add, remove, and reorder controls for transform, filter, and rule chain nodes
 - explicit proposed-flow validation with `POST /flows/validate`
 - explicit proposed-flow dry-run with `POST /flows/dry-run`
 - explicit create with `POST /flows`
 - explicit stored-flow validation and dry-run against the selected saved flow
+- explicit copy of a stored flow into a proposed draft when it matches the constrained linear pattern
 - explicit enable, disable, and confirm-before-delete controls for stored flows
 - click-to-select node detail panels for both proposed and stored graphs
 - node-level validation markers when issue payloads include `node_id`
@@ -70,9 +73,12 @@ The dashboard does not execute flows. Validation and dry-run remain planning-onl
 Graph behavior:
 
 - stored flow graphs render from `GET /dashboard/flows/{flow_id}`
+- stored flow graphs stay read-only in place
 - stored graph issue detail can be enriched with `GET /flows/{flow_id}/validation`
 - proposed graph issue detail can be enriched with `POST /flows/validate`
 - proposed and stored graph effect highlighting can be enriched with `POST /flows/dry-run` or `POST /flows/{flow_id}/dry-run`
+- proposed visual editing stays constrained to a single linear chain with regenerated edges
+- advanced JSON override disables constrained graph editing until cleared
 - invalid advanced JSON override content shows a clear graph preview error instead of breaking the page
 
 ## Time-Series Explorer
@@ -370,14 +376,14 @@ The UI supports:
 - worker plan and runtime inspection
 - manual TTN validation and dry-run readiness reads
 - guided flow creation, validation, dry-run, and stored-flow lifecycle operations
-- read-only visual flow graph rendering and node inspection
+- constrained proposed-draft visual flow editing plus read-only stored-flow graph rendering and node inspection
 
 The app intentionally still does not implement:
 
 - flow execution
 - form-free arbitrary flow editing
 - drag-and-drop flow building
-- visual graph editing
+- arbitrary visual graph editing
 - graph panning or zooming
 - secret creation
 - live TTN validation triggers

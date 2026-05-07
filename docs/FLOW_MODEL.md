@@ -28,7 +28,7 @@ The current flow foundation now adds:
 
 The current flow milestones still do not add:
 
-- visual graph editing
+- arbitrary visual graph editing
 - drag-and-drop editing
 - flow execution
 - runtime packet forwarding
@@ -39,6 +39,8 @@ The current flow milestones still do not add:
 - any side effects from validation or dry-run
 
 Milestone 95 adds the first static dashboard visual graph layer for inspection and preview only. It renders existing node and edge data, validation markers, and dry-run effect hints, but it does not change the flow model, persist graph layout edits, or introduce runtime behavior.
+
+Milestone 96 adds constrained visual editing for proposed builder drafts only. It keeps the graph shape limited to `source -> zero or more decoder/transform/filter/rule nodes -> sink or dlq`, regenerates edges automatically, and leaves stored-flow graphs read-only until explicitly copied into a builder draft.
 
 ## Core Types
 
@@ -231,13 +233,15 @@ Milestone 92 adds a static frontend-only Flow Builder foundation under `apps/aio
 
 That UI:
 
-- uses a guided source -> transform -> sink form rather than arbitrary graph editing
+- uses a guided source -> constrained middle chain -> sink form rather than arbitrary graph editing
 - generates linear edges from the form
 - shows a redacted JSON preview before save
-- renders a dependency-free read-only graph preview for stored and proposed flows
+- renders a dependency-free graph preview for stored and proposed flows
+- allows constrained visual editing for proposed drafts only
 - allows an optional advanced JSON override for low-risk manual editing
 - uses `POST /flows/validate` and `POST /flows/dry-run` before create
 - uses `GET /flows/{flow_id}/validation` and `POST /flows/{flow_id}/dry-run` for stored flow inspection
+- keeps stored-flow graph detail read-only until a safe draft copy is made
 - still does not execute flows or create side effects
 
 This keeps the backend model stable while giving operators a safe authoring surface before a future Node-RED-like builder arrives.

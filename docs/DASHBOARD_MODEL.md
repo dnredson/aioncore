@@ -1,6 +1,6 @@
 # Dashboard Model
 
-The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, 94, and 95 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, optional static hosting through `aion-api`, and the first read-only visual flow graph layer so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
+The AionCore dashboard is currently a static operational surface served from `apps/aion-dashboard/`. Milestones 81, 82, 84, 87, 88, 89, 90, 91, 92, 93, 94, 95, and 96 add dashboard-oriented API summaries, flow and DLQ inventory counts, a lightweight static frontend shell, connector and broker management UI, a simple entity/property time-series explorer, a form-based flow builder foundation, a native-ES-module maintainability pass, optional static hosting through `aion-api`, the first read-only visual flow graph layer, and constrained visual editing for proposed linear drafts only so operators can inspect entities, connectors, workers, pipeline inventory, historical observations, and candidate flow definitions without changing ingestion or flow execution behavior.
 
 ## Current Intent
 
@@ -13,6 +13,7 @@ The AionCore dashboard is currently a static operational surface served from `ap
 - Provide a safe flow-definition authoring path before any future visual graph editor exists.
 - Keep the frontend split into browser-native modules before introducing runtime-heavy features.
 - Add a Node-RED-like inspection and preview layer before any drag-and-drop or execution surface exists.
+- Add constrained visual draft editing for known safe linear flow patterns before any arbitrary graph editor exists.
 - Preserve Grafana as a valid future option for advanced charting and long-range analytics.
 
 ## Current Read Surface
@@ -66,7 +67,7 @@ The current and future AionCore dashboard is intended to emphasize:
 - later pipeline and flow visibility
 - flow list, detail, and graph rendering from dashboard-friendly read models
 - form-based flow authoring with redacted preview JSON
-- read-only visual graph inspection for stored and proposed flows
+- read-only visual graph inspection for stored flows and constrained visual draft editing for proposed flows
 - node-level validation issue markers and click-to-inspect node detail
 - flow validation and dry-run inspection without execution
 - later reliability and provenance visibility for external flow engines such as NiFi and MiNiFi
@@ -112,8 +113,9 @@ It currently provides:
 - manual TTN validation and dry-run readiness inspection using existing TTN read endpoints only when the operator requests them
 - flow inventory table from `GET /dashboard/flows`
 - flow detail inspection panel from `GET /dashboard/flows/{flow_id}`
-- a guided source -> transform -> sink builder that generates a flow definition with linear edges
+- a guided source -> constrained middle chain -> sink or dlq builder that generates a flow definition with linear edges
 - a dependency-free SVG visual graph panel for the current builder draft and stored flow detail
+- constrained builder-draft editing for selected nodes and linear chain order only
 - click-to-select node detail panels that show redacted config JSON and node-scoped issues when available
 - proposed-flow validation from `POST /flows/validate`
 - proposed-flow dry-run planning from `POST /flows/dry-run`
@@ -146,7 +148,8 @@ Milestone 90 keeps several safety boundaries:
 - no automatic TTN live validation
 - no flow execution
 - no drag-and-drop flow editing
-- no visual graph editing
+- no arbitrary visual graph editing
+- no direct graph editing for stored flows
 - no graph persistence changes
 - no broker subscriptions or sink side effects initiated by the UI
 - no external chart library
@@ -162,6 +165,7 @@ The following are still explicitly out of scope for the current dashboard phase:
 - drag-and-drop graph canvas
 - drag-and-drop flow editor
 - arbitrary graph editing
+- arbitrary stored-flow graph mutation
 - graph panning or zooming
 - flow execution
 - broker subscription changes outside connector config

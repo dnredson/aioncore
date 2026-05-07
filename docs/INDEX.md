@@ -45,6 +45,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 
 Recent dashboard and flow ADRs:
 
+- [ADR 0091: Constrained visual flow editing](ADR/0091-constrained-visual-flow-editing.md)
 - [ADR 0090: Visual flow graph layer](ADR/0090-visual-flow-graph-layer.md)
 - [ADR 0089: Optional `aion-api` static dashboard hosting](ADR/0089-optional-aion-api-static-dashboard-hosting.md)
 - [ADR 0088: Dashboard static packaging and maintainability](ADR/0088-dashboard-static-packaging-maintainability.md)

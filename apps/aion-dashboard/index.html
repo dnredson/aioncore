@@ -10,7 +10,7 @@
   <div class="app-shell">
     <aside class="sidebar" aria-label="Primary">
       <div class="brand">
-        <p class="eyebrow">Milestone 95</p>
+        <p class="eyebrow">Milestone 96</p>
         <h1>AionCore Dashboard</h1>
         <p class="lede">Static operator UI for dashboard overview, connector operations, worker inspection, time-series exploration, and form-based plus visual flow planning, packaged as native browser modules.</p>
       </div>
@@ -532,7 +532,7 @@
         </div>
 
         <div class="notice-panel">
-          Form-based builder only. This milestone does not add drag-and-drop, visual graph editing, execution, broker subscriptions, MQTT publish, HTTP forward, observation writes, event creation, command creation, or DLQ writes.
+          Constrained visual draft editing only. This milestone does not add arbitrary drag-and-drop, arbitrary edge editing, stored-flow graph mutation, execution, broker subscriptions, MQTT publish, HTTP forward, observation writes, event creation, command creation, or DLQ writes.
         </div>
 
         <div class="notice-panel">
@@ -545,7 +545,7 @@
               <div>
                 <p class="eyebrow">Admin area</p>
                 <h3>Guided Builder</h3>
-                <p id="flow-builder-status" class="detail-title">Define a simple source -&gt; transform -&gt; sink flow, review the redacted preview, then validate or dry-run before creating it.</p>
+                <p id="flow-builder-status" class="detail-title">Define a constrained source -&gt; zero or more transform/filter/rule nodes -&gt; sink flow, review the redacted preview, then validate or dry-run before creating it.</p>
               </div>
             </div>
 
@@ -601,32 +601,21 @@
                 </div>
               </div>
 
-              <div class="builder-stage full-span">
-                <div class="builder-stage-header">
-                  <p class="eyebrow">Stage 2</p>
-                  <h4>Decoder / Transform Node</h4>
+              <section class="builder-stage full-span">
+                <div class="builder-stage-header builder-stage-header-wide">
+                  <div>
+                    <p class="eyebrow">Stage 2</p>
+                    <h4>Constrained Chain Nodes</h4>
+                    <p class="detail-title">Add only safe linear transform, filter, or rule nodes between the source and sink. Edges are regenerated automatically.</p>
+                  </div>
+                  <div class="button-row">
+                    <button class="button subtle" id="flow-add-transform-button" type="button">Add Transform</button>
+                    <button class="button subtle" id="flow-add-filter-button" type="button">Add Filter</button>
+                    <button class="button subtle" id="flow-add-rule-button" type="button">Add Rule</button>
+                  </div>
                 </div>
-                <div class="form-grid compact-grid">
-                  <label>
-                    <span>Node ID</span>
-                    <input name="transform_node_id" type="text" required placeholder="decoder-1">
-                  </label>
-                  <label>
-                    <span>Name</span>
-                    <input name="transform_name" type="text" placeholder="SenML Decode">
-                  </label>
-                  <label>
-                    <span>Kind</span>
-                    <select id="flow-transform-kind" name="transform_kind">
-                      <option value="senml_decode">senml_decode</option>
-                      <option value="ultralight_decode">ultralight_decode</option>
-                      <option value="canonical_json">canonical_json</option>
-                      <option value="json_map">json_map</option>
-                      <option value="filter_condition">filter_condition</option>
-                    </select>
-                  </label>
-                </div>
-              </div>
+                <div id="flow-draft-chain" class="flow-chain-list"></div>
+              </section>
 
               <div class="builder-stage full-span">
                 <div class="builder-stage-header">
@@ -692,6 +681,13 @@
 
             <section class="mini-panel">
               <div class="panel-heading compact">
+                <h4>Selected Draft Node Editor</h4>
+              </div>
+              <div id="flow-proposed-node-detail" class="graph-node-detail">Select a node in the preview graph to inspect or edit the constrained draft node.</div>
+            </section>
+
+            <section class="mini-panel">
+              <div class="panel-heading compact">
                 <h4>Proposed Visual Graph</h4>
                 <div id="flow-proposed-graph-status" class="status-meta">Preview-only graph layer from the current draft.</div>
               </div>
@@ -699,10 +695,6 @@
             </section>
 
             <div class="mini-panels">
-              <section class="mini-panel">
-                <h4>Selected Proposed Node</h4>
-                <div id="flow-proposed-node-detail" class="graph-node-detail">Select a node in the preview graph to inspect its redacted config.</div>
-              </section>
               <section class="mini-panel">
                 <h4>Proposed Validation Issues</h4>
                 <div id="flow-proposed-issues">Validate the proposed flow to inspect structured issues before saving.</div>
@@ -774,6 +766,7 @@
                 <button class="button subtle" id="flow-refresh-detail-button" type="button" disabled>Refresh Detail</button>
                 <button class="button subtle" id="flow-validate-stored-button" type="button" disabled>Validate Stored Flow</button>
                 <button class="button subtle" id="flow-dry-run-stored-button" type="button" disabled>Dry-Run Stored Flow</button>
+                <button class="button subtle" id="flow-copy-to-draft-button" type="button" disabled>Copy To Draft</button>
                 <button class="button subtle" id="flow-enable-button" type="button" disabled>Enable</button>
                 <button class="button subtle" id="flow-disable-button" type="button" disabled>Disable</button>
                 <button class="button subtle danger-button" id="flow-delete-button" type="button" disabled>Delete</button>
