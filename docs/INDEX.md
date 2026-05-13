@@ -22,8 +22,11 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 
 ## Usage Guides
 
+- [Configuration](CONFIGURATION.md)
 - [MVP Demo Scenario](MVP_DEMO_SCENARIO.md)
 - [MVP Scope Freeze](MVP_SCOPE_FREEZE.md)
+- [MVP Runbook](MVP_RUNBOOK.md)
+- [Release Checklist](RELEASE_CHECKLIST.md)
 - [Authentication Usage](AUTH_USAGE.md)
 - [Ingestion Usage](INGESTION_USAGE.md)
 - [Time-Series Usage](TIMESERIES_USAGE.md)
@@ -73,6 +76,9 @@ Recent dashboard and flow ADRs:
 
 ## Validation And Deployment
 
+- [Configuration](CONFIGURATION.md)
+- [MVP Runbook](MVP_RUNBOOK.md)
+- [Release Checklist](RELEASE_CHECKLIST.md)
 - [Runtime Validation](RUNTIME_VALIDATION.md)
 - [README Quick Local Start](../README.md#quick-local-start)
 - [ADR 0096: Flow Execution Side-Effect Authorization](ADR/0096-flow-execution-side-effect-authorization.md)

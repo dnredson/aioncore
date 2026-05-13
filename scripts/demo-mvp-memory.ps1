@@ -5,6 +5,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Write-Step {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    Write-Host ("==> {0}" -f $Message)
+}
+
 function Invoke-ApiJson {
     param(
         [Parameter(Mandatory = $true)]
@@ -72,10 +81,12 @@ $syncSessionId = "demo-sync-$suffix"
 
 Write-Host "AionCore MVP demo starting against $BaseUrl"
 
+Write-Step "Checking health and readiness"
 $health = Invoke-ApiJson -Method Get -Path "/health"
 $ready = Invoke-ApiJson -Method Get -Path "/ready"
 Assert-True ($ready.ready -eq $true) "Expected /ready to report ready=true."
 
+Write-Step "Creating demo entities and relationship"
 $field = Invoke-ApiJson -Method Post -Path "/entities" -Body (New-JsonLdEntityBody -EntityKey "demo-field-$suffix" -EntityType "aion:FieldSector" -Name "Demo Field Sector $suffix")
 $sensor = Invoke-ApiJson -Method Post -Path "/entities" -Body (New-JsonLdEntityBody -EntityKey "demo-sensor-$suffix" -EntityType "aion:Sensor" -Name "Demo Soil Sensor $suffix")
 
@@ -87,6 +98,7 @@ $relationship = Invoke-ApiJson -Method Post -Path "/relationships" -Body @{
 }
 Assert-True ($relationship.relationship_type -eq "observes") "Expected observes relationship."
 
+Write-Step "Submitting reliable ingestion and duplicate check"
 $reliableBody = @{
     producer_entity_id = $sensor.id
     feature_of_interest_id = $field.id
@@ -114,6 +126,7 @@ Assert-True ($reliable.duplicate -eq $false) "Expected first reliable ingest to 
 $duplicate = Invoke-ApiJson -Method Post -Path "/ingest/reliable" -Body $reliableBody
 Assert-True ($duplicate.duplicate -eq $true) "Expected duplicate reliable ingest on second submit."
 
+Write-Step "Submitting batch/backfill ingestion"
 $batch = Invoke-ApiJson -Method Post -Path "/ingest/batch" -Body @{
     batch_id = "demo-batch-$suffix"
     sync_session_id = $syncSessionId
@@ -148,12 +161,14 @@ Assert-True ($batch.accepted_count -ge 1) "Expected batch accepted_count >= 1."
 $syncSessions = Invoke-ApiJson -Method Get -Path ("/sync-sessions?sync_session_id={0}" -f [uri]::EscapeDataString($syncSessionId))
 Assert-True (($syncSessions | Measure-Object).Count -ge 1) "Expected sync session to exist after batch."
 
+Write-Step "Reading time-series metadata and values"
 $properties = Invoke-ApiJson -Method Get -Path ("/timeseries/entities/{0}/properties" -f $field.id)
 Assert-True (($properties.properties | Measure-Object).Count -ge 1) "Expected time-series properties for field."
 
 $series = Invoke-ApiJson -Method Get -Path ("/timeseries/query?entity_id={0}&observed_property=soil_moisture&limit=10" -f $field.id)
 Assert-True ($series.count -ge 1) "Expected at least one time-series point."
 
+Write-Step "Creating, validating, and preview-executing a flow"
 $flow = Invoke-ApiJson -Method Post -Path "/flows" -Body @{
     flow_key = "demo-flow-$suffix"
     name = "Demo Flow $suffix"
@@ -187,6 +202,7 @@ $execute = Invoke-ApiJson -Method Post -Path ("/flows/{0}/execute" -f $flow.id) 
 }
 Assert-True ($execute.side_effects_performed -eq $false) "Expected preview execution side effects false."
 
+Write-Step "Creating a DLQ record and replay plan"
 $dlq = Invoke-ApiJson -Method Post -Path "/dlq/records" -Body @{
     dlq_key = "demo-dlq-$suffix"
     source_system = "smartsentinel"
@@ -207,6 +223,7 @@ Assert-True ($dlq.id) "Expected DLQ record id."
 $replayPlan = Invoke-ApiJson -Method Post -Path ("/dlq/records/{0}/replay-plan" -f $dlq.id) -Body @{ target = "reliable_ingestion" }
 Assert-True ($replayPlan.side_effects_performed -eq $false) "Expected replay plan side effects false."
 
+Write-Step "Reading dashboard overview"
 $dashboard = Invoke-ApiJson -Method Get -Path "/dashboard/overview"
 Assert-True ($dashboard.generated_at) "Expected dashboard overview generated_at."
 
@@ -219,4 +236,6 @@ Write-Host ("Reliable raw message: {0}" -f $reliable.raw_message_id)
 Write-Host ("Sync session: {0}" -f $syncSessionId)
 Write-Host ("Flow: {0}" -f $flow.id)
 Write-Host ("DLQ record: {0}" -f $dlq.id)
+Write-Host ("Time-series points returned: {0}" -f $series.count)
+Write-Host ("Dashboard overview generated at: {0}" -f $dashboard.generated_at)
 Write-Host "Open the dashboard at /ui/ if AIONCORE_DASHBOARD_STATIC_DIR is enabled."

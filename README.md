@@ -69,6 +69,26 @@ scripts/demo-mvp-memory.ps1
 
 The script exercises the local memory-backed MVP path: entities, relationships, reliable ingestion, batch/backfill ingestion, sync sessions, time-series queries, flow validation/dry-run/preview execution, DLQ replay planning, and dashboard overview. See [MVP Demo Scenario](docs/MVP_DEMO_SCENARIO.md).
 
+## Configuration
+
+The current validated MVP configuration surface is documented in:
+
+- [Configuration](docs/CONFIGURATION.md)
+- [MVP Runbook](docs/MVP_RUNBOOK.md)
+- [Release Checklist](docs/RELEASE_CHECKLIST.md)
+
+The main local environment variables are:
+
+- `AIONCORE_AUTH_MODE`
+- `AIONCORE_BOOTSTRAP_ADMIN_TOKEN`
+- `AIONCORE_DASHBOARD_STATIC_DIR`
+- `AIONCORE_STORAGE_BACKEND`
+- `AIONCORE_DATABASE_URL`
+- `AIONCORE_CONNECTOR_WORKERS_ENABLED`
+- `AIONCORE_MQTT_ENABLED`
+- `AIONCORE_TEST_DATABASE_URL`
+
+Use [.env.example](.env.example) as a placeholder-only reference. Do not commit real secrets.
 
 ## Current Status
 
@@ -115,6 +135,9 @@ Core architecture and models:
 
 Operational usage guides:
 
+- [Configuration](docs/CONFIGURATION.md)
+- [MVP Runbook](docs/MVP_RUNBOOK.md)
+- [Release Checklist](docs/RELEASE_CHECKLIST.md)
 - [Authentication Usage](docs/AUTH_USAGE.md)
 - [Ingestion Usage](docs/INGESTION_USAGE.md)
 - [Time-Series Usage](docs/TIMESERIES_USAGE.md)
