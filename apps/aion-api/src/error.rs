@@ -8,6 +8,7 @@ use axum::{
     Json,
 };
 use serde::Serialize;
+use std::fmt;
 
 #[derive(Debug)]
 pub(crate) struct ApiError {
@@ -56,6 +57,12 @@ impl ApiError {
             validation_warnings: Vec::new(),
             skipped_items: Vec::new(),
         }
+    }
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
