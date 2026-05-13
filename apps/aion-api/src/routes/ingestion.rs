@@ -12,6 +12,7 @@ use aion_observation::Observation;
 use aion_payload::{DecodeInput, PayloadFormat, ReliableIngestionEnvelope};
 use aion_raw_message::{RawMessage, RawMessageSource};
 use aion_storage::{ConnectorProfile, IngestionConnector, StorageError, TtnDeviceMapping};
+use aion_sync::{SyncSession, SyncSessionStatus};
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
@@ -130,6 +131,7 @@ pub(crate) struct BatchReliableIngestResponse {
     pub stopped_early: bool,
     pub results: Vec<BatchReliableIngestItemResult>,
     pub event_id: Option<Uuid>,
+    pub sync_session_record_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -448,6 +450,16 @@ async fn ingest_batch(
         Some("Reliable batch ingestion processed".to_string()),
         event_metadata,
     )?;
+    let sync_session_record = record_batch_sync_session(
+        &scoped_state,
+        &request,
+        total_items,
+        accepted_count,
+        duplicate_count,
+        failed_count,
+        observations_created,
+        received_at,
+    )?;
 
     Ok((
         StatusCode::OK,
@@ -464,8 +476,75 @@ async fn ingest_batch(
             stopped_early,
             results,
             event_id: Some(event.id),
+            sync_session_record_id: sync_session_record.as_ref().map(|session| session.id),
         }),
     ))
+}
+
+fn record_batch_sync_session(
+    state: &AppState,
+    request: &BatchReliableIngestRequest,
+    total_items: usize,
+    accepted_count: usize,
+    duplicate_count: usize,
+    failed_count: usize,
+    observations_created: usize,
+    received_at: DateTime<Utc>,
+) -> Result<Option<SyncSession>, ApiError> {
+    let sync_session_id = match request
+        .sync_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+
+    let mut session = match state
+        .storage
+        .get_sync_session_by_external_id(state.tenant_id, sync_session_id)?
+    {
+        Some(session) => session,
+        None => {
+            let session = SyncSession::new(
+                state.tenant_id,
+                sync_session_id.to_string(),
+                request.source_system.clone(),
+                request.source_id.clone(),
+                None,
+                None,
+                Some(SyncSessionStatus::Receiving),
+                request.connectivity_state.clone(),
+                None,
+                request.metadata.clone(),
+                received_at,
+            )
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+            state.storage.create_sync_session(session)?
+        }
+    };
+
+    if session.source_system.is_none() {
+        session.source_system = request.source_system.clone();
+    }
+    if session.source_id.is_none() {
+        session.source_id = request.source_id.clone();
+    }
+    if let Some(metadata) = request.metadata.clone() {
+        session.metadata = metadata;
+    }
+    session.apply_batch_result(
+        request.batch_id.clone(),
+        total_items as u64,
+        accepted_count as u64,
+        duplicate_count as u64,
+        failed_count as u64,
+        observations_created as u64,
+        request.connectivity_state.clone(),
+        received_at,
+    );
+    Ok(Some(state.storage.update_sync_session(session)?))
 }
 
 async fn ingest_reliable_scoped(

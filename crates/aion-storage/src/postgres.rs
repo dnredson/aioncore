@@ -9,6 +9,7 @@ use aion_flow::Flow;
 use aion_observation::ObservationValue;
 use aion_raw_message::{NormalizationStatus, RawMessageSource};
 use aion_rule::RuleTriggerType;
+use aion_sync::{SyncSession, SyncSessionStatus};
 use serde::Serialize;
 use std::fmt;
 use std::sync::Mutex;
@@ -872,6 +873,61 @@ fn row_to_dlq_record(row: Row) -> StorageResult<DlqRecord> {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         resolved_at: row.get("resolved_at"),
+    })
+}
+
+fn sync_session_status_to_db(status: &SyncSessionStatus) -> &'static str {
+    match status {
+        SyncSessionStatus::Open => "open",
+        SyncSessionStatus::Receiving => "receiving",
+        SyncSessionStatus::Completed => "completed",
+        SyncSessionStatus::Failed => "failed",
+        SyncSessionStatus::Abandoned => "abandoned",
+    }
+}
+
+fn sync_session_status_from_db(value: String) -> StorageResult<SyncSessionStatus> {
+    match value.as_str() {
+        "open" => Ok(SyncSessionStatus::Open),
+        "receiving" => Ok(SyncSessionStatus::Receiving),
+        "completed" => Ok(SyncSessionStatus::Completed),
+        "failed" => Ok(SyncSessionStatus::Failed),
+        "abandoned" => Ok(SyncSessionStatus::Abandoned),
+        other => Err(StorageError::Backend(format!(
+            "unknown sync session status in database: {other}"
+        ))),
+    }
+}
+
+fn row_to_sync_session(row: Row) -> StorageResult<SyncSession> {
+    let Json(metadata) = row.get::<_, Json<Value>>("metadata");
+    Ok(SyncSession {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        sync_session_id: row.get("sync_session_id"),
+        source_system: row.get("source_system"),
+        source_id: row.get("source_id"),
+        connector_id: row.get("connector_id"),
+        edge_adapter_id: row.get("edge_adapter_id"),
+        status: sync_session_status_from_db(row.get::<_, String>("status"))?,
+        connectivity_state: row.get("connectivity_state"),
+        started_at: row.get("started_at"),
+        last_seen_at: row.get("last_seen_at"),
+        completed_at: row.get("completed_at"),
+        last_batch_id: row.get("last_batch_id"),
+        expected_items: row
+            .get::<_, Option<i64>>("expected_items")
+            .map(|value| value as u64),
+        received_items: row.get::<_, i64>("received_items") as u64,
+        accepted_count: row.get::<_, i64>("accepted_count") as u64,
+        duplicate_count: row.get::<_, i64>("duplicate_count") as u64,
+        failed_count: row.get::<_, i64>("failed_count") as u64,
+        observations_created: row.get::<_, i64>("observations_created") as u64,
+        first_observed_at: row.get("first_observed_at"),
+        last_observed_at: row.get("last_observed_at"),
+        metadata,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
     })
 }
 
@@ -3213,6 +3269,291 @@ impl DlqStore for PostgresStorage {
                 .map_err(map_postgres_error)?
                 .ok_or(StorageError::NotFound)?;
             row_to_dlq_record(row)
+        })
+    }
+}
+
+impl SyncSessionStore for PostgresStorage {
+    fn create_sync_session(&self, session: SyncSession) -> StorageResult<SyncSession> {
+        self.with_client(|client| {
+            let row = client
+                .query_one(
+                    "
+                    INSERT INTO sync_sessions (
+                        id, tenant_id, sync_session_id, source_system, source_id,
+                        connector_id, edge_adapter_id, status, connectivity_state,
+                        started_at, last_seen_at, completed_at, last_batch_id,
+                        expected_items, received_items, accepted_count, duplicate_count,
+                        failed_count, observations_created, first_observed_at, last_observed_at,
+                        metadata, created_at, updated_at
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+                    )
+                    RETURNING id, tenant_id, sync_session_id, source_system, source_id,
+                        connector_id, edge_adapter_id, status, connectivity_state,
+                        started_at, last_seen_at, completed_at, last_batch_id,
+                        expected_items, received_items, accepted_count, duplicate_count,
+                        failed_count, observations_created, first_observed_at, last_observed_at,
+                        metadata, created_at, updated_at
+                    ",
+                    &[
+                        &session.id,
+                        &session.tenant_id,
+                        &session.sync_session_id,
+                        &session.source_system,
+                        &session.source_id,
+                        &session.connector_id,
+                        &session.edge_adapter_id,
+                        &sync_session_status_to_db(&session.status),
+                        &session.connectivity_state,
+                        &session.started_at,
+                        &session.last_seen_at,
+                        &session.completed_at,
+                        &session.last_batch_id,
+                        &session.expected_items.map(|value| value as i64),
+                        &(session.received_items as i64),
+                        &(session.accepted_count as i64),
+                        &(session.duplicate_count as i64),
+                        &(session.failed_count as i64),
+                        &(session.observations_created as i64),
+                        &session.first_observed_at,
+                        &session.last_observed_at,
+                        &json_column(&session.metadata),
+                        &session.created_at,
+                        &session.updated_at,
+                    ],
+                )
+                .map_err(|err| {
+                    if is_unique_violation(&err) {
+                        StorageError::Conflict
+                    } else {
+                        map_postgres_error(err)
+                    }
+                })?;
+            row_to_sync_session(row)
+        })
+    }
+
+    fn update_sync_session(&self, session: SyncSession) -> StorageResult<SyncSession> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    UPDATE sync_sessions
+                    SET sync_session_id = $3,
+                        source_system = $4,
+                        source_id = $5,
+                        connector_id = $6,
+                        edge_adapter_id = $7,
+                        status = $8,
+                        connectivity_state = $9,
+                        started_at = $10,
+                        last_seen_at = $11,
+                        completed_at = $12,
+                        last_batch_id = $13,
+                        expected_items = $14,
+                        received_items = $15,
+                        accepted_count = $16,
+                        duplicate_count = $17,
+                        failed_count = $18,
+                        observations_created = $19,
+                        first_observed_at = $20,
+                        last_observed_at = $21,
+                        metadata = $22,
+                        updated_at = $23
+                    WHERE tenant_id = $1 AND id = $2
+                    RETURNING id, tenant_id, sync_session_id, source_system, source_id,
+                        connector_id, edge_adapter_id, status, connectivity_state,
+                        started_at, last_seen_at, completed_at, last_batch_id,
+                        expected_items, received_items, accepted_count, duplicate_count,
+                        failed_count, observations_created, first_observed_at, last_observed_at,
+                        metadata, created_at, updated_at
+                    ",
+                    &[
+                        &session.tenant_id,
+                        &session.id,
+                        &session.sync_session_id,
+                        &session.source_system,
+                        &session.source_id,
+                        &session.connector_id,
+                        &session.edge_adapter_id,
+                        &sync_session_status_to_db(&session.status),
+                        &session.connectivity_state,
+                        &session.started_at,
+                        &session.last_seen_at,
+                        &session.completed_at,
+                        &session.last_batch_id,
+                        &session.expected_items.map(|value| value as i64),
+                        &(session.received_items as i64),
+                        &(session.accepted_count as i64),
+                        &(session.duplicate_count as i64),
+                        &(session.failed_count as i64),
+                        &(session.observations_created as i64),
+                        &session.first_observed_at,
+                        &session.last_observed_at,
+                        &json_column(&session.metadata),
+                        &session.updated_at,
+                    ],
+                )
+                .map_err(|err| {
+                    if is_unique_violation(&err) {
+                        StorageError::Conflict
+                    } else {
+                        map_postgres_error(err)
+                    }
+                })?
+                .ok_or(StorageError::NotFound)?;
+            row_to_sync_session(row)
+        })
+    }
+
+    fn list_sync_sessions(
+        &self,
+        tenant_id: Uuid,
+        filter: SyncSessionFilter,
+    ) -> StorageResult<Vec<SyncSession>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, sync_session_id, source_system, source_id,
+                        connector_id, edge_adapter_id, status, connectivity_state,
+                        started_at, last_seen_at, completed_at, last_batch_id,
+                        expected_items, received_items, accepted_count, duplicate_count,
+                        failed_count, observations_created, first_observed_at, last_observed_at,
+                        metadata, created_at, updated_at
+                    FROM sync_sessions
+                    WHERE tenant_id = $1
+                        AND ($2::TEXT IS NULL OR status = $2)
+                        AND ($3::TEXT IS NULL OR source_system = $3)
+                        AND ($4::TEXT IS NULL OR source_id = $4)
+                        AND ($5::UUID IS NULL OR connector_id = $5)
+                        AND ($6::TEXT IS NULL OR sync_session_id = $6)
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT $7
+                    ",
+                    &[
+                        &tenant_id,
+                        &filter.status.as_ref().map(sync_session_status_to_db),
+                        &filter.source_system,
+                        &filter.source_id,
+                        &filter.connector_id,
+                        &filter.sync_session_id,
+                        &(filter.limit as i64),
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_sync_session)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn list_all_sync_sessions(&self, filter: SyncSessionFilter) -> StorageResult<Vec<SyncSession>> {
+        self.with_client(|client| {
+            let rows = client
+                .query(
+                    "
+                    SELECT id, tenant_id, sync_session_id, source_system, source_id,
+                        connector_id, edge_adapter_id, status, connectivity_state,
+                        started_at, last_seen_at, completed_at, last_batch_id,
+                        expected_items, received_items, accepted_count, duplicate_count,
+                        failed_count, observations_created, first_observed_at, last_observed_at,
+                        metadata, created_at, updated_at
+                    FROM sync_sessions
+                    WHERE ($1::TEXT IS NULL OR status = $1)
+                        AND ($2::TEXT IS NULL OR source_system = $2)
+                        AND ($3::TEXT IS NULL OR source_id = $3)
+                        AND ($4::UUID IS NULL OR connector_id = $4)
+                        AND ($5::TEXT IS NULL OR sync_session_id = $5)
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT $6
+                    ",
+                    &[
+                        &filter.status.as_ref().map(sync_session_status_to_db),
+                        &filter.source_system,
+                        &filter.source_id,
+                        &filter.connector_id,
+                        &filter.sync_session_id,
+                        &(filter.limit as i64),
+                    ],
+                )
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(row_to_sync_session)
+                .collect::<StorageResult<Vec<_>>>()
+        })
+    }
+
+    fn get_sync_session(
+        &self,
+        tenant_id: Uuid,
+        session_id: Uuid,
+    ) -> StorageResult<Option<SyncSession>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, sync_session_id, source_system, source_id,
+                        connector_id, edge_adapter_id, status, connectivity_state,
+                        started_at, last_seen_at, completed_at, last_batch_id,
+                        expected_items, received_items, accepted_count, duplicate_count,
+                        failed_count, observations_created, first_observed_at, last_observed_at,
+                        metadata, created_at, updated_at
+                    FROM sync_sessions
+                    WHERE tenant_id = $1 AND id = $2
+                    ",
+                    &[&tenant_id, &session_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_sync_session).transpose()
+        })
+    }
+
+    fn get_sync_session_any_tenant(&self, session_id: Uuid) -> StorageResult<Option<SyncSession>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, sync_session_id, source_system, source_id,
+                        connector_id, edge_adapter_id, status, connectivity_state,
+                        started_at, last_seen_at, completed_at, last_batch_id,
+                        expected_items, received_items, accepted_count, duplicate_count,
+                        failed_count, observations_created, first_observed_at, last_observed_at,
+                        metadata, created_at, updated_at
+                    FROM sync_sessions
+                    WHERE id = $1
+                    ",
+                    &[&session_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_sync_session).transpose()
+        })
+    }
+
+    fn get_sync_session_by_external_id(
+        &self,
+        tenant_id: Uuid,
+        sync_session_id: &str,
+    ) -> StorageResult<Option<SyncSession>> {
+        self.with_client(|client| {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, tenant_id, sync_session_id, source_system, source_id,
+                        connector_id, edge_adapter_id, status, connectivity_state,
+                        started_at, last_seen_at, completed_at, last_batch_id,
+                        expected_items, received_items, accepted_count, duplicate_count,
+                        failed_count, observations_created, first_observed_at, last_observed_at,
+                        metadata, created_at, updated_at
+                    FROM sync_sessions
+                    WHERE tenant_id = $1 AND sync_session_id = $2
+                    ",
+                    &[&tenant_id, &sync_session_id],
+                )
+                .map_err(map_postgres_error)?;
+            row.map(row_to_sync_session).transpose()
         })
     }
 }

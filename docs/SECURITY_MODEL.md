@@ -422,7 +422,7 @@ User and admin APIs should eventually support API tokens first, with JWT or OAut
 
 Devices, adapters, executors, connectors, and bridges should use dedicated machine credentials rather than user tokens reused across automation.
 
-External reliable flow engines such as NiFi or MiNiFi should also authenticate as dedicated machine principals. Current runtime delivery scopes are `ingestion:write` for `POST /ingest/reliable` and `batches:write` for `POST /ingest/batch`. Read-only operational integrations may also need `flows:read`, `dashboard:read`, or `dlq:read`. Reliable-ingestion integrations can now use dedicated `dlq:write`, `dlq:read`, and `batches:write` scopes without requiring broad operator tokens.
+External reliable flow engines such as NiFi or MiNiFi should also authenticate as dedicated machine principals. Current runtime delivery scopes are `ingestion:write` for `POST /ingest/reliable`, `batches:write` for `POST /ingest/batch`, and `sync-sessions:read`/`sync-sessions:write` for reconnect/backfill tracking. Read-only operational integrations may also need `flows:read`, `dashboard:read`, or `dlq:read`. Reliable-ingestion integrations can now use dedicated `dlq:write`, `dlq:read`, and `batches:write` scopes without requiring broad operator tokens.
 
 ### Secret Storage For API Credentials
 
@@ -543,6 +543,7 @@ The table below describes the intended future protection model. It does not chan
 | `/ingestion/connectors/{connector_id}/ttn-device-mappings` POST, PATCH, enable, disable, and DELETE | `UserPrincipal`, `AdminPrincipal`, selected `ServicePrincipal` | `connectors:admin` | Implemented in Milestone 52 for TTN device-mapping administration. |
 | `/ingestion/connectors/{connector_id}/ingest`, `/ingest/http`, and `/ingest/reliable` | `ConnectorPrincipal`, `DevicePrincipal`, `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `ingestion:write` | Reliable generic HTTP ingestion is implemented; connector-aware reliable ingestion remains future work. |
 | `/ingest/batch` | `ServicePrincipal`, optionally `UserPrincipal` in tooling cases | `batches:write` | Batch/backfill reliable ingestion is intended for trusted machine reconnect and store-and-forward flows; item writes remain tenant-scoped and `admin:all` satisfies the scope. |
+| `/sync-sessions*` | `ServicePrincipal`, `AdminPrincipal`, trusted operator tools | `sync-sessions:read` for GET and `sync-sessions:write` for create/patch/status | Sync-session records are tenant-scoped reconnect/backfill tracking records. They correlate batch ingestion windows but do not prove external provenance or execute replay by themselves. |
 | `/secrets/connectors/*` | `UserPrincipal`, `AdminPrincipal` | `secrets:admin` | Implemented in Milestone 50. Highest sensitivity operator surface. |
 | `/commands/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `commands:read` for GET, `commands:create` for creation, `commands:approve` for approve/reject, `commands:write` for selected lifecycle writes, `commands:claim` for generic claim, `commands:lease` for selected lease writes | Selected generic write authorization now applies in Milestone 60. Executor-specific flows still use executor scopes. |
 | `/actions/*` | `UserPrincipal`, `ExecutorPrincipal`, `AdminPrincipal`, limited `ServicePrincipal` | `actions:read` for GET, `actions:write` for selected POST routes | Selected generic write authorization now applies in Milestone 60. |
@@ -802,3 +803,28 @@ Implemented shape:
 - Whether device credentials should bind directly to entity IDs, connector IDs, or both.
 - Whether service-to-service auth should start with API tokens or skip directly to mTLS in distributed mode.
 - How and when tenant/resource ownership checks should be layered onto the remaining unprotected write and read surfaces.
+
+## Flow execution side-effect scope
+
+`flows:read` permits validation, dry-run, and simulated execution. Requests that declare side-effect intent through `allow_side_effects=true` or non-empty `requested_sink_actions` additionally require `flows:execute` in token mode. `admin:all` satisfies this requirement.
+
+The scope is forward-compatible: current execution remains simulated and real side effects are not supported yet.
+
+## Flow execution internal side-effect authorization
+
+Milestone 102 keeps real side effects behind explicit execution intent and `flows:execute`. The only real side effects currently supported are internal observation storage and internal event creation. External sinks such as MQTT publish and HTTP forward remain disabled. This keeps side-effect rollout auditable and prevents a read-only execution simulation from accidentally causing operational changes.
+
+
+## Flow MQTT/HTTP Sink Execution
+
+Milestone 103 introduces the first external flow side effects. These are guarded by `flows:execute` or `admin:all`, explicit `allow_side_effects`, explicit `requested_sink_actions`, and tenant-owned enabled connector references. MQTT publish and HTTP forward do not run from preview or dry-run APIs, do not run from enabled flows automatically, and do not expose connector secret values in responses or audit metadata.
+
+
+## DLQ replay planning
+
+DLQ replay planning uses existing `dlq:read` and `dlq:write` scopes. Planning is read-only and requires `dlq:read`; requesting replay intent requires `dlq:write`. The current replay foundation does not execute payload replay or external side effects. External provenance is preserved as metadata and is not trusted as proof by itself.
+
+
+## Sync-session tracking
+
+Sync-session APIs use `sync-sessions:read` for inspection and `sync-sessions:write` for creation/status updates. Non-admin principals are tenant-filtered. `POST /ingest/batch` remains protected by `batches:write` and updates sync-session counters only within the authenticated tenant. External `sync_session_id` values are correlation metadata and must be scoped by tenant; they are not treated as proof of origin.

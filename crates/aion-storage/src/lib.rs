@@ -10,6 +10,7 @@ use aion_observation::Observation;
 use aion_raw_message::RawMessage;
 use aion_relationship::Relationship;
 use aion_rule::Rule;
+use aion_sync::{SyncSession, SyncSessionStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,6 +55,8 @@ pub const MIGRATION_0014_CREATE_DLQ_RECORDS: &str =
     include_str!("../../../migrations/0014_create_dlq_records.sql");
 pub const MIGRATION_0015_ADD_RAW_MESSAGE_IDEMPOTENCY: &str =
     include_str!("../../../migrations/0015_add_raw_message_idempotency.sql");
+pub const MIGRATION_0016_CREATE_SYNC_SESSIONS: &str =
+    include_str!("../../../migrations/0016_create_sync_sessions.sql");
 
 pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     ("0001_create_tenants.sql", MIGRATION_0001_CREATE_TENANTS),
@@ -106,6 +109,10 @@ pub const ORDERED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0015_add_raw_message_idempotency.sql",
         MIGRATION_0015_ADD_RAW_MESSAGE_IDEMPOTENCY,
+    ),
+    (
+        "0016_create_sync_sessions.sql",
+        MIGRATION_0016_CREATE_SYNC_SESSIONS,
     ),
 ];
 
@@ -995,6 +1002,38 @@ pub trait DlqStore {
     ) -> StorageResult<DlqRecord>;
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncSessionFilter {
+    pub status: Option<SyncSessionStatus>,
+    pub source_system: Option<String>,
+    pub source_id: Option<String>,
+    pub connector_id: Option<Uuid>,
+    pub sync_session_id: Option<String>,
+    pub limit: u32,
+}
+
+pub trait SyncSessionStore {
+    fn create_sync_session(&self, session: SyncSession) -> StorageResult<SyncSession>;
+    fn update_sync_session(&self, session: SyncSession) -> StorageResult<SyncSession>;
+    fn list_sync_sessions(
+        &self,
+        tenant_id: Uuid,
+        filter: SyncSessionFilter,
+    ) -> StorageResult<Vec<SyncSession>>;
+    fn list_all_sync_sessions(&self, filter: SyncSessionFilter) -> StorageResult<Vec<SyncSession>>;
+    fn get_sync_session(
+        &self,
+        tenant_id: Uuid,
+        session_id: Uuid,
+    ) -> StorageResult<Option<SyncSession>>;
+    fn get_sync_session_any_tenant(&self, session_id: Uuid) -> StorageResult<Option<SyncSession>>;
+    fn get_sync_session_by_external_id(
+        &self,
+        tenant_id: Uuid,
+        sync_session_id: &str,
+    ) -> StorageResult<Option<SyncSession>>;
+}
+
 pub trait ControlPlaneStore:
     TenantStore
     + EntityStore
@@ -1014,6 +1053,7 @@ pub trait ControlPlaneStore:
     + RuleStore
     + FlowStore
     + DlqStore
+    + SyncSessionStore
     + ExecutorStore
 {
 }
@@ -1037,6 +1077,7 @@ impl<T> ControlPlaneStore for T where
         + RuleStore
         + FlowStore
         + DlqStore
+        + SyncSessionStore
         + ExecutorStore
 {
 }
@@ -1100,6 +1141,8 @@ struct InMemoryState {
     flows: HashMap<Uuid, Flow>,
     flow_key_index: HashMap<(Uuid, String), Uuid>,
     dlq_records: HashMap<Uuid, DlqRecord>,
+    sync_sessions: HashMap<Uuid, SyncSession>,
+    sync_session_external_index: HashMap<(Uuid, String), Uuid>,
     connector_secrets: HashMap<Uuid, ConnectorSecret>,
     connector_secret_key_index: HashMap<(Uuid, String), Uuid>,
     api_tokens: HashMap<Uuid, ApiToken>,
@@ -2971,6 +3014,144 @@ impl DlqStore for InMemoryStorage {
     }
 }
 
+impl SyncSessionStore for InMemoryStorage {
+    fn create_sync_session(&self, session: SyncSession) -> StorageResult<SyncSession> {
+        let mut state = self.write_state()?;
+        let external_key = (session.tenant_id, session.sync_session_id.clone());
+        if state.sync_sessions.contains_key(&session.id)
+            || state
+                .sync_session_external_index
+                .contains_key(&external_key)
+        {
+            return Err(StorageError::Conflict);
+        }
+        state
+            .sync_session_external_index
+            .insert(external_key, session.id);
+        state.sync_sessions.insert(session.id, session.clone());
+        Ok(session)
+    }
+
+    fn update_sync_session(&self, session: SyncSession) -> StorageResult<SyncSession> {
+        let mut state = self.write_state()?;
+        let previous = state
+            .sync_sessions
+            .get(&session.id)
+            .filter(|stored| stored.tenant_id == session.tenant_id)
+            .cloned()
+            .ok_or(StorageError::NotFound)?;
+        if previous.sync_session_id != session.sync_session_id {
+            let key = (session.tenant_id, session.sync_session_id.clone());
+            if state.sync_session_external_index.contains_key(&key) {
+                return Err(StorageError::Conflict);
+            }
+            state
+                .sync_session_external_index
+                .remove(&(previous.tenant_id, previous.sync_session_id.clone()));
+            state.sync_session_external_index.insert(key, session.id);
+        }
+        state.sync_sessions.insert(session.id, session.clone());
+        Ok(session)
+    }
+
+    fn list_sync_sessions(
+        &self,
+        tenant_id: Uuid,
+        filter: SyncSessionFilter,
+    ) -> StorageResult<Vec<SyncSession>> {
+        let mut sessions = self
+            .read_state()?
+            .sync_sessions
+            .values()
+            .filter(|session| session.tenant_id == tenant_id)
+            .filter(|session| sync_session_matches_filter(session, &filter))
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_and_truncate_sync_sessions(&mut sessions, filter.limit);
+        Ok(sessions)
+    }
+
+    fn list_all_sync_sessions(&self, filter: SyncSessionFilter) -> StorageResult<Vec<SyncSession>> {
+        let mut sessions = self
+            .read_state()?
+            .sync_sessions
+            .values()
+            .filter(|session| sync_session_matches_filter(session, &filter))
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_and_truncate_sync_sessions(&mut sessions, filter.limit);
+        Ok(sessions)
+    }
+
+    fn get_sync_session(
+        &self,
+        tenant_id: Uuid,
+        session_id: Uuid,
+    ) -> StorageResult<Option<SyncSession>> {
+        Ok(self
+            .read_state()?
+            .sync_sessions
+            .get(&session_id)
+            .filter(|session| session.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    fn get_sync_session_any_tenant(&self, session_id: Uuid) -> StorageResult<Option<SyncSession>> {
+        Ok(self.read_state()?.sync_sessions.get(&session_id).cloned())
+    }
+
+    fn get_sync_session_by_external_id(
+        &self,
+        tenant_id: Uuid,
+        sync_session_id: &str,
+    ) -> StorageResult<Option<SyncSession>> {
+        let state = self.read_state()?;
+        let key = (tenant_id, sync_session_id.to_string());
+        Ok(state
+            .sync_session_external_index
+            .get(&key)
+            .and_then(|session_id| state.sync_sessions.get(session_id))
+            .cloned())
+    }
+}
+
+fn sync_session_matches_filter(session: &SyncSession, filter: &SyncSessionFilter) -> bool {
+    filter
+        .status
+        .as_ref()
+        .map(|status| &session.status == status)
+        .unwrap_or(true)
+        && filter
+            .source_system
+            .as_deref()
+            .map(|value| session.source_system.as_deref() == Some(value))
+            .unwrap_or(true)
+        && filter
+            .source_id
+            .as_deref()
+            .map(|value| session.source_id.as_deref() == Some(value))
+            .unwrap_or(true)
+        && filter
+            .connector_id
+            .map(|value| session.connector_id == Some(value))
+            .unwrap_or(true)
+        && filter
+            .sync_session_id
+            .as_deref()
+            .map(|value| session.sync_session_id == value)
+            .unwrap_or(true)
+}
+
+fn sort_and_truncate_sync_sessions(sessions: &mut Vec<SyncSession>, limit: u32) {
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    sessions.truncate(limit as usize);
+}
+
 fn dlq_record_matches_filter(record: &DlqRecord, filter: &DlqRecordFilter) -> bool {
     filter
         .status
@@ -3035,7 +3216,7 @@ mod tests {
 
     #[test]
     fn exposes_ordered_migrations() {
-        assert_eq!(ORDERED_MIGRATIONS.len(), 15);
+        assert_eq!(ORDERED_MIGRATIONS.len(), 16);
         assert_eq!(ORDERED_MIGRATIONS[0].0, "0001_create_tenants.sql");
         assert_eq!(ORDERED_MIGRATIONS[4].0, "0005_create_observations.sql");
         assert_eq!(
@@ -3063,6 +3244,7 @@ mod tests {
             ORDERED_MIGRATIONS[14].0,
             "0015_add_raw_message_idempotency.sql"
         );
+        assert_eq!(ORDERED_MIGRATIONS[15].0, "0016_create_sync_sessions.sql");
     }
 
     #[test]
@@ -3098,6 +3280,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS api_tokens",
             "CREATE TABLE IF NOT EXISTS ttn_device_mappings",
             "CREATE TABLE IF NOT EXISTS dlq_records",
+            "CREATE TABLE IF NOT EXISTS sync_sessions",
         ] {
             assert!(
                 combined.contains(table),
@@ -4170,6 +4353,30 @@ mod tests {
             "raw_messages_idempotency_lookup_idx",
             "raw_messages_tenant_idempotency_unique_idx",
             "WHERE idempotency_key IS NOT NULL",
+        ] {
+            assert!(
+                migration.contains(required),
+                "missing migration item: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_session_migration_defines_required_columns_and_indexes() {
+        let migration = MIGRATION_0016_CREATE_SYNC_SESSIONS;
+        for required in [
+            "CREATE TABLE IF NOT EXISTS sync_sessions",
+            "sync_session_id TEXT NOT NULL",
+            "source_system TEXT",
+            "status TEXT NOT NULL",
+            "received_items BIGINT NOT NULL DEFAULT 0",
+            "accepted_count BIGINT NOT NULL DEFAULT 0",
+            "duplicate_count BIGINT NOT NULL DEFAULT 0",
+            "failed_count BIGINT NOT NULL DEFAULT 0",
+            "observations_created BIGINT NOT NULL DEFAULT 0",
+            "idx_sync_sessions_tenant_external_id",
+            "idx_sync_sessions_tenant_status",
+            "idx_sync_sessions_source_system",
         ] {
             assert!(
                 migration.contains(required),

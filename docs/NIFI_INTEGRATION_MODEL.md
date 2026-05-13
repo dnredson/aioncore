@@ -361,3 +361,8 @@ Milestone 86 now also provides:
 - `aion:ReliableBatchIngested` batch-level audit events
 
 The current runtime preserves the documented provenance contract in `RawMessage.headers` and `Event.metadata` and keeps existing `POST /ingest/http` behavior unchanged.
+
+
+## Sync Sessions
+
+AionCore sync sessions provide an optional tenant-scoped tracking record for reconnect/backfill windows. NiFi, MiNiFi, SmartSentinel, or an edge adapter should reuse a stable `sync_session_id` across all batches belonging to the same outage/reconnect episode.

@@ -142,12 +142,33 @@ Invoke-RestMethod -Method Patch -Uri "http://localhost:8080/dlq/records/<record-
 
 `replay_requested` only records operator intent in this milestone. No replay worker runs yet.
 
+
+## Replay Planning
+
+Plan replay without changing the record:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/dlq/records/<record-id>/replay-plan" -ContentType "application/json" -Body '{"target":"reliable_ingestion"}'
+```
+
+Request replay intent for an eligible record:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/dlq/records/<record-id>/replay" -ContentType "application/json" -Body '{"target":"flow_execution","operator_reason":"mapping corrected","approval_reference":"ticket-123"}'
+```
+
+`/replay` marks the record as `replay_requested` when eligible. It does not execute a replay worker yet. Use `simulate_only=true` to return the replay response shape without changing status.
+
+See [DLQ Replay Usage](DLQ_REPLAY_USAGE.md) for more examples.
+
 ## Token Mode
 
 In `AIONCORE_AUTH_MODE=token`:
 
 - `GET /dlq/records` and `GET /dlq/records/{record_id}` require `dlq:read`
 - `POST /dlq/records` and `PATCH /dlq/records/{record_id}/status` require `dlq:write`
+- `POST /dlq/records/{record_id}/replay-plan` requires `dlq:read`
+- `POST /dlq/records/{record_id}/replay` requires `dlq:write`
 - `admin:all` satisfies both
 
 Read example:
@@ -176,3 +197,8 @@ Tenant behavior in token mode:
 - non-admin principals list, get, and update only their tenant’s DLQ records
 - known cross-tenant detail and update attempts return `403`
 - `admin:all` can read and manage across tenants
+
+
+## Sync Sessions
+
+AionCore sync sessions provide an optional tenant-scoped tracking record for reconnect/backfill windows. NiFi, MiNiFi, SmartSentinel, or an edge adapter should reuse a stable `sync_session_id` across all batches belonging to the same outage/reconnect episode.

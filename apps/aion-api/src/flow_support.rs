@@ -28,6 +28,8 @@ pub(crate) struct FlowEdgeDraft {
     pub edge_id: Option<String>,
     pub source_node_id: String,
     pub target_node_id: String,
+    pub label: Option<String>,
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

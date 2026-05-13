@@ -229,3 +229,7 @@ The UI still preserves the same no-side-effect guarantees:
 - dry-run stays conceptual only
 - execute stays simulated only
 - no MQTT publish, HTTP forward, observation write, event creation, command creation, or DLQ write occurs from dashboard actions
+
+## Execution Semantics Note
+
+Validation still checks graph structure and safe references. Milestone 100 extends simulated execution semantics separately with edge traversal results and richer mapping/condition previews. Validation does not execute the flow and does not evaluate sample payloads.

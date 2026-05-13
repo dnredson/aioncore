@@ -22,13 +22,18 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 
 ## Usage Guides
 
+- [MVP Demo Scenario](MVP_DEMO_SCENARIO.md)
+- [MVP Scope Freeze](MVP_SCOPE_FREEZE.md)
 - [Authentication Usage](AUTH_USAGE.md)
 - [Ingestion Usage](INGESTION_USAGE.md)
 - [Time-Series Usage](TIMESERIES_USAGE.md)
 - [Dashboard Usage](DASHBOARD_USAGE.md)
 - [Dashboard Frontend](../apps/aion-dashboard/README.md)
 - [DLQ Usage](DLQ_USAGE.md)
+- [DLQ Replay Usage](DLQ_REPLAY_USAGE.md)
 - [Reliable Ingestion Usage](RELIABLE_INGESTION_USAGE.md)
+- [Sync Session Model](SYNC_SESSION_MODEL.md)
+- [Sync Session Usage](SYNC_SESSION_USAGE.md)
 - [Batch Ingestion Usage](BATCH_INGESTION_USAGE.md)
 - [Flow Usage](FLOW_USAGE.md)
 - [Flow Validation Usage](FLOW_VALIDATION_USAGE.md)
@@ -39,6 +44,7 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 - [NiFi/MiNiFi Usage](NIFI_USAGE.md)
 - [Commands, Rules, and Executors Usage](COMMANDS_RULES_EXECUTORS_USAGE.md)
 - [Runtime Validation](RUNTIME_VALIDATION.md)
+- [MVP Demo Script](../scripts/demo-mvp-memory.ps1)
 
 ## Planning And ADRs
 
@@ -47,6 +53,10 @@ This index groups the main AionCore documentation so model docs, usage guides, A
 
 Recent dashboard and flow ADRs:
 
+- [ADR 0101: MVP Demo Scenario And Documentation Freeze](ADR/0101-mvp-demo-scenario-documentation-freeze.md)
+- [ADR 0099: DLQ Replay Processing Foundation](ADR/0099-dlq-replay-processing-foundation.md)
+
+- [ADR 0095: Richer simulated flow execution semantics](ADR/0095-richer-simulated-flow-execution-semantics.md)
 - [ADR 0094: Flow execution UI integration](ADR/0094-flow-execution-ui-integration.md)
 - [ADR 0093: Flow execution engine foundation](ADR/0093-flow-execution-engine-foundation.md)
 - [ADR 0092: Typed flow node inspectors](ADR/0092-typed-flow-node-inspectors.md)
@@ -65,3 +75,10 @@ Recent dashboard and flow ADRs:
 
 - [Runtime Validation](RUNTIME_VALIDATION.md)
 - [README Quick Local Start](../README.md#quick-local-start)
+- [ADR 0096: Flow Execution Side-Effect Authorization](ADR/0096-flow-execution-side-effect-authorization.md)
+
+- [ADR 0097: Safe Internal Flow Side Effects](ADR/0097-safe-internal-flow-side-effects.md)
+
+- [Flow execution model](FLOW_EXECUTION_MODEL.md) now covers preview execution, safe internal side effects, and guarded MQTT/HTTP sink execution.
+
+- [ADR 0100: Batch Sync-Session Tracking API](ADR/0100-batch-sync-session-tracking-api.md)

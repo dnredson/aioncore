@@ -18,6 +18,7 @@ aion-raw-message.workspace = true
 aion-relationship.workspace = true
 aion-rule.workspace = true
 aion-storage.workspace = true
+aion-sync.workspace = true
 axum.workspace = true
 chrono.workspace = true
 hex = "0.4"

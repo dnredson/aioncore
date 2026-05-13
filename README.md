@@ -61,6 +61,15 @@ PostgreSQL mode is available when you explicitly set:
 
 Detailed runtime validation and PostgreSQL testing notes live in [Runtime Validation](docs/RUNTIME_VALIDATION.md).
 
+MVP demo script:
+
+```powershell
+scripts/demo-mvp-memory.ps1
+```
+
+The script exercises the local memory-backed MVP path: entities, relationships, reliable ingestion, batch/backfill ingestion, sync sessions, time-series queries, flow validation/dry-run/preview execution, DLQ replay planning, and dashboard overview. See [MVP Demo Scenario](docs/MVP_DEMO_SCENARIO.md).
+
+
 ## Current Status
 
 - The local API runtime is functional with in-memory storage.
@@ -70,6 +79,7 @@ Detailed runtime validation and PostgreSQL testing notes live in [Runtime Valida
 - A lightweight static dashboard now exists under [apps/aion-dashboard](apps/aion-dashboard/README.md) for overview, connector, time-series, and flow inspection, and `aion-api` can optionally serve it from `/ui/` for local demos.
 - A storage-only flow API foundation exists for future dashboard and execution work, but no visual editor or flow runtime is implemented yet.
 - A storage-only DLQ API foundation exists for future replay, quarantine, and reliable-ingestion workflows, but no automatic routing or replay runtime is implemented yet.
+- A local MVP demo path is frozen in `docs/MVP_DEMO_SCENARIO.md` and `scripts/demo-mvp-memory.ps1`.
 
 ## Authentication Warning
 
@@ -121,6 +131,8 @@ Operational usage guides:
 
 Project planning:
 
+- [MVP Demo Scenario](docs/MVP_DEMO_SCENARIO.md)
+- [MVP Scope Freeze](docs/MVP_SCOPE_FREEZE.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Documentation Index](docs/INDEX.md)
 - [Architecture Decision Records](docs/ADR)
@@ -131,3 +143,6 @@ Project planning:
 - In-memory storage remains the reference behavior for tests and local development.
 - MQTT and connector workers are opt-in and disabled unless explicitly enabled.
 - Edge Adapter remains an optional future deployment path and is not required for current ingestion flows.
+
+
+Sync-session tracking for disconnected/backfill ingestion is documented in `docs/SYNC_SESSION_MODEL.md` and `docs/SYNC_SESSION_USAGE.md`.

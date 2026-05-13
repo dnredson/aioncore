@@ -189,3 +189,12 @@ The following are still explicitly out of scope for the current dashboard phase:
 - automated pipeline or rule authoring from the dashboard
 
 Node-RED-like flow editing remains future work. The current milestones establish safe backend summaries plus a static UI that later dashboard work can replace or migrate without changing the current API contracts.
+
+## Flow Execution Preview Semantics
+
+The dashboard can render execution previews returned by the simulated execution endpoints. Milestone 100 adds edge-level traversal results and richer mapping/rule previews to support future visual branching explanations. These previews remain side-effect-free.
+
+
+## Flow Execution Status
+
+The dashboard can display simulated execution and sink results. Milestone 103 adds backend support for explicitly authorized MQTT/HTTP sink execution, but the dashboard should continue to present this as an operator-triggered action requiring `flows:execute` and explicit sink-action intent.

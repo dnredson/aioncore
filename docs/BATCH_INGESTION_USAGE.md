@@ -200,3 +200,8 @@ In `AIONCORE_AUTH_MODE=token`:
 - no flow execution
 - no connector-aware reliable batch endpoint
 - no broker subscription or outbound publish behavior in this milestone
+
+
+## Sync Session Tracking
+
+When `sync_session_id` is present, `POST /ingest/batch` updates or creates a tenant-scoped sync session. The session accumulates `received_items`, `accepted_count`, `duplicate_count`, `failed_count`, and `observations_created`. Use [Sync Session Usage](SYNC_SESSION_USAGE.md) to inspect or complete the session after a reconnect/backfill window.

@@ -28,6 +28,7 @@ dependencies = [
  "aion-relationship",
  "aion-rule",
  "aion-storage",
+ "aion-sync",
  "axum",
  "chrono",
  "hex",
@@ -155,8 +156,19 @@ dependencies = [
  "aion-raw-message",
  "aion-relationship",
  "aion-rule",
+ "aion-sync",
  "chrono",
  "postgres",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "aion-sync"
+version = "0.1.0"
+dependencies = [
+ "chrono",
  "serde",
  "serde_json",
  "uuid",

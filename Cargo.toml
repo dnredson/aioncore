@@ -13,6 +13,7 @@ members = [
     "crates/aion-relationship",
     "crates/aion-rule",
     "crates/aion-storage",
+    "crates/aion-sync",
 ]
 resolver = "2"
 
@@ -42,3 +43,4 @@ aion-raw-message = { path = "crates/aion-raw-message" }
 aion-relationship = { path = "crates/aion-relationship" }
 aion-rule = { path = "crates/aion-rule" }
 aion-storage = { path = "crates/aion-storage" }
+aion-sync = { path = "crates/aion-sync" }

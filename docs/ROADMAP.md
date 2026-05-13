@@ -61,14 +61,16 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - Milestone 97 typed flow node inspectors in the static dashboard: `apps/aion-dashboard/` now adds typed inspectors for known constrained builder node kinds across sources, decoders, transforms, filters, rules, sinks, and DLQ planning; keeps the draft shape linear and static frontend-only; reuses the existing `/flows`, `/flows/validate`, `/flows/dry-run`, `/dashboard/flows`, and `/ingestion/connectors` APIs only; improves stored-flow copy rejection messages for unsupported shapes such as branching, cycles, multiple sources, multiple terminals, missing endpoints, and unsupported node kinds; preserves secret redaction and optional `/ui/*` hosting; and intentionally defers execution, arbitrary graph editing, broker subscriptions, MQTT/HTTP side effects, and backend API changes.
 - Milestone 98 flow execution engine foundation: `aion-api` now adds `POST /flows/execute` and `POST /flows/{flow_id}/execute`; a dedicated internal flow execution module; tenant-aware stored-flow and raw-message-backed simulated execution on `flows:read`; preview-only interpretation for supported source, decoder, transform, filter, rule, sink, and DLQ node kinds; and per-node plus per-sink preview responses while intentionally deferring broker subscriptions, MQTT publish, HTTP forward, observation/event/command/DLQ persistence, worker integration, and dashboard execution UI.
 - Milestone 99 flow execution UI integration for simulated execution: `apps/aion-dashboard/` now adds static proposed-flow and stored-flow simulated execute actions backed only by `POST /flows/execute` and `POST /flows/{flow_id}/execute`; client-side JSON validation for sample payload and optional metadata; redacted execution request and response previews; graph highlighting for `node_results` states and sink conceptual actions; clearer token-scope guidance for `flows:read`, `dashboard:read`, and optional `connectors:read`; preserves the no-build frontend stance and secret redaction; and intentionally defers real execution, MQTT publish, HTTP forward, observation/event/command/DLQ writes, broker subscriptions, and backend API changes.
+- Milestone 100 richer simulated flow execution semantics: `aion-api` now extends the preview-only execution engine with `edge_results`, edge-level conditional traversal through edge metadata, compound condition support (`all`, `any`, `not`), additional operators (`between`, `in`, `not_exists`/`missing`), and richer `json_map` preview conventions including nested targets, defaults, literals, and simple templates; execution remains simulated with `side_effects_performed=false` and still does not publish MQTT, forward HTTP, create observations/events/commands/DLQ records, subscribe to brokers, or change ingestion behavior.
 
 ## Next
 
-1. Extend the simulated execution engine with richer mapping, rule, and branching semantics while keeping real side effects disabled.
-2. Review whether the optional `/ui/*` hosting should gain small readiness diagnostics or packaging helpers without changing its optional nature.
-3. Review whether remaining open write surfaces should split into narrower operator and machine scopes.
-4. Add production MCP transport hardening, including Origin validation and stronger browser-facing transport controls.
-5. Extend the time-series explorer with richer charting, interval bucket views, and broader result navigation without weakening the current no-build stance unless the UI surface justifies a dedicated frontend stack.
+The MVP demonstration boundary is now frozen. Recommended immediate work is validation and polishing rather than new runtime scope:
+
+1. Run the complete local validation suite.
+2. Run `scripts/demo-mvp-memory.ps1` against a memory-backed runtime.
+3. Fix only blocking demo defects, documentation mistakes, redaction issues, or validation failures.
+4. Defer new runtime capabilities to post-MVP planning.
 
 ## Future
 
@@ -86,3 +88,32 @@ This roadmap summarizes completed work and the next planned milestones for AionC
 - The roadmap is intentionally concise. Canonical details live in the individual model docs and ADRs.
 - Security hardening remains staged after the current selected write-surface rollout to avoid overreaching beyond verified behavior in one milestone.
 - `aion-api` modularization is intentionally incremental; Milestones 61 through 79 establish safe extraction patterns for later route-level and shared-support splits.
+
+## Milestone 101 - Flow execution side-effect authorization
+
+Completed: added a forward-compatible authorization model for future real flow side effects. Simulated execution still uses `flows:read`; requests that declare side-effect intent additionally require `flows:execute` or `admin:all`. Real side effects remain disabled.
+
+
+## Milestone 102 - Safe internal flow side effects
+
+Completed: flow execution can now perform the first explicitly authorized internal side effects for `internal_observation_store` and `event_create`. The request must declare side-effect intent and token mode requires `flows:execute` or `admin:all`. MQTT publish, HTTP forward, command creation, DLQ writes, broker subscriptions, and automatic enabled-flow runtime execution remain future work.
+
+
+## Milestone 103 - MQTT/HTTP sink execution
+
+Completed: flow execution can now perform explicitly authorized MQTT publish and HTTP forward side effects through tenant-owned enabled connectors. Requests must include side-effect intent, `flows:execute`/`admin:all`, and explicit `requested_sink_actions`. Command creation, DLQ writes, broker subscriptions, HTTPS/custom headers, and automatic enabled-flow runtime execution remain future work.
+
+## Milestone 104 - DLQ replay processing foundation
+
+Completed: AionCore now exposes replay planning and replay-request endpoints for individual DLQ records. `POST /dlq/records/{record_id}/replay-plan` returns eligibility, blockers, warnings, redacted payload preview, provenance, and suggested replay target without changing state. `POST /dlq/records/{record_id}/replay` marks eligible records as `replay_requested` and emits the existing replay-request audit event. No automatic replay worker, reliable-ingestion resubmission, flow execution, MQTT/HTTP side effect, observation write, command creation, or DLQ write is performed.
+
+
+
+## Milestone 105 - Batch sync-session tracking API
+
+Completed: AionCore now has a tenant-scoped `SyncSession` model and API for tracking reconnect/backfill windows from SmartSentinel, Aion Edge Adapter, NiFi, MiNiFi, or custom gateways. `POST /sync-sessions`, `GET /sync-sessions`, detail, patch, status, complete, and fail endpoints are protected by `sync-sessions:read` and `sync-sessions:write`. `POST /ingest/batch` now updates or creates matching sessions when `sync_session_id` is present, accumulating accepted, duplicate, failed, and observation counts. No replay worker, automatic late-data policy, per-batch ledger table, or automatic DLQ routing was added.
+
+
+## Milestone 106 - MVP demo scenario and documentation freeze
+
+Completed: AionCore now has a frozen local MVP demo path and documentation boundary. Added `docs/MVP_DEMO_SCENARIO.md`, `docs/MVP_SCOPE_FREEZE.md`, `scripts/demo-mvp-memory.ps1`, and ADR 0101. The demo exercises local memory runtime health/readiness, JSON-LD entities and relationships, reliable ingestion with idempotency, batch/backfill ingestion with sync-session tracking, time-series discovery/query, flow validation/dry-run/preview execution, DLQ replay planning, and dashboard overview. No new runtime APIs or side-effect behavior were added.

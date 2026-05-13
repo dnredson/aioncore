@@ -309,3 +309,7 @@ It supports:
 - explicit create, enable, disable, and delete operations
 
 It still does not support drag-and-drop, arbitrary graph editing, graph panning/zooming, in-place stored-flow graph editing, or flow execution.
+
+## Simulated Mapping And Branching Notes
+
+The execution engine can now preview richer `json_map`, compound rule/filter conditions, and edge-level branch conditions while still performing no side effects. See [Flow Execution Usage](FLOW_EXECUTION_USAGE.md) for the current simulated execution semantics.

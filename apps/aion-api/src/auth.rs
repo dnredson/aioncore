@@ -13,7 +13,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 const BOOTSTRAP_ADMIN_TOKEN_MIN_LENGTH: usize = 24;
-const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 40] = [
+const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 42] = [
     "auth_tokens",
     "connector_secrets",
     "adapters",
@@ -25,6 +25,7 @@ const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 40] = [
     "generic_http_ingestion",
     "reliable_ingestion",
     "batch_ingestion",
+    "sync_sessions",
     "ttn_device_mappings",
     "ttn_live_validation",
     "smartsentinel_snapshot_ingestion",
@@ -39,6 +40,7 @@ const TOKEN_MODE_PROTECTED_ENDPOINT_GROUPS: [&str; 40] = [
     "dashboard",
     "dlq",
     "flows",
+    "flow_execution",
     "commands",
     "actions",
     "rules",

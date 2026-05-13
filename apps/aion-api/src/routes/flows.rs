@@ -301,6 +301,12 @@ async fn execute_proposed_flow(
     Json(request): Json<ProposedFlowExecutionRequest>,
 ) -> Result<Json<FlowExecutionResponse>, ApiError> {
     require_scope(&state, &auth, "/flows/execute", "flows:read")?;
+    let side_effects_authorized = require_flow_execute_scope_if_requested(
+        &state,
+        &auth,
+        "/flows/execute",
+        &request.execution,
+    )?;
     let tenant_id = principal_tenant_or_default(&state, &auth)?;
     let _ = (
         request.name.as_ref(),
@@ -308,15 +314,32 @@ async fn execute_proposed_flow(
         request.enabled,
     );
 
-    Ok(Json(execute_flow(
-        &state_for_tenant(&state, tenant_id),
-        tenant_id,
-        None,
-        request.flow_key,
-        &draft_nodes_from_requests(&request.nodes),
-        &draft_edges_from_requests(&request.edges),
-        &request.execution,
-    )?))
+    Ok(Json(
+        execute_flow(
+            &state_for_tenant(&state, tenant_id),
+            tenant_id,
+            None,
+            request.flow_key,
+            &draft_nodes_from_requests(&request.nodes),
+            &draft_edges_from_requests(&request.edges),
+            &request.execution,
+            side_effects_authorized,
+        )
+        .await?,
+    ))
+}
+
+fn require_flow_execute_scope_if_requested(
+    state: &AppState,
+    auth: &AuthContext,
+    endpoint: &'static str,
+    request: &FlowExecutionRequest,
+) -> Result<bool, ApiError> {
+    if !request.requests_side_effects() {
+        return Ok(false);
+    }
+    require_scope(state, auth, endpoint, "flows:execute")?;
+    Ok(true)
 }
 
 async fn list_flows(
@@ -406,17 +429,27 @@ async fn execute_stored_flow(
     Json(request): Json<FlowExecutionRequest>,
 ) -> Result<Json<FlowExecutionResponse>, ApiError> {
     require_scope(&state, &auth, "/flows/:flow_id/execute", "flows:read")?;
+    let side_effects_authorized = require_flow_execute_scope_if_requested(
+        &state,
+        &auth,
+        "/flows/:flow_id/execute",
+        &request,
+    )?;
     let flow = resolve_flow_for_read(&state, &auth, "/flows/:flow_id/execute", flow_id)?;
 
-    Ok(Json(execute_flow(
-        &state_for_tenant(&state, flow.tenant_id),
-        flow.tenant_id,
-        Some(flow.id),
-        Some(flow.flow_key.clone()),
-        &draft_nodes_from_flow(&flow),
-        &draft_edges_from_flow(&flow),
-        &request,
-    )?))
+    Ok(Json(
+        execute_flow(
+            &state_for_tenant(&state, flow.tenant_id),
+            flow.tenant_id,
+            Some(flow.id),
+            Some(flow.flow_key.clone()),
+            &draft_nodes_from_flow(&flow),
+            &draft_edges_from_flow(&flow),
+            &request,
+            side_effects_authorized,
+        )
+        .await?,
+    ))
 }
 
 async fn update_flow(
@@ -590,13 +623,12 @@ fn draft_nodes_from_requests(nodes: &[ProposedFlowNodeRequest]) -> Vec<FlowNodeD
 fn draft_edges_from_requests(edges: &[ProposedFlowEdgeRequest]) -> Vec<FlowEdgeDraft> {
     edges
         .iter()
-        .map(|edge| {
-            let _ = (&edge.label, &edge.metadata);
-            FlowEdgeDraft {
-                edge_id: edge.edge_id.clone(),
-                source_node_id: edge.source_node_id.clone(),
-                target_node_id: edge.target_node_id.clone(),
-            }
+        .map(|edge| FlowEdgeDraft {
+            edge_id: edge.edge_id.clone(),
+            source_node_id: edge.source_node_id.clone(),
+            target_node_id: edge.target_node_id.clone(),
+            label: edge.label.clone(),
+            metadata: edge.metadata.clone(),
         })
         .collect()
 }
@@ -620,6 +652,8 @@ pub(crate) fn draft_edges_from_flow(flow: &Flow) -> Vec<FlowEdgeDraft> {
             edge_id: Some(edge.edge_id.clone()),
             source_node_id: edge.source_node_id.clone(),
             target_node_id: edge.target_node_id.clone(),
+            label: edge.label.clone(),
+            metadata: edge.metadata.clone(),
         })
         .collect()
 }

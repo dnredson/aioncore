@@ -169,3 +169,8 @@ This makes future backfill and replay features easier to explain and audit.
 - Connector-aware reliable ingestion is not implemented yet.
 
 Use this guide as a contract for future-compatible producer design rather than a runtime feature checklist.
+
+
+## Sync Sessions
+
+AionCore sync sessions provide an optional tenant-scoped tracking record for reconnect/backfill windows. NiFi, MiNiFi, SmartSentinel, or an edge adapter should reuse a stable `sync_session_id` across all batches belonging to the same outage/reconnect episode.

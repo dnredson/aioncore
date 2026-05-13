@@ -9,10 +9,10 @@ This guide covers the Milestone 98 simulated flow execution API foundation.
 
 ## Key Rules
 
-- execution is always simulated in this milestone
-- `simulated` always returns `true`
-- `side_effects_performed` always returns `false`
-- no MQTT publish, HTTP forward, command creation, observation storage, or DLQ write happens
+- execution is preview-only unless side effects are explicitly requested and authorized
+- token mode uses `flows:read` for preview execution and `flows:execute` for requested side effects
+- MQTT publish and HTTP forward require explicit `requested_sink_actions` entries and connector references
+- command creation and DLQ writes remain preview-only
 
 ## Proposed Flow Execution
 
@@ -154,3 +154,145 @@ Token-mode behavior:
 - no external sink delivery exists
 - no automatic DLQ handling exists
 - no real execute UI is added in this milestone; the dashboard only calls simulated execute
+
+## Richer Simulated Mapping, Rules, And Branching
+
+Milestone 100 extends simulated execution previews while keeping `side_effects_performed = false`.
+
+### Conditional Branch Example
+
+A proposed flow edge can include conditional metadata:
+
+```json
+{
+  "edge_id": "hot-edge",
+  "source_node_id": "source-1",
+  "target_node_id": "sink-hot",
+  "metadata": {
+    "condition": {
+      "field": "temperature",
+      "operator": "gte",
+      "value": 30
+    }
+  }
+}
+```
+
+The response includes `edge_results` with `traversed`, `skipped`, or `failed` statuses. This is useful for dashboards that need to explain why one branch was followed and another branch was skipped.
+
+### Compound Rule Example
+
+```json
+{
+  "kind": "threshold_rule",
+  "condition": {
+    "all": [
+      { "field": "temperature", "operator": "between", "value": [30, 40] },
+      { "field": "state", "operator": "in", "value": ["warning", "critical"] }
+    ]
+  }
+}
+```
+
+Supported condition composition keys are `all`, `any`, and `not`. Supported operators include `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `contains`, `exists`, `not_exists`, `between`, and `in`.
+
+### JSON Mapping Example
+
+```json
+{
+  "kind": "json_map",
+  "mapping": {
+    "entity.id": "device.id",
+    "reading.value": { "from": "temperature", "default": 0 },
+    "reading.unit": { "literal": "Cel" },
+    "topic": { "template": "devices/{device.id}/temperature" }
+  }
+}
+```
+
+The execution response shows the mapped output as preview data only. No transformed payload is persisted by simulated execution.
+
+## Requesting future side effects safely
+
+Execution remains simulated, but operators can already test the authorization boundary that will protect future real sinks.
+
+```json
+{
+  "sample_payload": {"temperature": 31.5},
+  "allow_side_effects": true,
+  "requested_sink_actions": ["would_store_observation"],
+  "operator_reason": "maintenance dry-run before enabling execution",
+  "approval_reference": "ticket-123"
+}
+```
+
+In token mode this request requires both `flows:read` and `flows:execute`. The response still reports no real side effects because the current runtime policy is preview-only.
+
+## Safe Internal Side Effects
+
+To request internal side effects, include `allow_side_effects=true` and use a token with `flows:execute` or `admin:all`. To restrict the operation to specific supported sinks, pass `requested_sink_actions`, for example:
+
+```json
+{
+  "sample_payload": {"temperature": 31.5},
+  "allow_side_effects": true,
+  "requested_sink_actions": ["store_observation", "create_event"],
+  "operator_reason": "manual validation in lab",
+  "approval_reference": "ticket-123"
+}
+```
+
+Milestone 102 supports only internal observation and event writes. MQTT publish, HTTP forward, command creation, DLQ writes, raw-message writes, and broker subscriptions remain preview-only.
+
+
+## MQTT Publish Execution
+
+Milestone 103 allows an explicitly authorized MQTT publish sink. The sink must reference an enabled tenant-owned MQTT connector and the request must include `requested_sink_actions` such as `publish_mqtt` or `mqtt_publish`.
+
+```powershell
+$body = @'
+{
+  "sample_payload": { "device": { "id": "sensor-01" }, "temperature": 31.5 },
+  "allow_side_effects": true,
+  "requested_sink_actions": ["publish_mqtt"],
+  "operator_reason": "controlled lab publish test",
+  "approval_reference": "ticket-123"
+}
+'@
+
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8080/flows/<flow-id>/execute" `
+  -Headers @{ Authorization = "Bearer <flows-read-and-execute-token>" } `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+The MQTT sink node should include a config similar to:
+
+```json
+{
+  "kind": "mqtt_publish",
+  "connector_id": "<mqtt-connector-id>",
+  "topic_template": "devices/{device.id}/temperature",
+  "qos": "at_least_once",
+  "retain": false
+}
+```
+
+MQTT publish does not run when `requested_sink_actions` is omitted, even if `allow_side_effects=true`.
+
+## HTTP Forward Execution
+
+Milestone 103 also allows explicitly authorized HTTP forward through an enabled tenant-owned HTTP connector. Only `http://` endpoints are supported in this foundation. HTTPS, custom headers, and secret-backed HTTP credentials are deferred.
+
+The request must include `requested_sink_actions` such as `forward_http` or `http_forward`. The sink node should include:
+
+```json
+{
+  "kind": "http_forward",
+  "connector_id": "<http-connector-id>",
+  "method": "POST"
+}
+```
+
+The connector endpoint or the node `endpoint_url` supplies the destination. Endpoint values are redacted in responses.

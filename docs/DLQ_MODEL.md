@@ -158,3 +158,8 @@ This DLQ foundation is intended to support later work such as:
 - dashboard DLQ inspection views
 - idempotency-aware reprocessing
 - external provenance drill-through for NiFi or MiNiFi
+
+
+## Sync Sessions
+
+AionCore sync sessions provide an optional tenant-scoped tracking record for reconnect/backfill windows. NiFi, MiNiFi, SmartSentinel, or an edge adapter should reuse a stable `sync_session_id` across all batches belonging to the same outage/reconnect episode.

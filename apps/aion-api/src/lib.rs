@@ -608,6 +608,7 @@ pub fn app_with_state_and_dashboard_static(
         .merge(routes::dlq::router())
         .merge(routes::flows::router())
         .merge(routes::smartsentinel::router())
+        .merge(routes::sync_sessions::router())
         .merge(routes::mcp::router())
         .merge(routes::ai::router())
         .merge(routes::provenance::router())
@@ -2551,6 +2552,7 @@ mod tests {
                 "generic_http_ingestion",
                 "reliable_ingestion",
                 "batch_ingestion",
+                "sync_sessions",
                 "ttn_device_mappings",
                 "ttn_live_validation",
                 "smartsentinel_snapshot_ingestion",
@@ -2565,6 +2567,7 @@ mod tests {
                 "dashboard",
                 "dlq",
                 "flows",
+                "flow_execution",
                 "commands",
                 "actions",
                 "rules",

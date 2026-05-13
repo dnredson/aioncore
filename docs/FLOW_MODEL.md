@@ -278,3 +278,7 @@ That UI:
 - still does not execute flows or create side effects
 
 This keeps the backend model stable while giving operators a safe authoring surface before a future Node-RED-like builder arrives.
+
+## Execution authorization note
+
+Flow execution remains simulated. The side-effect authorization model introduces `flows:execute` for future real sinks, but current execution still performs no external or persistent effects.

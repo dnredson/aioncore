@@ -659,3 +659,8 @@ TTN connector validation in this milestone is deliberately limited to local conf
 - Production broker scaling is not implemented yet.
 - The env-var MQTT worker still has no reconnect fallback; if it is enabled and the broker cannot be reached, readiness reports MQTT as not ready.
 - HTTP and MQTT ingest into the same canonical-observation model, but the runtime still defaults to in-memory storage unless PostgreSQL is selected explicitly.
+
+
+## Sync-session tracking
+
+Reliable batch ingestion can now correlate reconnect/backfill windows through `sync_session_id`. AionCore stores a tenant-scoped `SyncSession` record and updates cumulative counters whenever `/ingest/batch` carries that identifier. This is intended for SmartSentinel, Aion Edge Adapter, NiFi, and MiNiFi store-and-forward deployments.

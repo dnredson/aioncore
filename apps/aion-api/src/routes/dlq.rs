@@ -1,3 +1,4 @@
+use crate::flow_support::redact_sensitive_json;
 use crate::{
     auth::{
         is_admin_all, principal_tenant_id, require_scope, require_scope_for_write,
@@ -16,7 +17,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -33,6 +34,14 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/dlq/records/:record_id/status",
             axum::routing::patch(update_dlq_record_status),
+        )
+        .route(
+            "/dlq/records/:record_id/replay-plan",
+            post(plan_dlq_record_replay),
+        )
+        .route(
+            "/dlq/records/:record_id/replay",
+            post(request_dlq_record_replay),
         )
 }
 
@@ -86,6 +95,52 @@ pub(crate) struct ListDlqRecordsQuery {
 #[derive(Debug, Deserialize)]
 pub(crate) struct UpdateDlqRecordStatusRequest {
     pub status: DlqStatus,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct DlqReplayRequest {
+    pub target: Option<String>,
+    #[serde(default)]
+    pub simulate_only: bool,
+    #[serde(default)]
+    pub record_intent: bool,
+    pub flow_id: Option<Uuid>,
+    pub operator_reason: Option<String>,
+    pub approval_reference: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DlqReplayResponse {
+    pub replay_id: Uuid,
+    pub record_id: Uuid,
+    pub tenant_id: Uuid,
+    pub target: String,
+    pub eligible: bool,
+    pub simulated: bool,
+    pub side_effects_performed: bool,
+    pub replay_requested: bool,
+    pub status_before: DlqStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_after: Option<DlqStatus>,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+    pub suggested_action: String,
+    pub source_system: Option<String>,
+    pub source_id: Option<String>,
+    pub flow_id: Option<Uuid>,
+    pub raw_message_id: Option<Uuid>,
+    pub idempotency_key: Option<String>,
+    pub external_flow_id: Option<String>,
+    pub external_flowfile_uuid: Option<String>,
+    pub sync_session_id: Option<String>,
+    pub payload_available: bool,
+    pub payload_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_preview: Option<Value>,
+    pub provenance: Value,
+    pub operator_reason_present: bool,
+    pub approval_reference_present: bool,
 }
 
 async fn create_dlq_record(
@@ -265,6 +320,224 @@ async fn update_dlq_record_status(
         )),
     )?;
     Ok(Json(record))
+}
+
+async fn plan_dlq_record_replay(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(record_id): Path<Uuid>,
+    Json(request): Json<DlqReplayRequest>,
+) -> Result<Json<DlqReplayResponse>, ApiError> {
+    require_scope(
+        &state,
+        &auth,
+        "/dlq/records/:record_id/replay-plan",
+        "dlq:read",
+    )?;
+    let record = require_same_tenant_for_target_dlq(
+        &state,
+        &auth,
+        "/dlq/records/:record_id/replay-plan",
+        record_id,
+    )?;
+    Ok(Json(build_dlq_replay_response(&record, &request, false)?))
+}
+
+async fn request_dlq_record_replay(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(record_id): Path<Uuid>,
+    Json(request): Json<DlqReplayRequest>,
+) -> Result<Json<DlqReplayResponse>, ApiError> {
+    require_scope_for_write(&state, &auth, "/dlq/records/:record_id/replay", "dlq:write")?;
+    let record = require_same_tenant_for_target_dlq(
+        &state,
+        &auth,
+        "/dlq/records/:record_id/replay",
+        record_id,
+    )?;
+    let initial = build_dlq_replay_response(&record, &request, false)?;
+    if request.simulate_only || !initial.eligible {
+        return Ok(Json(initial));
+    }
+
+    let scoped_state = state_for_tenant(&state, record.tenant_id);
+    let updated = scoped_state.storage.update_dlq_record_status(
+        scoped_state.tenant_id,
+        record.id,
+        DlqStatus::ReplayRequested,
+        Utc::now(),
+    )?;
+    record_dlq_event(
+        &scoped_state,
+        "aion:DlqReplayRequested",
+        EventSeverity::Info,
+        &updated,
+        Some("dlq replay requested".to_string()),
+    )?;
+
+    let mut response = build_dlq_replay_response(&updated, &request, true)?;
+    response.status_before = record.status;
+    response.status_after = Some(updated.status.clone());
+    response.replay_requested = true;
+    Ok(Json(response))
+}
+
+fn build_dlq_replay_response(
+    record: &DlqRecord,
+    request: &DlqReplayRequest,
+    replay_requested: bool,
+) -> Result<DlqReplayResponse, ApiError> {
+    let target = normalize_replay_target(record, request.target.as_deref())?;
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+
+    if matches!(record.status, DlqStatus::Resolved | DlqStatus::Ignored) {
+        blockers.push("record is already resolved or ignored".to_string());
+    }
+
+    if request.simulate_only && request.record_intent {
+        warnings.push("record_intent is ignored when simulate_only is true".to_string());
+    }
+
+    match target.as_str() {
+        "reliable_ingestion" => {
+            if record.payload.is_none() {
+                blockers.push(
+                    "reliable ingestion replay requires payload on the DLQ record".to_string(),
+                );
+            }
+            if record.payload_format.is_none() {
+                blockers.push(
+                    "reliable ingestion replay requires payload_format on the DLQ record"
+                        .to_string(),
+                );
+            }
+            if record.idempotency_key.is_none() {
+                warnings.push(
+                    "record has no idempotency_key; future replay could create duplicates"
+                        .to_string(),
+                );
+            }
+        }
+        "flow_execution" => {
+            let selected_flow_id = request.flow_id.or(record.flow_id);
+            if selected_flow_id.is_none() {
+                blockers.push(
+                    "flow execution replay requires flow_id on the request or DLQ record"
+                        .to_string(),
+                );
+            }
+            if record.payload.is_none() && record.raw_message_id.is_none() {
+                blockers
+                    .push("flow execution replay requires payload or raw_message_id".to_string());
+            }
+        }
+        "manual_review" => {
+            if record.payload.is_none() && record.raw_message_id.is_none() {
+                warnings.push("record has no payload or raw_message_id; operator review will rely on metadata only".to_string());
+            }
+        }
+        _ => unreachable!("normalize_replay_target returned unsupported target"),
+    }
+
+    let suggested_action = suggested_replay_action(&target);
+    let payload_preview = record.payload.as_ref().map(redact_sensitive_json);
+    let eligible = blockers.is_empty();
+
+    Ok(DlqReplayResponse {
+        replay_id: Uuid::new_v4(),
+        record_id: record.id,
+        tenant_id: record.tenant_id,
+        target,
+        eligible,
+        simulated: true,
+        side_effects_performed: false,
+        replay_requested,
+        status_before: record.status.clone(),
+        status_after: if replay_requested {
+            Some(record.status.clone())
+        } else {
+            None
+        },
+        blockers,
+        warnings,
+        suggested_action,
+        source_system: record.source_system.clone(),
+        source_id: record.source_id.clone(),
+        flow_id: request.flow_id.or(record.flow_id),
+        raw_message_id: record.raw_message_id,
+        idempotency_key: record.idempotency_key.clone(),
+        external_flow_id: record.external_flow_id.clone(),
+        external_flowfile_uuid: record.external_flowfile_uuid.clone(),
+        sync_session_id: record.sync_session_id.clone(),
+        payload_available: record.payload.is_some(),
+        payload_format: record.payload_format.clone(),
+        payload_preview,
+        provenance: dlq_replay_provenance(record, request),
+        operator_reason_present: request
+            .operator_reason
+            .as_ref()
+            .map_or(false, |value| !value.trim().is_empty()),
+        approval_reference_present: request
+            .approval_reference
+            .as_ref()
+            .map_or(false, |value| !value.trim().is_empty()),
+    })
+}
+
+fn normalize_replay_target(
+    record: &DlqRecord,
+    requested: Option<&str>,
+) -> Result<String, ApiError> {
+    let target = requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            if record.flow_id.is_some() {
+                "flow_execution".to_string()
+            } else if record.payload.is_some() {
+                "reliable_ingestion".to_string()
+            } else {
+                "manual_review".to_string()
+            }
+        });
+
+    match target.as_str() {
+        "reliable_ingestion" | "flow_execution" | "manual_review" => Ok(target),
+        _ => Err(ApiError::bad_request(format!(
+            "unsupported replay target '{target}'; expected reliable_ingestion, flow_execution, or manual_review"
+        ))),
+    }
+}
+
+fn suggested_replay_action(target: &str) -> String {
+    match target {
+        "reliable_ingestion" => "future replay engine would resubmit the payload through reliable ingestion with the preserved idempotency/provenance metadata".to_string(),
+        "flow_execution" => "future replay engine would execute the selected flow using the DLQ payload or referenced raw message under explicit execution authorization".to_string(),
+        "manual_review" => "operator should inspect the record and decide whether to resolve, ignore, or request a later replay".to_string(),
+        _ => "unsupported replay target".to_string(),
+    }
+}
+
+fn dlq_replay_provenance(record: &DlqRecord, request: &DlqReplayRequest) -> Value {
+    json!({
+        "external.source_system": record.source_system,
+        "external.source_id": record.source_id,
+        "external.flow_id": record.external_flow_id,
+        "external.flow_name": record.external_flow_name,
+        "external.flowfile_uuid": record.external_flowfile_uuid,
+        "external.process_group_id": record.external_process_group_id,
+        "external.processor_id": record.external_processor_id,
+        "external.provenance_uri": record.external_provenance_uri,
+        "external.idempotency_key": record.idempotency_key,
+        "external.sync_session_id": record.sync_session_id,
+        "external.retry_count": record.retry_count,
+        "external.replay_count": record.replay_count,
+        "payload_hash": record.payload_hash,
+        "request.metadata": request.metadata.as_ref().map(redact_sensitive_json),
+    })
 }
 
 fn dlq_tenant_for_create(
